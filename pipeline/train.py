@@ -236,7 +236,7 @@ class Fire:
         # physics: wind pushing fire uphill, and cells downwind of the current fire
         wspd = np.hypot(u, vv) + 1e-6
         ux, uy = u / wspd, vv / wspd                       # wind blowing toward (east, north)
-        asp = self.aspect[win_sl].astype(np.float32)
+        asp = np.radians(self.aspect[win_sl].astype(np.float32))   # aspect is stored in degrees
         slp = np.radians(self.slope[win_sl].astype(np.float32))
         upslope_wind = (ux * -np.sin(asp) + uy * -np.cos(asp)) * np.sin(slp) * np.minimum(wspd / 10, 2)
         gy = (np.arange(R1 - R0)[:, None] - iy)[sl] * -1.0  # + = north of nearest burned cell
