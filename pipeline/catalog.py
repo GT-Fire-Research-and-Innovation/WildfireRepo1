@@ -42,16 +42,31 @@ def years_arg(s):
     return [int(x) for x in s.split(",")]
 
 
-def paged(sess, url, params, page=2000):
-    out, offset = [], 0
-    while True:
-        js = N.get_json(sess, f"{url}/query", dict(params, resultOffset=offset, resultRecordCount=page,
-                                                     orderByFields="OBJECTID"))
-        feats = js.get("features", [])
-        out += feats
-        if len(feats) < page and not js.get("exceededTransferLimit"):
-            return out
-        offset += len(feats)
+def paged(sess, url, params, page=500):
+    """All records matching params: list every OBJECTID first, then fetch them in POSTed chunks.
+    (Offset paging is unreliable on some archive services: the 2018 NIFS layer repeats records.)"""
+    import requests
+    ids = N.get_json(sess, f"{url}/query", {"where": params.get("where", "1=1"), "returnIdsOnly": "true", "f": "json"})
+    ids = sorted(set(ids.get("objectIds") or []))
+    out = []
+    for i in range(0, len(ids), page):
+        body = dict(params, objectIds=",".join(map(str, ids[i:i + page])))
+        body.pop("where", None)
+        for t in range(5):
+            try:
+                r = sess.post(f"{url}/query", data=body, timeout=300)
+                r.raise_for_status()
+                js = r.json()
+                if "error" in js:
+                    raise RuntimeError(js["error"])
+                break
+            except (requests.RequestException, RuntimeError, ValueError) as ex:
+                if t == 4:
+                    raise
+                print(f"    retry {t + 1}: {str(ex)[:120]}", flush=True)
+                time.sleep(2 ** (t + 1))
+        out += js.get("features", [])
+    return out
 
 
 def layer_fields(sess, url):
@@ -218,12 +233,22 @@ def geoms(out, years):
             continue
         parts = []
         for url, grp in r.groupby("layer_url"):
-            ids = grp["objectid"].astype(int).tolist()
+            ids = sorted(set(pd.to_numeric(grp["objectid"]).astype(int).tolist()))
             t0 = time.time()
-            for i in range(0, len(ids), 250):
-                js = N.get_json(sess, f"{url}/query", {"objectIds": ",".join(map(str, ids[i:i + 250])), "outFields": "OBJECTID",
-                                                       "returnGeometry": "true", "outSR": 4326, "f": "geojson",
-                                                       "maxAllowableOffset": SIMPLIFY_DEG, "geometryPrecision": 6})
+            for i in range(0, len(ids), 200):
+                for t in range(5):
+                    try:
+                        r = sess.post(f"{url}/query", data={"objectIds": ",".join(map(str, ids[i:i + 200])), "outFields": "OBJECTID",
+                                                            "returnGeometry": "true", "outSR": 4326, "f": "geojson",
+                                                            "maxAllowableOffset": SIMPLIFY_DEG, "geometryPrecision": 6}, timeout=300)
+                        r.raise_for_status()
+                        js = r.json()
+                        break
+                    except Exception as ex:  # noqa: BLE001
+                        if t == 4:
+                            raise
+                        print(f"    retry {t + 1}: {str(ex)[:120]}", flush=True)
+                        time.sleep(2 ** (t + 1))
                 for ft in js.get("features", []):
                     if ft.get("geometry"):
                         oid = ft["properties"].get("OBJECTID", ft.get("id"))
@@ -236,73 +261,125 @@ def geoms(out, years):
         g.to_parquet(dst, index=False)
 
 
+def norm_frame(g, geom, year):
+    """Vectorised equivalent of nifc_perimeters.normalize (same columns), without GeoJSON round trips."""
+    import geopandas as gpd
+    g = g.reset_index(drop=True)
+    col = lambda c: g[c] if c in g else pd.Series(None, index=g.index, dtype="object")  # noqa: E731
+    src = col("source").astype("string").fillna("nifs")
+    is_g = src == "geomac"
+    t = _time(g)
+    vt = _time(pd.DataFrame({"gdb_from_date": col("gdb_from_date")}))
+    vt = vt.where(~is_g, _time(pd.DataFrame({"datecurrent": col("datecurrent")})))
+    cat = col("featurecategory").astype("string").where(~is_g, "Wildfire Daily Fire Perimeter")
+    deleted = col("deletethis").astype("string").str.strip().str.lower().isin(["yes", "y", "true", "1"])
+    oid = col("objectid").astype("string")
+    gid = col("sourceglobalid").astype("string").fillna(col("globalid").astype("string")).fillna(col("layer_url").astype("string") + "#" + oid)
+    gid = gid.where(~is_g, "geomac_" + oid)
+    name = col("incidentname").astype("string").fillna("").str.strip()
+    irwin = col("irwinid").astype("string").str.strip("{} ").str.upper()
+    irwin = irwin.where(irwin.notna() & (irwin != ""), None)
+    uid = col("uniquefireidentifier").astype("string").fillna(col("localincidentidentifier").astype("string"))
+    df = pd.DataFrame({"source": src, "layer": f"archive_{year}", "incident_name": name.astype(object),
+                       "name_problem": [N.name_problem(n) for n in name], "irwin_id": irwin.astype(object),
+                       "unique_fire_id": uid.astype(object), "complex_name": None, "category": cat.astype(object),
+                       "map_method": col("mapmethod").astype("string").fillna("Unknown").str.strip().astype(object),
+                       "comments": col("comments").astype("string").fillna("").astype(object), "acres": pd.to_numeric(col("gisacres"), errors="coerce"),
+                       "perim_time": t, "version_time": vt, "geometry_id": gid.astype(object), "deleted": deleted.values})
+    return gpd.GeoDataFrame(df, geometry=list(geom), crs=4326)
+
+
+def polygonal(g):
+    """Polygon parts only (None if there are none)."""
+    import shapely
+    from shapely.geometry import MultiPolygon
+    if g is None or g.is_empty:
+        return None
+    if g.geom_type in ("Polygon", "MultiPolygon"):
+        return g
+    parts = [p for p in shapely.get_parts(g) if p.geom_type in ("Polygon", "MultiPolygon")]
+    polys = [q for p in parts for q in (p.geoms if p.geom_type == "MultiPolygon" else [p])]
+    return MultiPolygon(polys) if polys else None
+
+
+N_BUCKETS = 8
+
+
+def _bucket(df):
+    """Same incident key as nifc_perimeters.incident_key, hashed into N_BUCKETS (cleaning is per incident)."""
+    import zlib
+    name = df["incident_name"].fillna("").str.lower().str.replace(r"\s+", " ", regex=True).str.strip()
+    key = df["irwin_id"].where(df["irwin_id"].notna(), "name:" + name + "|" + df["unique_fire_id"].fillna("").astype(str))
+    return key.map(lambda k: zlib.crc32(str(k).encode()) % N_BUCKETS).astype("int8")
+
+
 def clean_all(out, years, min_acres, min_days):
+    """Normalise each year to disk, then clean in incident buckets (keeps memory under ~2 GB)."""
     import geopandas as gpd
     import shapely
     d = out / "catalog"
+    nd = d / "norm"
+    nd.mkdir(exist_ok=True)
     rec = pd.read_parquet(d / "candidate_records.parquet")
     keys = set(rec["key"])
-    frames = []
     for y in years:
-        p = d / f"geoms_{y}.parquet"
-        if not p.exists():
+        p, q = d / f"geoms_{y}.parquet", nd / f"norm_{y}.parquet"
+        if not p.exists() or q.exists():
             continue
         g = pd.read_parquet(p)
         if "featurecategory" in g:     # FGDB year: attributes and geometry together
             a = g.drop(columns="wkb")
             a["key"] = incident_keys(a)
-            a = a[a["key"].isin(keys)]
-            g = g.loc[a.index]
+            g = g.loc[a.index[a["key"].isin(keys)]]
         else:
-            g = g.merge(rec[rec["year"] == y].drop(columns=[c for c in ("wkb",) if c in rec]), on=["layer_url", "objectid"])
+            r = rec[rec["year"] == y].copy()
+            r["objectid"] = pd.to_numeric(r["objectid"], errors="coerce").astype("Int64")
+            r = r.drop_duplicates(["layer_url", "objectid"])
+            g["objectid"] = pd.to_numeric(g["objectid"], errors="coerce").astype("Int64")
+            g = g.merge(r, on=["layer_url", "objectid"])
         if g.empty:
             continue
         geom = shapely.from_wkb(g.pop("wkb").values)
-        feats = []
-        for props, gm in zip(g.to_dict("records"), geom):
-            props = {k: (None if (v is pd.NA or (isinstance(v, float) and np.isnan(v))) else v) for k, v in props.items()}
-            # one id per archive feature across its edit versions (SourceGlobalID), else GlobalID, else layer+OBJECTID
-            props["geometryid"] = props.get("sourceglobalid") or props.get("globalid") or f"{props.get('layer_url')}#{props.get('objectid')}"
-            for c in ("perimeterdatetime", "polygondatetime", "datecurrent", "gdb_from_date"):
-                v = props.get(c)
-                if isinstance(v, str) and v and not v.isdigit():
-                    t = pd.to_datetime(v, utc=True, errors="coerce")
-                    props[c] = None if pd.isna(t) else int(t.timestamp() * 1000)
-                elif isinstance(v, str) and v.isdigit():
-                    props[c] = int(v)
-            feats.append({"geometry": gm.__geo_interface__, "properties": props})
-        for kind in ("geomac", "nifs"):
-            sub = [f for f, s in zip(feats, g["source"]) if s == kind]
-            if sub:
-                frames.append(N.normalize(sub, kind, g["layer_url"].iloc[0] if not g["layer_url"].iloc[0].startswith("fgdb://")
-                                          else f"{N.NIFC_ROOT}/fgdb_{y}/x"))
-        print(f"  {y}: {len(feats)} records", flush=True)
-    gdf = gpd.GeoDataFrame(pd.concat(frames, ignore_index=True), geometry="geometry", crs=4326)
-    gdf, drops = N.clean(gdf)
-    print("dropped:", drops)
-    # fire level summary
-    rows = []
-    for inc, grp in gdf.groupby("incident"):
-        grp = grp.sort_values("perim_time")
-        if grp["acres_calc"].max() < min_acres or grp["burn_day"].nunique() < min_days:
-            continue
-        b = grp.total_bounds
-        gaps = grp["perim_time"].diff().dt.total_seconds().dropna() / 3600
-        fid = "F" + hashlib.sha1(inc.encode()).hexdigest()[:10]
-        rows.append(dict(fire_id=fid, incident=inc, name=grp["incident_name"].iloc[-1], year=grp["perim_time"].iloc[-1].year,
-                         first=grp["perim_time"].iloc[0], last=grp["perim_time"].iloc[-1], days=grp["burn_day"].nunique(),
-                         perimeters=len(grp), final_acres=float(grp["acres_calc"].max()),
-                         first_acres=float(grp["acres_calc"].iloc[0]), median_gap_h=float(gaps.median()) if len(gaps) else np.nan,
-                         west=b[0], south=b[1], east=b[2], north=b[3], sources=",".join(sorted(grp["source"].unique())),
-                         methods=",".join(sorted(grp["map_method"].str.lower().unique()))))
+        nf = norm_frame(g, geom, y)
+        nf["bucket"] = _bucket(nf)
+        nf.to_parquet(q, index=False)
+        print(f"  {y}: {len(nf)} records", flush=True)
+        del g, geom, nf
+    rows, parts, drops_all = [], [], {}
+    for b in range(N_BUCKETS):
+        frames = [gpd.read_parquet(q, filters=[("bucket", "==", b)]) for q in sorted(nd.glob("norm_*.parquet"))]
+        gdf = gpd.GeoDataFrame(pd.concat([f for f in frames if len(f)], ignore_index=True), geometry="geometry", crs=4326)
+        del frames
+        gdf["geometry"] = [polygonal(x) for x in gdf.geometry]
+        gdf = gdf[gdf.geometry.notna()]
+        gdf, drops = N.clean(gdf)
+        for k, v in drops.items():
+            drops_all[k] = drops_all.get(k, 0) + v
+        for inc, grp in gdf.groupby("incident"):
+            grp = grp.sort_values("perim_time")
+            if grp["acres_calc"].max() < min_acres or grp["burn_day"].nunique() < min_days:
+                continue
+            bb = grp.total_bounds
+            gaps = grp["perim_time"].diff().dt.total_seconds().dropna() / 3600
+            fid = "F" + hashlib.sha1(inc.encode()).hexdigest()[:10]
+            rows.append(dict(fire_id=fid, incident=inc, name=grp["incident_name"].iloc[-1], year=grp["perim_time"].iloc[-1].year,
+                             first=grp["perim_time"].iloc[0], last=grp["perim_time"].iloc[-1], days=grp["burn_day"].nunique(),
+                             perimeters=len(grp), final_acres=float(grp["acres_calc"].max()),
+                             first_acres=float(grp["acres_calc"].iloc[0]),
+                             median_gap_h=float(gaps.median()) if len(gaps) else np.nan,
+                             west=bb[0], south=bb[1], east=bb[2], north=bb[3], sources=",".join(sorted(grp["source"].unique())),
+                             methods=",".join(sorted(grp["map_method"].str.lower().unique()))))
+            keep = ["incident", "incident_name", "source", "category", "map_method", "perim_time", "burn_day",
+                    "acres_calc", "irwin_id", "geometry"]
+            parts.append(grp[keep].assign(fire_id=fid))
+        print(f"  bucket {b + 1}/{N_BUCKETS}: {len(rows)} fires so far", flush=True)
+        del gdf
+    print("dropped:", drops_all)
     fires = pd.DataFrame(rows)
-    gdf = gdf[gdf["incident"].isin(set(fires["incident"]))]
-    gdf = gdf.merge(fires[["incident", "fire_id"]], on="incident")
-    keep = ["fire_id", "incident", "incident_name", "source", "category", "map_method", "perim_time", "burn_day",
-            "acres_calc", "irwin_id", "geometry"]
-    gdf[keep].to_parquet(d / "perimeters.parquet", index=False)
+    per = gpd.GeoDataFrame(pd.concat(parts, ignore_index=True), geometry="geometry", crs=4326)
+    per.to_parquet(d / "perimeters.parquet", index=False)
     fires.to_csv(d / "fires.csv", index=False)
-    print(f"\nfires: {len(fires)}  perimeters: {len(gdf)}")
+    print(f"\nfires: {len(fires)}  perimeters: {len(per)}")
     print(fires.groupby("year").agg(fires=("fire_id", "size"), median_days=("days", "median"),
                                     median_acres=("final_acres", "median"), median_gap_h=("median_gap_h", "median")).round(1).to_string())
 

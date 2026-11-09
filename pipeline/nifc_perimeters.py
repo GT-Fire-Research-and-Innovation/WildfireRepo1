@@ -475,6 +475,27 @@ def burn_day(t, lon):
     return local.tz_localize(None).normalize()
 
 
+def _safe_valid(g):
+    """make_valid that never raises: falls back to buffer(0), keeps polygon parts only, else None."""
+    import shapely
+    from shapely.geometry import MultiPolygon
+    if g is None or g.is_empty:
+        return None
+    for fix in (shapely.make_valid, lambda x: x.buffer(0)):
+        try:
+            v = fix(g)
+            break
+        except Exception:  # noqa: BLE001 (GEOS 'mixed-dimension' and similar on broken archive shapes)
+            v = None
+    if v is None or v.is_empty:
+        return None
+    if v.geom_type in ("Polygon", "MultiPolygon"):
+        return v
+    polys = [q for p in shapely.get_parts(v) if p.geom_type in ("Polygon", "MultiPolygon")
+             for q in (p.geoms if p.geom_type == "MultiPolygon" else [p])]
+    return MultiPolygon(polys) if polys else None
+
+
 def clean(gdf, keep_methods=None):
     """Returns (clean_gdf, counts_of_what_was_dropped)."""
     import shapely
@@ -489,7 +510,7 @@ def clean(gdf, keep_methods=None):
     if gdf.empty:
         return gdf, drops
     gdf = gdf.copy()
-    gdf["geometry"] = shapely.make_valid(gdf.geometry.values)
+    gdf["geometry"] = [_safe_valid(g) for g in gdf.geometry.values]
     gdf = drop(gdf.geometry.is_empty | gdf.geometry.isna(), "empty geometry")
     gdf = drop(~gdf["category"].isin(NIFS_CATEGORIES), "not a wildfire perimeter")
     gdf = drop(gdf["deleted"], "marked DeleteThis")
