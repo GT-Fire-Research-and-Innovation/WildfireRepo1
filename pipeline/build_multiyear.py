@@ -107,9 +107,9 @@ def st_labels(g, ctx):
     cand = per.iloc[list(per.sindex.intersection((w, s, e, n)))]
     cand = cand[(cand.fire_id != g["fire_id"]) & (cand.perim_time >= t0) & (cand.perim_time <= t1 + pd.Timedelta(days=30))]
     other = rasterize(list(cand.geometry.values), g) & (arrival < 0)
+    txt = lambda c: np.array([str(v) for v in p[c]], dtype="U")  # noqa: E731  (plain unicode: loads without pickle)
     return dict(arrival=arrival, other=other, times=p.perim_time.astype("int64").values,
-                burn_days=p.burn_day.astype(str).values, map_methods=p.map_method.astype(str).values,
-                sources=p.source.astype(str).values)
+                burn_days=txt("burn_day"), map_methods=txt("map_method"), sources=txt("source"))
 
 
 def st_history(g, ctx):
@@ -152,7 +152,7 @@ def st_viirs(g, ctx):
     for src in srcs:
         d = d0
         while d <= d1:
-            k = min(10, (d1 - d).days + 1)
+            k = min(5, (d1 - d).days + 1)            # FIRMS archive requests: at most 5 days
             ctx["firms_limiter"]()
             df = firms.get(src, (w, s, e, n), k, d.date().isoformat())
             if len(df):
@@ -162,7 +162,7 @@ def st_viirs(g, ctx):
         for src in firms.NRT:
             d = d0
             while d <= d1:
-                k = min(10, (d1 - d).days + 1)
+                k = min(5, (d1 - d).days + 1)            # FIRMS archive requests: at most 5 days
                 ctx["firms_limiter"]()
                 df = firms.get(src, (w, s, e, n), k, d.date().isoformat())
                 if len(df):
@@ -459,7 +459,7 @@ def build_one(out, catalog, g, stages):
 
 HRRR_STEP_H = 3                  # analysis every 3 h from 1 day before the first perimeter to the last
 GOES_STEP_MIN = 60               # one GOES scan per hour per satellite
-GOES_FIRE_MASK = {10, 11, 12, 13, 14, 15, 30, 31, 32, 33, 34, 35}   # ABI fire categories (processed + filtered)
+GOES_FIRE_MASK = {10, 11, 12, 13, 14, 30, 31, 32, 33, 34}   # ABI fire categories, low-probability (15, 35) excluded
 
 
 def _fire_span(g):
@@ -573,6 +573,35 @@ def _goes_latlon(ds):
     return lat.astype(np.float32), lon.astype(np.float32)
 
 
+def _goes_one(sess, bucket, sat, prefix, t, found, grids_ll, h5lock, netCDF4):
+    """Fire pixels from the scan nearest to time t of one satellite (appended to found)."""
+    import re
+    r = sess.get(f"https://{bucket}.s3.amazonaws.com/", params={"list-type": 2, "prefix": prefix}, timeout=60)
+    r.raise_for_status()
+    keys = re.findall(r"<Key>([^<]+)</Key>", r.text)
+    if not keys:
+        return
+    key = min(keys, key=lambda k: abs(int(k.split("_s")[1][9:11]) - t.minute))
+    rr = sess.get(f"https://{bucket}.s3.amazonaws.com/{key}", timeout=120)
+    rr.raise_for_status()
+    nc = rr.content
+    with h5lock:
+        ds = netCDF4.Dataset("x", memory=nc)
+        try:
+            mask = np.asarray(np.ma.filled(ds.variables["Mask"][:], 0))
+            powr = np.asarray(np.ma.filled(ds.variables["Power"][:], 0)) if "Power" in ds.variables \
+                else np.zeros(mask.shape, np.float32)
+            fire = np.isin(mask, list(GOES_FIRE_MASK))
+            if fire.any() and (sat, mask.shape) not in grids_ll:
+                grids_ll[(sat, mask.shape)] = _goes_latlon(ds)
+        finally:
+            ds.close()
+    if fire.any():
+        la, lo = grids_ll[(sat, mask.shape)]
+        ts = pd.to_datetime(key.split("_s")[1][:13], format="%Y%j%H%M%S", utc=True)
+        found.append((sat, ts, la[fire], lo[fire], mask[fire], powr[fire]))
+
+
 def goes_stage(out, grids, threads=16):
     """Per fire goes.npz: every GOES ABI fire pixel (CONUS product, hourly scans from both the East and
     West satellites) inside the fire's box: t (ns UTC), lat, lon, mask category, power (MW), sat.
@@ -608,33 +637,18 @@ def goes_stage(out, grids, threads=16):
             if not (pd.Timestamp(a, tz="UTC") <= t <= pd.Timestamp(b, tz="UTC")):
                 continue
             prefix = f"ABI-L2-FDCC/{t.year}/{t.dayofyear:03d}/{t.hour:02d}/"
-            try:
-                r = sess.get(f"https://{bucket}.s3.amazonaws.com/", params={"list-type": 2, "prefix": prefix}, timeout=60)
-                import re
-                keys = re.findall(r"<Key>([^<]+)</Key>", r.text)
-                if not keys:
-                    continue
-                want = t.minute
-                key = min(keys, key=lambda k: abs(int(k.split("_s")[1][9:11]) - want))
-                nc = sess.get(f"https://{bucket}.s3.amazonaws.com/{key}", timeout=120).content
-                with h5lock:
-                    ds = netCDF4.Dataset("x", memory=nc)
-                    try:
-                        mask = np.asarray(np.ma.filled(ds.variables["Mask"][:], 0))
-                        powr = np.asarray(np.ma.filled(ds.variables["Power"][:], 0)) if "Power" in ds.variables \
-                            else np.zeros(mask.shape, np.float32)
-                        fire = np.isin(mask, list(GOES_FIRE_MASK))
-                        if fire.any() and (sat, mask.shape) not in grids_ll:
-                            grids_ll[(sat, mask.shape)] = _goes_latlon(ds)
-                    finally:
-                        ds.close()
-                if fire.any():
-                    la, lo = grids_ll[(sat, mask.shape)]
-                    ts = pd.to_datetime(key.split("_s")[1][:13], format="%Y%j%H%M%S", utc=True)
-                    found.append((sat, ts, la[fire], lo[fire], mask[fire], powr[fire]))
-            except Exception as ex:  # noqa: BLE001
-                print(f"  GOES {sat} {t}: {ex}", flush=True)
+            for attempt in range(3):          # transient network errors: retry this satellite-hour
+                try:
+                    found_before = len(found)
+                    _goes_one(sess, bucket, sat, prefix, t, found, grids_ll, h5lock, netCDF4)
+                    break
+                except Exception as ex:  # noqa: BLE001
+                    if attempt == 2:
+                        print(f"  GOES {sat} {t}: {str(ex)[:150]}", flush=True)
+                    del found[found_before:]
+                    time.sleep(3 * (attempt + 1))
         return t, found
+
 
     t_start = time.time()
     with ThreadPoolExecutor(threads) as ex:

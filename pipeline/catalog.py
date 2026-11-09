@@ -303,6 +303,20 @@ def polygonal(g):
 
 
 N_BUCKETS = 8
+MAX_GAP_DAYS = 10        # perimeters further apart than this start a new episode
+
+
+def main_episode(grp):
+    """Split an incident at gaps > MAX_GAP_DAYS and keep the episode with the most perimeter days
+    (ties: the most growth). Removes misdated stray perimeters, e.g. a 'March' record on an August fire."""
+    gap = grp["perim_time"].diff().dt.total_seconds().fillna(0) / 86400
+    seg = (gap > MAX_GAP_DAYS).cumsum()
+    if seg.max() == 0:
+        return grp
+    best = max(seg.unique(), key=lambda k: (grp.loc[seg == k, "burn_day"].nunique(),
+                                             grp.loc[seg == k, "acres_calc"].max() - grp.loc[seg == k, "acres_calc"].min()))
+    return grp[seg == best]
+
 
 
 def _bucket(df):
@@ -356,7 +370,7 @@ def clean_all(out, years, min_acres, min_days):
         for k, v in drops.items():
             drops_all[k] = drops_all.get(k, 0) + v
         for inc, grp in gdf.groupby("incident"):
-            grp = grp.sort_values("perim_time")
+            grp = main_episode(grp.sort_values("perim_time"))
             if grp["acres_calc"].max() < min_acres or grp["burn_day"].nunique() < min_days:
                 continue
             bb = grp.total_bounds

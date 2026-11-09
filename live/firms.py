@@ -60,11 +60,11 @@ def latest(bbox, days, key=None):
 
 
 def history(bbox, start, end, key=None):
-    """Archived detections between two dates (inclusive), in 10-day requests."""
+    """Archived detections between two dates (inclusive), in 5-day requests (the API maximum with a date)."""
     out, d = [], date.fromisoformat(start)
     end_d = date.fromisoformat(end)
     while d <= end_d:
-        n = min(10, (end_d - d).days + 1)
+        n = min(5, (end_d - d).days + 1)
         for s in SP:
             out.append(get(s, bbox, n, d.isoformat(), key=key))
         d += timedelta(days=n)

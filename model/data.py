@@ -298,10 +298,13 @@ def stack(f, groups):
     return np.concatenate([f[g] for g in groups])
 
 
-def year_split(year, split="time"):
+VAL_YEARS, TEST_YEARS = {2023}, {2024, 2025}
+
+
+def year_split(year):
     """Default: train 2014-2022, validate 2023, test 2024-2025 (newest fires = the real test)."""
-    if year >= 2024:
+    if year in TEST_YEARS:
         return "test"
-    if year == 2023:
+    if year in VAL_YEARS:
         return "val"
     return "train"

@@ -223,7 +223,11 @@ def main():
     ap.add_argument("--eval-every", type=int, default=3)
     ap.add_argument("--max-fires", type=int)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    ap.add_argument("--val-years", default="2023", help="comma list (default 2023)")
+    ap.add_argument("--test-years", default="2024,2025", help="comma list (default 2024,2025)")
     a = ap.parse_args()
+    D.VAL_YEARS = {int(y) for y in a.val_years.split(",")}
+    D.TEST_YEARS = {int(y) for y in a.test_years.split(",")}
     runs = Path(a.data) / "runs"
     runs.mkdir(parents=True, exist_ok=True)
     torch.manual_seed(0)
