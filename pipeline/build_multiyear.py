@@ -98,6 +98,10 @@ def days_of(g):
 def st_labels(g, ctx):
     per = ctx["per"]
     p = per[per.fire_id == g["fire_id"]].sort_values("perim_time")
+    qc = ctx.get("qc")
+    if qc is not None:                       # leave out placeholder shapes and stale repeats (qc_fires.py)
+        bad_t = set(qc.loc[(qc.fire_id == g["fire_id"]) & qc["drop"], "perim_time"])
+        p = p[~p.perim_time.isin(bad_t)]
     arrival = np.full((g["height"], g["width"]), -1, np.int16)
     for i, gm in enumerate(p.geometry.values):
         m = rasterize([gm], g) & (arrival < 0)
@@ -352,6 +356,11 @@ def _ctx(out, catalog):
     import weather_features as WF
     per = gpd.read_parquet(Path(catalog) / "perimeters.parquet")
     _CTX["per"] = per
+    qp = Path(catalog) / "qc_perimeters.csv"
+    if qp.exists():
+        qc = pd.read_csv(qp, usecols=["fire_id", "perim_time", "drop"])
+        qc["perim_time"] = pd.to_datetime(qc["perim_time"], utc=True)
+        _CTX["qc"] = qc
     sess = requests.Session()
     cache = Path(out) / "cache" / "hrrr"
     cache.mkdir(parents=True, exist_ok=True)
@@ -778,12 +787,19 @@ def main():
     ap.add_argument("--limit", type=int)
     ap.add_argument("--fires", nargs="*")
     ap.add_argument("--years")
+    ap.add_argument("--include-bad", action="store_true", help="also build fires that qc_fires.py rated bad")
     a = ap.parse_args()
     os.environ["BUILD_WORKERS"] = str(a.workers)
     out = Path(a.out)
     (out / "fires").mkdir(parents=True, exist_ok=True)
     stages = STAGES[1:] if a.stages == "all" else a.stages.split(",")
     fires = pd.read_csv(Path(a.catalog) / "fires.csv")
+    qf = Path(a.catalog) / "qc_fires.csv"
+    if qf.exists() and not a.include_bad:
+        q = pd.read_csv(qf)
+        bad = set(q.loc[q.rating == "bad", "fire_id"])
+        print(f"QC: leaving out {len(bad)} fires rated bad (qc_fires.py; --include-bad to keep)", flush=True)
+        fires = fires[~fires.fire_id.isin(bad)]
     if a.years:
         y0, y1 = map(int, a.years.split("-"))
         fires = fires[fires.year.between(y0, y1)]

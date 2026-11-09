@@ -9,8 +9,12 @@ cd "$(dirname "$0")/../pipeline"
 if [ ! -f "$DATA/catalog/fires.csv" ]; then
   python catalog.py all --out "$DATA" --years 2014-2025                                    2>&1 | tee -a "$DATA/catalog.log"
 fi
+if [ ! -f "$DATA/catalog/qc_fires.csv" ]; then
+  python qc_fires.py --catalog "$DATA/catalog"                                             2>&1 | tee -a "$DATA/catalog.log"
+fi
 python build_multiyear.py --catalog "$DATA/catalog" --out "$DATA/my" --years 2014-2025 \
        --stages labels,history,viirs,terrain,weather,landfire,tessera,suppression,hrrr,goes,human \
        --workers "$WORKERS"                                                                 2>&1 | tee -a "$DATA/build.log"
+python qc_fires.py --catalog "$DATA/catalog" --built "$DATA/my"                               2>&1 | tail -8
 python quicklook_multiyear.py --out "$DATA/my" --fires $(ls "$DATA/my/fires" | shuf -n 12 --random-source=<(yes)) \
                                                                                             2>&1 | tail -3
