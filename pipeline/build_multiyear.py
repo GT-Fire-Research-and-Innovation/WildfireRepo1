@@ -711,6 +711,26 @@ def human_stage(out, grids):
             print(f"[human {k + 1}/{len(todo)}] {g['fire_id']}: ERROR {ex}", flush=True)
 
 
+def prewarm_suppression(out, years):
+    """Do the one-time downloads before the worker pool starts, so workers never race on them:
+    the 2020/2021 archive geodatabases (and their Parquet caches) and ICS-209-PLUS."""
+    import nifc_perimeters as NP
+    import requests
+    import suppression_layers as SL
+    NP.FGDB_DIR = Path(out) / "nifc_fgdb"
+    sess = requests.Session()
+    for y in [y for y in years if y >= 2018]:
+        for url, _ in SL.discover_archive_layers(sess, [y]).get(y, []):
+            if url.startswith("fgdb://"):
+                gdb, layer = url[len("fgdb://"):].split("|")
+                NP._fgdb_cache(gdb, layer)
+    if any(y <= 2020 for y in years):
+        try:
+            SL.load_ics209(Path(out))
+        except Exception as ex:  # noqa: BLE001
+            print("ICS-209-PLUS unavailable:", ex, flush=True)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--catalog", default="data/catalog")
@@ -750,6 +770,8 @@ def main():
     print(f"{len(grids)} fires to build, {len(skipped)} skipped as larger than {MAX_CELLS} cells a side", flush=True)
     pd.DataFrame(skipped, columns=["fire_id", "name", "height", "width"]).to_csv(out / "skipped_large.csv", index=False)
     pstages = [s for s in stages if s not in DATE_MAJOR]
+    if "suppression" in pstages:
+        prewarm_suppression(out, sorted({g["year"] for g in grids}))
     if pstages:
         t0 = time.time()
         with ProcessPoolExecutor(a.workers) as ex:
