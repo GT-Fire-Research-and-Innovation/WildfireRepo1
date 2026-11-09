@@ -13,8 +13,12 @@ then run live on current fires.
 | `pipeline/train.py` | Two-branch gated U-Net (the plan's "plain U-Net" baseline), distance/logistic baselines, evaluation |
 | `pipeline/analyze.py` | Error analysis by gap, distance from front, active fire, fire size, plus example maps |
 
-Planned next: `physics/` (differentiable Rothermel + level-set solver), `model/` (CNN encoder +
-temporal transformer), `app/` (web app).
+| `physics/rothermel.py` | Differentiable Rothermel surface spread in PyTorch (Scott & Burgan 40 fuel models, dynamic curing, BehavePlus wind adjustment, wind + slope vectors, elliptical shape). Matches the pyretechnics reference to 0.013 % on 400 random cases |
+| `physics/solver.py` | Differentiable arrival-time solver: 16-neighbour minimum travel time with an exact adjoint backward pass (memory does not grow with iterations) |
+| `tests/test_physics.py` | Flat circle, wind ellipse (L/B), upslope speed-up, non-burnable barrier, finite-difference gradient checks |
+
+Planned next: physics-only baseline on the 117 training fires, `model/` (CNN encoder + temporal
+transformer predicting a spread-rate correction), `app/` (web app).
 
 ## Setup
 ```bash
