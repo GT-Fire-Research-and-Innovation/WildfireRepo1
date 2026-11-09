@@ -193,6 +193,15 @@ def spread(fuel_idx, m1, m10, m100, m_herb, m_woody, wind10_ms, wind_from_deg, s
     lb = torch.clamp(0.936 * torch.exp(0.1147 * u_mph) + 0.461 * torch.exp(-0.0692 * u_mph) - 0.397, 1.0, 8.0)
     ecc = torch.sqrt((lb ** 2 - 1).clamp_min(0) + EPS ** 2) / lb
 
+    # non-burnable cells (water, rock, urban, ag): no spread, neutral shape (avoids 0 * inf = NaN)
+    zero = torch.zeros_like(r0)
+    r_head = torch.where(burnable, r_head, zero)
+    head_x = torch.where(burnable, head_x, zero)
+    head_y = torch.where(burnable, head_y, torch.ones_like(r0))
+    lb = torch.where(burnable, lb, torch.ones_like(r0))
+    ecc = torch.where(burnable, ecc, zero)
+    u_eff = torch.where(burnable, u_eff, zero)
+    i_r = torch.where(burnable, i_r, zero)
     return dict(r0=r0 * FT, r_head=r_head * FT, head_x=head_x, head_y=head_y, lb=lb, ecc=ecc,
                 u_eff=u_eff * FT, i_r=i_r * 1.055056 / FT ** 2 / 60.0, burnable=burnable)
 

@@ -666,6 +666,28 @@ def goes_stage(out, grids, threads=16):
                 print(f"  GOES {k}/{len(hours)} hours ({(time.time() - t_start) / 60:.0f} min)", flush=True)
 
 
+GOES_SUBLON = {"G16": -75.2, "G19": -75.2, "G17": -137.2, "G18": -137.0}
+
+
+def goes_parallax(lat, lon, elev_m, sat):
+    """Move GOES fire pixels to the terrain surface. ABI geolocation assumes the ellipsoid, so a fire at
+    height h appears displaced away from the satellite by h * tan(view zenith); shift it back."""
+    Re, Hs = 6378137.0, 35786023.0
+    lam_s = np.radians(np.array([GOES_SUBLON[str(x)] for x in sat]))
+    phi, lam = np.radians(lat), np.radians(lon)
+    cosg = np.cos(phi) * np.cos(lam - lam_s)
+    sing = np.sqrt(np.clip(1 - cosg ** 2, 0, 1))
+    vza = np.arctan2(sing, cosg - Re / (Re + Hs))
+    d = np.maximum(elev_m, 0) * np.tan(vza)                     # metres to move toward the satellite
+    # bearing from the pixel to the sub-satellite point (0, lam_s)
+    y = np.sin(lam_s - lam) * np.cos(0.0)
+    x = np.cos(phi) * np.sin(0.0) - np.sin(phi) * np.cos(0.0) * np.cos(lam_s - lam)
+    brg = np.arctan2(y, x)
+    dlat = d * np.cos(brg) / 110570.0
+    dlon = d * np.sin(brg) / (111320.0 * np.cos(phi))
+    return (lat + dlat).astype(np.float32), (lon + dlon).astype(np.float32)
+
+
 def _save_goes(out, fid, rows):
     if rows:
         n = [len(r[2]) for r in rows]
@@ -673,6 +695,22 @@ def _save_goes(out, fid, rows):
                    lon=np.concatenate([r[3] for r in rows]), mask=np.concatenate([r[4] for r in rows]).astype(np.int16),
                    power=np.concatenate([r[5] for r in rows]).astype(np.float32),
                    sat=np.repeat([r[0] for r in rows], n))
+        # parallax: terrain height under each pixel from the fire's DEM (mean elevation if outside it)
+        d = out / "fires" / fid
+        try:
+            g = json.loads((d / "grid.json").read_text())
+            elev = np.load(d / "terrain.npz")["elev"]
+            dx, _, x0, _, ey, y0 = g["transform"]
+            c = np.floor((arr["lon"] - x0) / dx).astype(int)
+            r = np.floor((arr["lat"] - y0) / ey).astype(int)
+            ok = (r >= 0) & (r < elev.shape[0]) & (c >= 0) & (c < elev.shape[1])
+            h = np.full(len(r), float(np.nanmean(elev)), np.float32)
+            h[ok] = elev[r[ok], c[ok]]
+            arr["lat_raw"], arr["lon_raw"] = arr["lat"].copy(), arr["lon"].copy()
+            arr["lat"], arr["lon"] = goes_parallax(arr["lat"], arr["lon"], h, arr["sat"])
+            arr["parallax_corrected"] = np.array(True)
+        except FileNotFoundError:
+            arr["parallax_corrected"] = np.array(False)
     else:
         arr = dict(t=np.zeros(0, np.int64), lat=np.zeros(0, np.float32), lon=np.zeros(0, np.float32),
                    mask=np.zeros(0, np.int16), power=np.zeros(0, np.float32), sat=np.zeros(0, "<U3"))

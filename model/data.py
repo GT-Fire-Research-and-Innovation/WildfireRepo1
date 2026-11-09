@@ -266,6 +266,9 @@ class Fire:
         phys = self.rothermel(fb, gmv, u_mean, v_mean, slope, ter["aspect"][sl].astype(np.float32), h, w)
         f["physics"] = np.stack([np.log1p(phys["r_head"]) / 3, phys["ecc"], phys["head_x"], phys["head_y"]]).astype(np.float32)
 
+        for k in f:                                   # last line of defence: no NaN / inf reaches the network
+            f[k] = np.nan_to_num(f[k], nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+        phys = {k: np.nan_to_num(v, nan=0.0, posinf=0.0, neginf=0.0) for k, v in phys.items()}
         target = self.arrival[sl] == i + 1
         mask = ~B0 & ~oth
         far = target & (dist > CLEAN_FAR_KM) & ~evidence[sl]

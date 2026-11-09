@@ -294,7 +294,7 @@ def main():
     torch.save(model.state_dict(), runs / f"{a.name}.pt")
     extra = {}
     if a.mode == "hybrid":
-        extra = {"effective_minutes_per_day": float(model.log_h.exp()), "softness_min": float(model.log_tau.exp())}
+        extra = {"effective_minutes_per_day": model.log_h.exp().item(), "softness_min": model.log_tau.exp().item()}
     json.dump({"name": a.name, "mode": a.mode, "drop": a.drop, "val": best[2], "test": mt, "history": hist,
                "pairs": rows, **extra}, open(runs / f"{a.name}.json", "w"), indent=1)
     print(f"[{a.name}] TEST AP {mt['ap']:.3f} F1 {mt['f1']:.3f} IoU {mt['iou']:.3f} P {mt['precision']:.3f} "
