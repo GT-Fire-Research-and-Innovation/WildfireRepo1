@@ -1,0 +1,16 @@
+numpy
+pandas
+scipy
+scikit-learn
+requests
+rasterio
+geopandas
+shapely
+pyproj
+xarray
+netCDF4
+zarr
+pygrib
+huggingface_hub
+torch
+matplotlib

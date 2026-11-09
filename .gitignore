@@ -1,0 +1,13 @@
+# data and secrets never go in git
+data/
+osm_work/
+*.npz
+*.npy
+*.tif
+*.pt
+*.ckpt
+*.zarr/
+.env
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
