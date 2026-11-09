@@ -1,8 +1,11 @@
-# conda env create -f environment.yml   (works without root: PACE, RunPod, a desktop)
+# Conda environment (no root needed: PACE, RunPod, a desktop). Python 3.12+ is required by geotessera.
+#   mamba env create -f environment.yml -p ~/scratch/envs/wildfire
+#   source activate ~/scratch/envs/wildfire
+#   pip install --index-url https://download.pytorch.org/whl/cu124 torch    # GPU build of PyTorch
 name: wildfire
-channels: [conda-forge, pytorch, nvidia]
+channels: [conda-forge]
 dependencies:
-  - python=3.11
+  - python=3.12
   - numpy
   - pandas
   - scipy
@@ -23,4 +26,4 @@ dependencies:
   - huggingface_hub
   - pip
   - pip:
-      - torch   # on a CUDA machine: pip install torch --index-url https://download.pytorch.org/whl/cu124
+      - geotessera
