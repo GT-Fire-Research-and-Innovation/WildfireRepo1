@@ -9,7 +9,7 @@
 #SBATCH -N 1 --cpus-per-task=8 --mem=64G
 #SBATCH -t 16:00:00
 #SBATCH -o logs/train-%j.out
-module load anaconda3
-conda activate "$HOME/scratch/envs/wildfire"
+module purge
+export PATH="$HOME/scratch/envs/wildfire/bin:$PATH"
 cd "$SLURM_SUBMIT_DIR/model"
 python train_hybrid.py --data "$HOME/scratch/wildfire/my" --name "${NAME:-hybrid}" --device cuda
