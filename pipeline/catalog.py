@@ -150,9 +150,15 @@ def _time(df):
         if c in df:
             v = df[c]
             num = pd.to_numeric(v, errors="coerce")
-            t = pd.to_datetime(num, unit="ms", utc=True, errors="coerce")
-            t = t.fillna(pd.to_datetime(v.where(num.isna()), utc=True, errors="coerce"))
-            out = out.fillna(t)
+            # milliseconds since 1970 between 2000 and 2030; anything else is an archive placeholder
+            ok = num.between(946684800000, 1893456000000)
+            t = pd.to_datetime(num.where(ok), unit="ms", utc=True, errors="coerce")
+            s = v.where(num.isna()).astype("string")
+            yr = pd.to_numeric(s.str.extract(r"^(\d{4})", expand=False), errors="coerce")
+            s = s.where(yr.between(2000, 2030))
+            t2 = pd.to_datetime(s, utc=True, errors="coerce", format="mixed")
+            t = t.fillna(t2.astype("datetime64[ns, UTC]"))
+            out = out.fillna(t.astype("datetime64[ns, UTC]"))
     return out
 
 
@@ -190,7 +196,11 @@ def select(out, years, min_acres, min_days):
     summ = g.agg(year=("year", "max"), name=("incidentname", "first"), days=("day", "nunique"),
                  max_acres=("acres", "max"), n=("t", "size"))
     cand = summ[(summ["max_acres"] >= min_acres) & (summ["days"] >= min_days)]
-    df[df["key"].isin(cand.index)].to_parquet(d / "candidate_records.parquet", index=False)
+    keep = df[df["key"].isin(cand.index)].copy()
+    for c in keep.columns:                    # archives mix ms numbers and ISO strings: store as text
+        if keep[c].dtype == object or c in ("perimeterdatetime", "polygondatetime", "datecurrent", "gdb_from_date", "day"):
+            keep[c] = keep[c].astype("string")
+    keep.to_parquet(d / "candidate_records.parquet", index=False)
     cand.to_csv(d / "candidates.csv")
     print(f"candidate incidents: {len(cand)} (from {summ.shape[0]}); per year:")
     print(cand.groupby("year").size().to_string())

@@ -203,8 +203,9 @@ def discover_sources(sess, years):
     sources = {}
     for y in sorted(years):
         found = []
-        g = f"Historic_Geomac_Perimeters_{y}"
-        if g in names:
+        # the 2019 service is spelled "GeoMAC", earlier years "Geomac"
+        g = next((n for n in names if n.lower() == f"historic_geomac_perimeters_{y}"), None)
+        if g:
             found.append(("geomac", f"{NIFC_ROOT}/{g}/FeatureServer/0"))
         nifs_names = [n for n in names if str(y) in n and re.search(
             r"(National_Incident_Feature_Service|NIFS_OpenData|NIFS_Archive|Operational_Data_Archive)", n, re.I)]
