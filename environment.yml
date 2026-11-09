@@ -1,0 +1,26 @@
+# conda env create -f environment.yml   (works without root: PACE, RunPod, a desktop)
+name: wildfire
+channels: [conda-forge, pytorch, nvidia]
+dependencies:
+  - python=3.11
+  - numpy
+  - pandas
+  - scipy
+  - scikit-learn
+  - geopandas
+  - pyogrio
+  - shapely>=2
+  - rasterio
+  - pyproj
+  - xarray
+  - netcdf4
+  - zarr
+  - pygrib
+  - osmium-tool
+  - aria2
+  - matplotlib
+  - requests
+  - huggingface_hub
+  - pip
+  - pip:
+      - torch   # on a CUDA machine: pip install torch --index-url https://download.pytorch.org/whl/cu124

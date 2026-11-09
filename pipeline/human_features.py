@@ -51,9 +51,11 @@ CHANNELS = {
     "power_line": ("power", {"line", "minor_line"}),  # cleared corridors; also an ignition source
     "building": ("building", None),
     "developed": ("landuse", {"residential", "commercial", "industrial", "retail"}),
+    "water": ("natural", {"water"}),                  # lakes, reservoirs, ponds (fire barriers)
+    "river": ("waterway", {"river", "canal"}),
 }
 CHANNEL_NAMES = list(CHANNELS)
-LINE_CHANNELS = ["road_major", "road_minor", "track_trail", "railway", "power_line"]
+LINE_CHANNELS = ["road_major", "road_minor", "track_trail", "railway", "power_line", "river"]
 
 
 # Fires outside the us-west region file: (state file, lon_min, lat_min, lon_max, lat_max).
@@ -65,7 +67,8 @@ TAG_FILTER = ["w/highway=" + ",".join(sorted(CHANNELS["road_major"][1] | CHANNEL
               "w/railway=" + ",".join(sorted(CHANNELS["railway"][1])),
               "w/power=" + ",".join(sorted(CHANNELS["power_line"][1])),
               "w/building",
-              "w/landuse=" + ",".join(sorted(CHANNELS["developed"][1]))]
+              "w/landuse=" + ",".join(sorted(CHANNELS["developed"][1])),
+              "a/natural=water", "w/waterway=river,canal"]
 RASTER_BATCH = 50000  # geometries per rasterize call (bounds memory over dense cities)
 
 
@@ -117,7 +120,7 @@ def fire_features(filt, fire, work):
     w, s, e, n = fire["bounds_lonlat"]
     cut = work / f"cut_{fire['fire_id']}.osm.pbf"
     seq = work / f"cut_{fire['fire_id']}.geojsonseq"
-    run(f"osmium extract --overwrite -s complete_ways -b {w},{s},{e},{n} {filt} -o {cut}")
+    run(f"osmium extract --overwrite -s smart -b {w},{s},{e},{n} {filt} -o {cut}")   # smart: complete lake multipolygons
     run(f"osmium export --overwrite {cut} -f geojsonseq --geometry-types=linestring,polygon -o {seq}")
     cut.unlink()
     try:
