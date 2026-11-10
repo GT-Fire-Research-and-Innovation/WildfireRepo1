@@ -10,6 +10,7 @@ randomly hidden (mask set to 0) so the model learns to work without them.
 """
 import json
 import math
+import warnings
 from pathlib import Path
 
 import numpy as np
@@ -231,7 +232,9 @@ class Fire:
                 mu, sd = GM_SCALE[n]
                 weather[c] = np.sin(np.radians(gmv[n])) if n == "th" else (gmv[n] - mu) / sd
             for c, (n, days) in enumerate([("vpd", 7), ("rmin", 7), ("fm100", 7), ("erc", 7), ("fm1000", 14)]):
-                a = np.nanmean(gm[max(0, k - days):k + 1, names.index(n)], axis=0)[np.ix_(gr, gc)]
+                with warnings.catch_warnings():          # all-NaN cells (gaps in GRIDMET) are filled below
+                    warnings.simplefilter("ignore", RuntimeWarning)
+                    a = np.nanmean(gm[max(0, k - days):k + 1, names.index(n)], axis=0)[np.ix_(gr, gc)]
                 mu, sd = GM_SCALE[n]
                 weather[9 + c] = (np.nan_to_num(a, nan=mu) - mu) / sd
         f["weather"] = weather
