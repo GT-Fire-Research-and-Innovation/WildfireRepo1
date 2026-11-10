@@ -16,7 +16,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-MIN_GAP_H, MAX_GAP_H = 3.0, 96.0
+MIN_GAP_H, MAX_GAP_H = 3.0, 168.0          # pairs up to 7 days apart (98 % of kept pairs); the gap is a model input
 CLEAN_FAR_KM = 3.0                 # new burn farther than this with no satellite fire nearby -> unknown
 HERB, WOODY = 0.6, 0.9             # live fuel moisture defaults (fraction)
 GM = ["vpd", "fm100", "fm1000", "bi", "erc", "rmin", "vs", "th", "tmmx"]

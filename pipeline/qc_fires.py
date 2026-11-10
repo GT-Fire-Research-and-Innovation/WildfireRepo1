@@ -13,9 +13,9 @@ Level 2, satellite evidence (needs the built dataset, run on ICE after build_mul
   python qc_fires.py --catalog data/catalog                       -> catalog/qc_perimeters.csv, qc_fires.csv
   python qc_fires.py --catalog data/catalog --built data/my       -> adds satellite agreement
 
-Placeholder perimeters and exact repeats get drop=True (build_multiyear.py leaves them out of the labels).
-Fire rating, from the kept perimeters: bad (< 3 usable or > 30 % jumps/shifts; not built), review
-(any jump, shift or x30 growth), good.
+Placeholder shapes, stale repeats and jumping / shifted perimeters get drop=True (build_multiyear.py leaves
+them out of the labels). A fire is kept when at least 2 good perimeters remain, else rated bad and not built;
+after the build, a fire whose new burn had satellite fire nearby less than 20 % of the time is also bad.
 """
 import argparse
 import math
@@ -74,64 +74,94 @@ PLACEHOLDER = ("circle", "box", "generated", "too_simple")
 
 
 def level1(catalog):
-    """Per perimeter: shape flags; then sequence checks against the previous KEPT perimeter
-    (placeholders and exact repeats are dropped, so they never make a real perimeter look wrong)."""
+    """Per perimeter, three passes:
+    1. shape: placeholder circles / boxes / triangles / generated shapes are dropped;
+    2. forward: exact repeats of the previous kept perimeter (stale copies) are dropped;
+    3. anchored on the fire's largest real perimeter (its true footprint): earlier perimeters, walking
+       backwards, must sit inside the next kept one (>= OVERLAP_MIN) and not jump (centroid > JUMP_KM and
+       farther than that fire's radius); later re-maps must cover the same ground as the anchor.
+    Big growth is kept (real blow-up days) but flagged."""
     import geopandas as gpd
     per = gpd.read_parquet(Path(catalog) / "perimeters.parquet").to_crs(5070)
     per = per.sort_values(["fire_id", "perim_time"]).reset_index(drop=True)
     rows = []
     for fid, grp in per.groupby("fire_id", sort=False):
-        prev = None
+        geoms = list(grp.geometry)
+        recs = []
         for k, (idx, r) in enumerate(grp.iterrows()):
-            g = r.geometry
-            m = shape_metrics(g)
-            flags = shape_flags(m)
+            m = shape_metrics(r.geometry)
             m.update(fire_id=fid, k=k, perim_time=r.perim_time, map_method=r.map_method, source=r.source)
-            placeholder = any(f in PLACEHOLDER for f in flags)
-            repeat = False
-            if prev is not None and not placeholder:
-                inter = prev.intersection(g).area if prev.intersects(g) else 0.0
-                m["overlap_prev"] = inter / max(prev.area, 1e-9)
+            m["_flags"] = shape_flags(m)
+            m["drop"] = any(f in PLACEHOLDER for f in m["_flags"])
+            recs.append(m)
+        prev = None                                   # pass 2: stale repeats
+        for m, g in zip(recs, geoms):
+            if m["drop"]:
+                continue
+            if prev is not None and abs(g.area - prev.area) < 1e-3 * max(prev.area, 1) and \
+                    prev.intersects(g) and prev.intersection(g).area / max(prev.area, 1e-9) > 0.999:
+                m["_flags"].append("repeat")
+                m["drop"] = True
+                continue
+            prev = g
+        # pass 3: consistency with the fire's footprint, anchored on its LARGEST real perimeter (a final
+        # perimeter can be a small partial re-map; the largest one is the fire's true extent)
+        live = [i for i, m in enumerate(recs) if not m["drop"]]
+        if live:
+            anchor = max(live, key=lambda i: geoms[i].area)
+            A = geoms[anchor]
+            nxt = A                                   # before the anchor: walk backwards, each inside the next kept
+            for i in reversed([i for i in live if i < anchor]):
+                g, m = geoms[i], recs[i]
+                inside = g.intersection(nxt).area / max(g.area, 1e-9) if g.intersects(nxt) else 0.0
+                jump = g.centroid.distance(nxt.centroid) / 1000
+                radius = math.sqrt(max(nxt.area, 1.0) / math.pi) / 1000
+                m["inside_next"], m["jump_km"] = round(inside, 3), round(jump, 2)
+                if inside < OVERLAP_MIN:
+                    # not inside the later footprint: misplaced / shifted (a jump on top of that = "jump")
+                    m["_flags"].append("jump" if (jump > JUMP_KM and jump > radius) else "shifted")
+                    m["drop"] = True
+                else:
+                    if jump > JUMP_KM and jump > radius:
+                        m["_flags"].append("lopsided_growth")   # inside the later fire: real one-sided run, kept
+                    nxt = g
+            for i in [i for i in live if i > anchor]:  # after the anchor: re-maps must cover the same ground
+                g, m = geoms[i], recs[i]
+                inter = g.intersection(A).area if g.intersects(A) else 0.0
+                m["inside_next"] = round(inter / max(g.area, 1e-9), 3)
+                if inter / max(g.area, 1e-9) < OVERLAP_MIN or inter / max(A.area, 1e-9) < OVERLAP_MIN:
+                    m["_flags"].append("shifted")
+                    m["drop"] = True
+        prev = None                                   # report growth / overlap vs the previous kept one
+        for m, g in zip(recs, geoms):
+            if m["drop"]:
+                continue
+            if prev is not None:
+                m["overlap_prev"] = prev.intersection(g).area / max(prev.area, 1e-9) if prev.intersects(g) else 0.0
                 m["growth"] = g.area / max(prev.area, 1e-9)
-                m["jump_km"] = prev.centroid.distance(g.centroid) / 1000
-                radius_km = math.sqrt(max(prev.area, 1.0) / math.pi) / 1000
-                repeat = bool(abs(g.area - prev.area) < 1e-3 * max(prev.area, 1) and m["overlap_prev"] > 0.999)
-                if m["overlap_prev"] < OVERLAP_MIN:
-                    flags.append("shifted")
-                if m["jump_km"] > JUMP_KM and m["jump_km"] > radius_km:
-                    flags.append("jump")
                 if m["growth"] > GROWTH_MAX and m["acres"] > 1000:
-                    flags.append("big_growth")
-            if repeat:
-                flags.append("repeat")
-            m["flags"] = ",".join(flags)
-            m["drop"] = placeholder or repeat
+                    m["_flags"].append("big_growth")
+            prev = g
+        for m in recs:
+            m["flags"] = ",".join(m.pop("_flags"))
             rows.append(m)
-            if not m["drop"]:
-                prev = g
     return pd.DataFrame(rows)
+
+
+MIN_KEEP = 2            # a fire with at least 2 good perimeters (one learnable pair) is kept
 
 
 def rate(pq):
     out = []
     for fid, g in pq.groupby("fire_id"):
-        n = len(g)
         fl = g["flags"].fillna("")
-        placeholder = int(fl.str.contains("circle|box|generated|too_simple").sum())
-        repeats = int(fl.str.contains("repeat").sum())
-        kept = g[~g["drop"]]
-        kfl = kept["flags"].fillna("")
-        seq = int(kfl.str.contains("shifted|jump").sum())
-        growth = int(kfl.str.contains("big_growth").sum())
-        usable = len(kept)
-        if usable < 3 or seq / max(usable, 1) > 0.3:
-            rating = "bad"
-        elif seq or growth:
-            rating = "review"
-        else:
-            rating = "good"
-        out.append(dict(fire_id=fid, perimeters=n, placeholder=placeholder, repeats=repeats, usable=usable,
-                        sequence_flags=seq, big_growth=growth, rating=rating,
+        usable = int((~g["drop"]).sum())
+        out.append(dict(fire_id=fid, perimeters=len(g), usable=usable,
+                        placeholder=int(fl.str.contains("circle|box|generated|too_simple").sum()),
+                        repeats=int(fl.str.contains("repeat").sum()),
+                        jumps_shifts=int(fl.str.contains("jump|shifted").sum()),
+                        big_growth=int(fl.str.contains("big_growth").sum()),
+                        rating="keep" if usable >= MIN_KEEP else "bad",
                         flags=";".join(f"{k}:{v}" for k, v in fl.str.split(",").explode().value_counts().items() if k)))
     return pd.DataFrame(out)
 
@@ -182,9 +212,7 @@ def main():
     if a.built:
         l2 = level2(a.built, qf["fire_id"])
         qf = qf.merge(l2, on="fire_id", how="left")
-        weak = qf["new_burn_with_satellite_fire"] < 0.5
-        qf.loc[weak & (qf["rating"] == "good"), "rating"] = "review"
-        qf.loc[qf["new_burn_with_satellite_fire"] < 0.2, "rating"] = "bad"
+        qf.loc[qf["new_burn_with_satellite_fire"] < 0.2, "rating"] = "bad"   # grew on paper, no satellite fire
     qf.to_csv(cat / "qc_fires.csv", index=False)
     print(qf["rating"].value_counts().to_string())
     print("\nperimeter flags:", pq["flags"].str.split(",").explode().value_counts().drop("", errors="ignore").to_dict())

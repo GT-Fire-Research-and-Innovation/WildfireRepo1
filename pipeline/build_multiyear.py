@@ -798,7 +798,11 @@ def main():
     if qf.exists() and not a.include_bad:
         q = pd.read_csv(qf)
         bad = set(q.loc[q.rating == "bad", "fire_id"])
-        print(f"QC: leaving out {len(bad)} fires rated bad (qc_fires.py; --include-bad to keep)", flush=True)
+        ov = Path(a.catalog) / "overrides.csv"          # team verdicts from the Perimeter QC page win
+        if ov.exists():
+            o = pd.read_csv(ov)
+            bad = (bad - set(o.loc[o.verdict == "keep", "fire_id"])) | set(o.loc[o.verdict == "drop", "fire_id"])
+        print(f"QC: leaving out {len(bad)} fires (rated bad, or dropped by the team; --include-bad to keep)", flush=True)
         fires = fires[~fires.fire_id.isin(bad)]
     if a.years:
         y0, y1 = map(int, a.years.split("-"))
