@@ -356,7 +356,7 @@ def main():
     print(f"[{a.out}] {len(members)} model(s); val/test fires {len(split['val'])}/{len(split['test'])}; "
           f"calibration {'on' if calibrate else 'off'}", flush=True)
 
-    res = {"name": a.out, "models": a.model, "resolution_m": res_m}
+    res = {"name": a.out, "models": a.model, "resolution_m": res_m, "data_version": D.DATA_VERSION}
     print("  validation pass (thresholds)", flush=True)
     sv, cv, _ = run_split(members, split["val"], calibrate, a.max_pairs)
     thr = {v: TH.metrics(sv[v], cv["y"])["thr"] for v in sv}

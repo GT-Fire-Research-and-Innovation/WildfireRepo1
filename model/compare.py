@@ -49,6 +49,10 @@ def main():
         if v in base:
             rows.append([label] + [fmt(base[v].get(k), d) for _, k, d in COLS])
     n_pairs = len(base.get("pairs", []))
+    versions = {name: e.get("data_version", 1) for name, e in evals}
+    if len(set(versions.values())) > 1:
+        out.append("WARNING: evaluations use different label versions (not the same cells): "
+                   + ", ".join(f"{n} v{v}" for n, v in versions.items()) + "\n")
     out.append(f"## Test years, {n_pairs} perimeter pairs (all models scored on the same cells)\n")
     out.append(table(["model"] + [c for c, _, _ in COLS], rows))
     for key, title in BREAKDOWNS:
