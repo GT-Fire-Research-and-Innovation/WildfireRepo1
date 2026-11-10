@@ -33,6 +33,7 @@ import time
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 import torch
 
 HERE = Path(__file__).resolve().parent
@@ -312,6 +313,8 @@ def main():
     ap.add_argument("--width", type=int, default=32)
     ap.add_argument("--max-pairs", type=int, help="quick check: stop after this many pairs per split")
     ap.add_argument("--catalog")
+    ap.add_argument("--fires", help="score only these test fires: a CSV with a fire_id column, or ids separated by commas "
+                                    "(e.g. ../benchmarks/tssatfire_2021_test_match.csv for the group's TS-SatFire test fires)")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--val-years", default="2023")
     ap.add_argument("--test-years", default="2024,2025")
@@ -323,6 +326,11 @@ def main():
     pca = TH.fit_pca(a.data, runs)
     fires = TH.load_fires(a.data, pca, None, a.catalog)
     split = {s: [f for f in fires if D.year_split(f.year) == s] for s in ("val", "test")}
+    if a.fires:
+        p = Path(a.fires)
+        keep = set(pd.read_csv(p)["fire_id"].dropna()) if p.suffix == ".csv" else set(a.fires.split(","))
+        split["test"] = [f for f in split["test"] if f.fid in keep]
+        print(f"  test limited to {len(split['test'])} of {len(keep)} listed fires", flush=True)
     res_m = fires[0].res_m
     TH.set_grid(res_m / 1000)
     groups_all = TH.groups_used(set())
