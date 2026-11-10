@@ -51,6 +51,10 @@ WIND_EDGES = [3, 6, 9]           # m/s: <3, 3-6, 6-9, >=9  (~<11, 11-22, 22-32, 
 WIND_NAMES = ["<3 m/s", "3-6 m/s", "6-9 m/s", ">=9 m/s"]
 GAP_EDGES = [12, 36, 72]         # hours
 GAP_NAMES = ["<=12 h", "12-36 h", "36-72 h", ">72 h"]
+GROW_EDGES = [0.5, 5, 50]        # km² of new burn in the pair
+GROW_NAMES = ["growth <0.5 km²", "0.5-5 km²", "5-50 km²", ">50 km²"]
+SIZE_EDGES = [40, 400]           # km² burned by the end of the fire (~10k and ~100k acres)
+SIZE_NAMES = ["fire <40 km²", "40-400 km²", ">400 km²"]
 
 
 # ---------------------------------------------------------------------------- models
@@ -183,9 +187,10 @@ def run_split(members, fires, calibrate, max_pairs=None, log_every=200):
     from scipy.ndimage import distance_transform_edt
     variants = ["raw"] + (["calibrated"] if calibrate else []) + ["distance"]
     out = {v: [] for v in variants}
-    Y, FUEL, WIND, GAP, rows = [], [], [], [], []
+    Y, FUEL, WIND, GAP, GROW, SIZE, rows = [], [], [], [], [], [], []
     cursor, n, t0 = 0, 0, time.time()
     for f in fires:
+        final_km2 = float((f.arrival >= 0).sum() * f.cell_km ** 2)
         prev = None                       # (pair index, per-member state, y, mask) of the previous pair
         for i, gap in f.pairs:
             feats, phys, y, m, b0 = f.sample(i, gap, window(f, i))
@@ -213,6 +218,9 @@ def run_split(members, fires, calibrate, max_pairs=None, log_every=200):
             FUEL.append(fuel[m])
             WIND.append(np.digitize(spd, WIND_EDGES).astype(np.int8)[m])
             GAP.append(np.full(int(m.sum()), np.digitize(gap, GAP_EDGES), np.int8))
+            GROW.append(np.full(int(m.sum()), np.digitize(y[m].sum() * f.cell_km ** 2, GROW_EDGES), np.int8))
+            SIZE.append(np.full(int(m.sum()), np.digitize(final_km2, SIZE_EDGES), np.int8))
+            rec["final_km2"] = round(final_km2, 2)
             rec["_b0"] = b0                               # kept only until edge errors are computed
             rec["_y"], rec["_m"] = y, m
             rows.append(rec)
@@ -227,7 +235,7 @@ def run_split(members, fires, calibrate, max_pairs=None, log_every=200):
             break
     arrays = {v: np.concatenate(out[v]) for v in variants}
     cells = dict(y=np.concatenate(Y).astype(bool), fuel=np.concatenate(FUEL), wind=np.concatenate(WIND),
-                 gap=np.concatenate(GAP))
+                 gap=np.concatenate(GAP), grow=np.concatenate(GROW), size=np.concatenate(SIZE))
     return arrays, cells, rows
 
 
@@ -340,6 +348,8 @@ def main():
         mt["by_fuel"] = breakdown(st[v], ct, thr[v], "fuel", FUEL_NAMES)
         mt["by_wind"] = breakdown(st[v], ct, thr[v], "wind", WIND_NAMES)
         mt["by_gap"] = breakdown(st[v], ct, thr[v], "gap", GAP_NAMES)
+        mt["by_growth"] = breakdown(st[v], ct, thr[v], "grow", GROW_NAMES)
+        mt["by_fire_size"] = breakdown(st[v], ct, thr[v], "size", SIZE_NAMES)
         res[v] = mt
     res["no_growth"] = no_growth(rows, y)
     cal = [r["cal"] for r in rows if r.get("cal")]
@@ -378,8 +388,8 @@ def main():
             else:
                 print(f"    {mb.name}: logit bias median {q['logit_bias_median']:+.2f}")
     best = "calibrated" if "calibrated" in res else "raw"
-    for key in ("by_fuel", "by_wind", "by_gap"):
-        print(f"  {best} {key[3:]}: " + "  ".join(f"{b['group']} F1 {b['f1']:.2f} (area {b['area_ratio']:.1f})" for b in res[best][key]))
+    for key in ("by_growth", "by_fire_size", "by_fuel", "by_wind", "by_gap"):
+        print(f"  {best} {key[3:]}: " + "  ".join(f"{b['group']} AP {b['ap']:.2f} F1 {b['f1']:.2f} (area {b['area_ratio']:.1f})" for b in res[best][key]))
     print(f"  saved {path}")
 
 
