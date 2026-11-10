@@ -5,7 +5,7 @@
 #SBATCH -J wf-hf-upload
 #SBATCH -p ice-cpu
 #SBATCH --qos=coe-ice
-#SBATCH -N 1 --cpus-per-task=8 --mem=16G
+#SBATCH -N 1 --cpus-per-task=8 --mem=64G
 #SBATCH -t 16:00:00
 #SBATCH -o logs/hf-upload-%j.out
 set -euo pipefail

@@ -10,7 +10,6 @@ randomly hidden (mask set to 0) so the model learns to work without them.
 """
 import json
 import math
-from functools import lru_cache
 from pathlib import Path
 
 import numpy as np
@@ -30,6 +29,12 @@ GROUPS = {  # name -> number of channels (including its mask channel where optio
     "fire": 11, "viirs": 3, "goes": 4, "terrain": 7, "fuels": 12, "tessera": 17, "human": 10, "history": 3,
     "weather": 14, "hrrr": 7, "suppression": 12, "physics": 4,
 }
+
+
+from collections import OrderedDict
+
+LAYER_CACHE = 24            # layers kept in memory per process (a fire has ~11)
+_CACHE = OrderedDict()
 
 
 class Fire:
@@ -55,11 +60,21 @@ class Fire:
     def has(self, name):
         return (self.d / f"{name}.npz").exists()
 
-    @lru_cache(maxsize=None)
     def z(self, name):
+        """Layer arrays, from a small per-process cache shared by all fires (keeps RAM bounded:
+        each DataLoader worker holds at most LAYER_CACHE layers at a time)."""
+        key = (self.fid, name)
+        hit = _CACHE.get(key)
+        if hit is not None:
+            _CACHE.move_to_end(key)
+            return hit
         if not self.has(name):
             return None
-        return dict(np.load(self.d / f"{name}.npz", allow_pickle=False))
+        arr = dict(np.load(self.d / f"{name}.npz", allow_pickle=False))
+        _CACHE[key] = arr
+        while len(_CACHE) > LAYER_CACHE:
+            _CACHE.popitem(last=False)
+        return arr
 
     def burned(self, i):
         return (self.arrival >= 0) & (self.arrival <= i)
