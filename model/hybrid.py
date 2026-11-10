@@ -69,8 +69,21 @@ def loss_fn(logits, y, mask, pos_weight=8.0, corr=None, corr_weight=1e-3):
 def combine_logits(a, b):
     """Logit of P = 1 - (1 - sigmoid(a)) (1 - sigmoid(b)): burned by spread OR by embers."""
     l1p = -nn.functional.softplus(a) - nn.functional.softplus(b)          # log(1 - P)
-    lp = torch.log(-torch.expm1(l1p.clamp(max=-1e-7)))                    # log(P)
+    lp = torch.logaddexp(-nn.functional.softplus(-a), -nn.functional.softplus(a) - nn.functional.softplus(-b))
     return lp - l1p
+
+
+def spread_or_spot(a, lam):
+    """Logit of P = 1 - (1 - sigmoid(a)) exp(-lam): burned by spread (logit a) OR by at least one
+    ember ignition (Poisson, expected ignitions lam >= 0). Where lam = 0 the result is exactly a, so
+    the spread keeps its full gradient; computed in log space, stable for very negative a."""
+    log_pa, log_1mpa = -nn.functional.softplus(-a), -nn.functional.softplus(a)
+    log_ps = torch.where(lam > 0, torch.log(-torch.expm1(-lam.clamp_min(1e-30))), torch.full_like(lam, -math.inf))
+    lp = torch.logaddexp(log_pa, log_1mpa + log_ps)
+    return lp - (log_1mpa - lam)
+
+
+SPOT_MOD = 1.5        # the network can scale ignitability by at most e^1.5 (~4.5x) either way
 
 
 class Hybrid2(Hybrid):
@@ -78,17 +91,17 @@ class Hybrid2(Hybrid):
 
         R      = (R_surface + w (R_crown - R_surface)) * exp(c) + floor       w learned, starts at 0.5
         spread = sigmoid((H_eff * gap - T) / tau)                             as in Hybrid
-        spot   = sigmoid(alpha * log(embers * gap + 1e-4) + beta + g)         alpha, beta learned
-        P      = 1 - (1 - spread) (1 - spot)
+        lam    = k * exp(1.5 tanh(g / 1.5)) * embers * gap                    expected ember ignitions
+        P      = 1 - (1 - spread) exp(-lam)
 
-    The network outputs three channels: c (spread correction), f (floor) and g (spotting correction).
-    w, alpha and beta are scalars, so the physics keeps its shape and the data sets the strengths."""
+    Embers come only from the burning front (no embers -> no spotting), k is a learned scalar and the
+    network output g only scales ignitability where embers land. The network outputs three channels:
+    c (spread correction), f (floor) and g (ignitability)."""
 
     def __init__(self, net, dx=150.0, r_floor=2.0, h_eff_init=480.0, tau_init=60.0, max_iter=400):
         super().__init__(net, dx, r_floor, h_eff_init, tau_init, max_iter)
         self.crown_logit = nn.Parameter(torch.tensor(0.0))
-        self.log_spot_a = nn.Parameter(torch.tensor(0.0))
-        self.spot_b = nn.Parameter(torch.tensor(-4.0))
+        self.log_k = nn.Parameter(torch.tensor(math.log(0.5)))
 
     def rate2(self, x, r_surf, r_crown):
         out = self.net(x)
@@ -97,8 +110,10 @@ class Hybrid2(Hybrid):
         w = torch.sigmoid(self.crown_logit)
         return (r_surf + w * (r_crown - r_surf).clamp_min(0)) * torch.exp(c) + floor, c, out[:, 2]
 
-    def spot_logit(self, ember, gap, g):
-        return self.log_spot_a.exp() * torch.log(ember * gap.view(-1, 1, 1) + 1e-4) + self.spot_b + g
+    def ignitions(self, ember, gap, g):
+        """Expected ember ignitions per cell over the gap (gap in days)."""
+        mod = torch.exp(SPOT_MOD * torch.tanh(g / SPOT_MOD))
+        return self.log_k.exp() * mod * ember.clamp_min(0) * gap.view(-1, 1, 1)
 
     def forward(self, x, phys, burning, gap):
         R, c, g = self.rate2(x, phys["r_head"], phys["r_crown"])
@@ -111,4 +126,4 @@ class Hybrid2(Hybrid):
             Ts.append(T)
             logits.append((horizon - T.clamp(max=1e5)) / tau)
         spread = torch.stack(logits)
-        return combine_logits(spread, self.spot_logit(phys["ember"], gap, g)), torch.stack(Ts), c
+        return spread_or_spot(spread, self.ignitions(phys["ember"], gap, g)), torch.stack(Ts), c

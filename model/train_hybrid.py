@@ -380,9 +380,18 @@ def main():
     start, best, hist = 0, (-1.0, None, None), []
     if ck.exists():
         c = torch.load(ck, weights_only=False, map_location=a.device)
-        model.load_state_dict(c["model"]); opt.load_state_dict(c["opt"]); sched.load_state_dict(c["sched"])
-        start, best, hist = c["epoch"], c["best"], c["hist"]
-        print(f"  resumed after epoch {start}", flush=True)
+        try:
+            model.load_state_dict(c["model"]); opt.load_state_dict(c["opt"]); sched.load_state_dict(c["sched"])
+            start, best, hist = c["epoch"], c["best"], c["hist"]
+            print(f"  resumed after epoch {start}", flush=True)
+        except (RuntimeError, ValueError, KeyError) as ex:   # checkpoint from an older version of this model
+            old = ck.with_suffix(".incompatible.ckpt")
+            ck.rename(old)
+            print(f"  checkpoint does not match the current model ({type(ex).__name__}); moved to {old.name}, "
+                  f"starting fresh", flush=True)
+            model = build_model(a.mode, n_in, a.width, a.device, dx=res_m)
+            opt = torch.optim.AdamW(model.parameters(), lr=a.lr, weight_decay=1e-4)
+            sched = torch.optim.lr_scheduler.OneCycleLR(opt, a.lr, total_steps=a.epochs * a.steps, pct_start=0.1)
     ds = Crops(split["train"], groups, a.steps * a.batch, seed=a.seed)
     dl = torch.utils.data.DataLoader(ds, batch_size=a.batch, num_workers=a.workers, persistent_workers=a.workers > 0)
     for ep in range(start, a.epochs):
@@ -420,10 +429,9 @@ def main():
     if a.mode in ("hybrid",) + V2_MODES:
         extra = {"effective_minutes_per_day": model.log_h.exp().item(), "softness_min": model.log_tau.exp().item()}
     if a.mode in V2_MODES:
-        extra.update(crown_weight=torch.sigmoid(model.crown_logit).item(), spot_alpha=model.log_spot_a.exp().item(),
-                     spot_beta=model.spot_b.item())
-        print(f"  learned: crown weight {extra['crown_weight']:.2f}, spotting alpha {extra['spot_alpha']:.2f} "
-              f"beta {extra['spot_beta']:.2f}, burning {extra['effective_minutes_per_day']:.0f} min/day", flush=True)
+        extra.update(crown_weight=torch.sigmoid(model.crown_logit).item(), ember_ignitability=model.log_k.exp().item())
+        print(f"  learned: crown weight {extra['crown_weight']:.2f}, ember ignitability {extra['ember_ignitability']:.3f}, "
+              f"burning {extra['effective_minutes_per_day']:.0f} min/day", flush=True)
     json.dump({"name": a.name, "mode": a.mode, "drop": a.drop, "data_version": D.DATA_VERSION, "val": best[2], "test": mt, "history": hist,
                "pairs": rows, **extra}, open(runs / f"{a.name}.json", "w"), indent=1)
     print(f"[{a.name}] TEST AP {mt['ap']:.3f} F1 {mt['f1']:.3f} IoU {mt['iou']:.3f} P {mt['precision']:.3f} "

@@ -43,3 +43,23 @@ def test_combine_logits_is_probability_union():
     want = 1 - (1 - pa) * (1 - pb)
     assert torch.allclose(torch.sigmoid(combine_logits(a, b)), want, atol=1e-5)
     assert torch.isfinite(combine_logits(torch.tensor([-60.0]), torch.tensor([-60.0]))).all()
+
+
+def test_spread_or_spot_matches_formula_and_keeps_gradient():
+    from hybrid import spread_or_spot
+    a = torch.tensor([-3.0, 0.5, 2.0, -800.0], requires_grad=True)
+    lam = torch.tensor([0.0, 0.3, 1e-6, 0.0])
+    out = spread_or_spot(a, lam)
+    want = 1 - (1 - torch.sigmoid(a.detach())) * torch.exp(-lam)
+    assert torch.allclose(torch.sigmoid(out[:3]), want[:3], atol=1e-6)
+    assert torch.isfinite(out).all()
+    out.sum().backward()
+    assert abs(a.grad[0].item() - 1.0) < 1e-6 and abs(a.grad[3].item() - 1.0) < 1e-6   # no embers: logit is exactly a
+    assert torch.isfinite(a.grad).all()
+
+
+def test_no_embers_means_no_spotting():
+    import train_hybrid as TH
+    m = TH.build_model("physics2", 1, 8, "cpu")
+    lam = m.ignitions(torch.zeros(1, 4, 4), torch.tensor([2.0]), torch.full((1, 4, 4), 10.0))
+    assert (lam == 0).all()

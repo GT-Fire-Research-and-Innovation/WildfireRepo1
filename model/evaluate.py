@@ -42,7 +42,7 @@ sys.path.insert(0, str(HERE))
 import data as D  # noqa: E402
 import train_hybrid as TH  # noqa: E402
 from physics import solver as S  # noqa: E402
-from hybrid import combine_logits  # noqa: E402
+from hybrid import spread_or_spot  # noqa: E402
 
 POS_WEIGHT = 8.0                 # same weighting as the training loss, so calibrated logits keep their scale
 CAL_A, CAL_S = 1.5, 1.0          # calibration limits: rate x/÷ 4.5, softness x/÷ 2.7
@@ -97,12 +97,15 @@ class Member:
                     sd, src = c["model"], f"latest (epoch {c['epoch']}, no validation yet)"
             else:
                 raise SystemExit(f"no checkpoint for {name} in {runs}")
-            head = next(v for k, v in sd.items() if k.endswith("head.weight"))
-            first = next(v for k, v in sd.items() if v.ndim == 4)
-            if first.shape[1] != n_in:
-                raise SystemExit(f"{name} was trained on {first.shape[1]} input channels, the data gives {n_in} "
-                                 f"(add its dropped groups: {name}:{mode}:group1+group2)")
-            self.model = TH.build_model(mode, n_in, int(head.shape[1]), device, dx=dx)   # width read from the weights
+            if mode == "physics2":                        # learned scalars only, no network
+                self.model = TH.build_model(mode, n_in, width, device, dx=dx)
+            else:
+                head = next(v for k, v in sd.items() if k.endswith("head.weight"))
+                first = next(v for k, v in sd.items() if v.ndim == 4)
+                if first.shape[1] != n_in:
+                    raise SystemExit(f"{name} was trained on {first.shape[1]} input channels, the data gives {n_in} "
+                                     f"(add its dropped groups: {name}:{mode}:group1+group2)")
+                self.model = TH.build_model(mode, n_in, int(head.shape[1]), device, dx=dx)   # width read from the weights
             self.model.load_state_dict(sd)
             print(f"  {name}: {mode}, {src}", flush=True)
         self.model.eval()
@@ -119,7 +122,7 @@ class Member:
         z = None
         if self.mode in TH.V2_MODES:
             R, _, g = m.rate2(x, P[None, 0], P[None, 4])
-            z = m.spot_logit(P[None, 5], torch.tensor([gap_h / 24], device=self.device), g)[0, :h, :w].float()
+            z = m.ignitions(P[None, 5], torch.tensor([gap_h / 24], device=self.device), g)[0, :h, :w].float()
         else:
             R, _ = m.rate(x, P[None, 0])
         costs = S.step_costs(R[0], P[1], P[2], P[3], m.dx)
@@ -128,14 +131,14 @@ class Member:
         T = S.arrival_time(costs, bb, max_iter=m.max_iter, t_max=horizon * 1.5 * math.exp(CAL_A))
         st = {"T": T[:h, :w].clamp(max=1e5).float(), "horizon": horizon, "tau": float(m.log_tau.exp())}
         if z is not None:
-            st["z"] = z                                   # spotting logit (calibration leaves it as is)
+            st["z"] = z                                   # expected ember ignitions (calibration leaves them as is)
         return st
 
     def logits(self, st, a=0.0, s=0.0):
         if "logit" in st:
             return st["logit"] * math.exp(-s) + a
         lg = (st["horizon"] - st["T"] * math.exp(-a)) / (st["tau"] * math.exp(s))
-        return combine_logits(lg, st["z"]) if "z" in st else lg
+        return spread_or_spot(lg, st["z"]) if "z" in st else lg
 
     def fit(self, st, y, mask):
         """Two calibration scalars from one observed pair (the fire's previous growth)."""
@@ -164,7 +167,7 @@ class Member:
             else:
                 lg = (st["horizon"] - base * torch.exp(-a)) / (st["tau"] * torch.exp(s))
                 if zz is not None:
-                    lg = combine_logits(lg, zz)
+                    lg = spread_or_spot(lg, zz)
             loss = torch.nn.functional.binary_cross_entropy_with_logits(lg, yy, pos_weight=pw) + CAL_PRIOR * (a ** 2 + s ** 2)
             opt.zero_grad()
             loss.backward()
