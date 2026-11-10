@@ -13,7 +13,12 @@ for log in $(ls -t logs/train-*.out 2>/dev/null); do
   best=$(grep -h "val AP" "$log" | sed 's/.*val AP \([0-9.]*\).*/\1/' | sort -n | tail -1)
   test=$(grep -h "TEST" "$log" | tail -1)
   err=$(grep -l "Traceback\|Error" "$log" >/dev/null && echo "  !! error in $log")
-  echo "$name ${last:-starting}   best val AP ${best:--}"
+  jid=$(basename "$log" .out | grep -o "[0-9]*$")
+  state=""
+  if [ -z "$test" ] && ! squeue -h -j "$jid" >/dev/null 2>&1 | grep -q . && ! squeue -h -j "$jid" 2>/dev/null | grep -q .; then
+    state="   (old log: that job ended without finishing, e.g. cancelled; a newer run may be waiting in the queue)"
+  fi
+  echo "$name ${last:-starting}   best val AP ${best:--}$state"
   [ -n "$test" ] && echo "    $test"
   [ -n "$err" ] && echo "$err"
 done
