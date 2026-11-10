@@ -2,6 +2,7 @@
 # Round 2: cleaned data (labels v2) + new physics, with detailed "before" evaluations.
 #   1. snapshot hybrid_v1 as it is now (best weights so far) -> hybrid_v1_before, then restart hybrid_v1
 #      from scratch on the cleaned data (so hybrid vs hybrid2 differ only in the physics)
+#      and cancel the old-physics ensemble seeds (hybrid_s1, hybrid_s2)
 #   2. make sure physics2_v1 and hybrid2_v1 (crown fire + spotting) are queued
 #   3. evaluate the "before" models: physics_v1, unet_v1, hybrid_v1_before
 #   4. evaluate hybrid_v1, hybrid2_v1, physics2_v1 automatically when their training ends
@@ -26,6 +27,12 @@ if [ -z "$(q wf-hybrid)" ] && [ ! -f "$RUNS/hybrid_v1.pt" ]; then
   H1=$(NAME=hybrid_v1 MODE=hybrid sub -J wf-hybrid scripts/ice_train.sbatch)
   H2=$(NAME=hybrid_v1 MODE=hybrid sub -J wf-hybrid --dependency=afterany:$H1 scripts/ice_train.sbatch)
   echo "hybrid_v1 (cleaned data): $H1 $H2"
+fi
+# 1b. the extra seeds were for the old-physics hybrid: drop them (rerun later on whichever hybrid wins)
+SEEDS=$(squeue -h -u "$USER" -n wf-hyb-s1,wf-hyb-s2 -o %i | tr '\n' ' ')
+if [ -n "$SEEDS" ]; then
+  scancel $SEEDS && echo "cancelled the old-physics ensemble seeds: $SEEDS"
+  rm -f "$RUNS"/hybrid_s1.ckpt "$RUNS"/hybrid_s2.ckpt
 fi
 # 2. new physics
 if [ -z "$(q wf-phys2)" ] && [ ! -f "$RUNS/physics2_v1.pt" ]; then
