@@ -161,8 +161,30 @@ def forward(model, mode, x, P, b0, gap_days):
     return logits, c
 
 
+def edge_error_km(b0, pred_new, true_new, cell_km=0.15):
+    """Symmetric mean distance (km) between the predicted and the actual NEW fire edge at the next
+    perimeter: only edge cells that moved off the current perimeter count (the shared old edge and
+    unburned islands are ignored). If one side did not grow, its edge is the current perimeter."""
+    from scipy.ndimage import binary_dilation, binary_erosion, binary_fill_holes, distance_transform_edt
+    B = binary_fill_holes(b0)
+    old_edge = binary_dilation(B & ~binary_erosion(B), iterations=1)
+    P, T = binary_fill_holes(B | pred_new), binary_fill_holes(B | true_new)
+    eP, eT = P & ~binary_erosion(P), T & ~binary_erosion(T)
+    nP, nT = eP & ~old_edge, eT & ~old_edge          # edge that moved
+    if not nP.any() and not nT.any():
+        return float("nan")                           # neither grew: nothing to measure
+    if not nP.any():
+        nP = eP                                       # predicted no growth: its edge is the current one
+    if not nT.any():
+        nT = eT
+    dT = distance_transform_edt(~eT) * cell_km
+    dP = distance_transform_edt(~eP) * cell_km
+    return float((dT[nP].mean() + dP[nT].mean()) / 2)
+
+
 @torch.no_grad()
-def evaluate(model, mode, fires, groups, device, max_pairs=None):
+def evaluate(model, mode, fires, groups, device, max_pairs=None, thr=None):
+    """thr (from validation) also computes each pair's fire-edge error in km."""
     """Whole-region scoring of every pair; returns pooled scores, labels and per-pair records."""
     model.eval()
     S, Y, rows = [], [], []
@@ -185,11 +207,30 @@ def evaluate(model, mode, fires, groups, device, max_pairs=None):
             s = logit[0, :y.shape[0], :y.shape[1]].float().cpu().numpy()
             S.append(s[m])
             Y.append(y[m])
-            rows.append(dict(fire=f.fid, year=f.year, i=i, gap_h=gap, new=int(y[m].sum()), cells=int(m.sum())))
+            rec = dict(fire=f.fid, year=f.year, i=i, gap_h=gap, new=int(y[m].sum()), cells=int(m.sum()))
+            if thr is not None:
+                rec["edge_km"] = edge_error_km(b0, (s >= thr) & m, y & m)
+                rec["edge_km_persist"] = edge_error_km(b0, np.zeros_like(b0), y & m)   # "no growth" reference
+            rows.append(rec)
             n += 1
             if max_pairs and n >= max_pairs:
                 return np.concatenate(S), np.concatenate(Y), rows
     return np.concatenate(S), np.concatenate(Y), rows
+
+
+def mode_probs(s):
+    """Scores are logits for the U-Net and hybrid; the physics-only model's are also logits of the
+    same burn-by-horizon form, so calibration is reported for all of them."""
+    return True
+
+
+def edge_summary(rows):
+    e = np.array([r["edge_km"] for r in rows if "edge_km" in r and np.isfinite(r["edge_km"])])
+    e0 = np.array([r["edge_km_persist"] for r in rows if "edge_km_persist" in r and np.isfinite(r["edge_km_persist"])])
+    if not len(e):
+        return {}
+    return {"edge_km_mean": float(e.mean()), "edge_km_median": float(np.median(e)),
+            "edge_km_no_growth_mean": float(e0.mean()) if len(e0) else float("nan")}
 
 
 def metrics(s, y, thr=None):
@@ -200,6 +241,17 @@ def metrics(s, y, thr=None):
         qs = np.unique(np.quantile(s, np.linspace(0.5, 0.9995, 400)))
         f1s = [2 * ((s >= q) & y).sum() / ((s >= q).sum() + y.sum() + 1e-9) for q in qs]
         thr = float(qs[int(np.argmax(f1s))])
+    if mode_probs(s):
+        prob = 1 / (1 + np.exp(-np.clip(s, -30, 30)))
+        out["brier"] = float(np.mean((prob - y) ** 2))
+        bins = np.minimum((prob * 10).astype(int), 9)
+        rel = []
+        for b in range(10):
+            sel = bins == b
+            if sel.sum() >= 50:
+                rel.append([round(b / 10 + 0.05, 2), round(float(prob[sel].mean()), 4), round(float(y[sel].mean()), 4), int(sel.sum())])
+        out["reliability"] = rel           # [bin centre, mean predicted, observed burn rate, cells]
+        out["ece"] = float(sum(abs(r[1] - r[2]) * r[3] for r in rel) / max(sum(r[3] for r in rel), 1))
     p = s >= thr
     tp, fp, fn = (p & y).sum(), (p & ~y).sum(), (~p & y).sum()
     out.update(thr=thr, f1=float(2 * tp / (2 * tp + fp + fn + 1e-9)), iou=float(tp / (tp + fp + fn + 1e-9)),
@@ -245,10 +297,13 @@ def main():
     if a.mode == "physics":
         sv, yv, _ = evaluate(model, a.mode, split["val"], groups, a.device)
         mv = metrics(sv, yv)
-        st, yt, rows = evaluate(model, a.mode, split["test"], groups, a.device)
+        st, yt, rows = evaluate(model, a.mode, split["test"], groups, a.device, thr=mv["thr"])
         mt = metrics(st, yt, mv["thr"])
+        mt.update(edge_summary(rows))
         json.dump({"name": a.name, "mode": a.mode, "val": mv, "test": mt, "pairs": rows}, open(runs / f"{a.name}.json", "w"), indent=1)
-        print(f"[{a.name}] TEST AP {mt['ap']:.3f} F1 {mt['f1']:.3f} IoU {mt['iou']:.3f} area {mt['area_ratio']:.2f}")
+        print(f"[{a.name}] TEST AP {mt['ap']:.3f} F1 {mt['f1']:.3f} IoU {mt['iou']:.3f} area {mt['area_ratio']:.2f}  "
+              f"edge {mt.get('edge_km_mean', float('nan')):.2f} km (no-growth {mt.get('edge_km_no_growth_mean', float('nan')):.2f})  "
+              f"Brier {mt.get('brier', float('nan')):.4f} ECE {mt.get('ece', float('nan')):.4f}")
         return
 
     opt = torch.optim.AdamW(model.parameters(), lr=a.lr, weight_decay=1e-4)
@@ -289,8 +344,9 @@ def main():
         torch.save({"model": model.state_dict(), "opt": opt.state_dict(), "sched": sched.state_dict(), "best": best,
                     "hist": hist, "epoch": ep + 1}, ck)
     model.load_state_dict(best[1])
-    st, yt, rows = evaluate(model, a.mode, split["test"], groups, a.device)
+    st, yt, rows = evaluate(model, a.mode, split["test"], groups, a.device, thr=best[2]["thr"])
     mt = metrics(st, yt, best[2]["thr"])
+    mt.update(edge_summary(rows))
     torch.save(model.state_dict(), runs / f"{a.name}.pt")
     extra = {}
     if a.mode == "hybrid":
@@ -298,7 +354,9 @@ def main():
     json.dump({"name": a.name, "mode": a.mode, "drop": a.drop, "val": best[2], "test": mt, "history": hist,
                "pairs": rows, **extra}, open(runs / f"{a.name}.json", "w"), indent=1)
     print(f"[{a.name}] TEST AP {mt['ap']:.3f} F1 {mt['f1']:.3f} IoU {mt['iou']:.3f} P {mt['precision']:.3f} "
-          f"R {mt['recall']:.3f} area {mt['area_ratio']:.2f}", flush=True)
+          f"R {mt['recall']:.3f} area {mt['area_ratio']:.2f}  edge {mt.get('edge_km_mean', float('nan')):.2f} km "
+          f"(no-growth {mt.get('edge_km_no_growth_mean', float('nan')):.2f})  Brier {mt.get('brier', float('nan')):.4f} "
+          f"ECE {mt.get('ece', float('nan')):.4f}", flush=True)
 
 
 if __name__ == "__main__":
