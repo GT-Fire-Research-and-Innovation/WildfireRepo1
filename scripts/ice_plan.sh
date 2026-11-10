@@ -17,7 +17,7 @@ cd "$(dirname "$0")/.."
 mkdir -p logs
 RUNS="$HOME/scratch/wildfire/my/runs"
 PY="$HOME/scratch/envs/wildfire/bin/python"
-q() { local out; for k in 1 2 3; do out=$(squeue -h -u "$USER" -n "$1" -o %i 2>/dev/null) && { echo "$out" | sort -n; return; }; sleep 3; done; }
+q() { local out; for k in 1 2 3; do out=$(squeue -h -u "$USER" -n "$1" -o %i 2>/dev/null) && { [ -n "$out" ] && echo "$out" | sort -n; return 0; }; sleep 3; done; }
 sub() { local j; for k in 1 2 3; do j=$(sbatch --parsable "$@") && [ -n "$j" ] && { echo "$j"; return 0; }; echo "  (sbatch failed, retrying)" >&2; sleep 5; done
         echo "  !! could not submit: sbatch $*" >&2; return 1; }
 
@@ -48,7 +48,7 @@ done
 TRAIN=()
 train() { local name="$1" mode="$2" jobname="$3" chain="$4" extra="${5:-}" t="${6:-16:00:00}"
   local ids; ids=$(q "$jobname" | tr '\n' ' ')
-  if [ -n "$ids" ]; then TRAIN+=($ids); echo "$name: already queued/running ($ids)"; return; fi
+  if [ -n "${ids// /}" ]; then TRAIN+=($ids); echo "$name: already queued/running ($ids)"; return; fi
   [ -f "$RUNS/$name.pt" ] && { echo "$name: already trained"; return; }
   local prev="" j
   for k in $(seq 1 "$chain"); do
