@@ -481,8 +481,8 @@ def prediction(d, i, weights, mode="hybrid", pca=None, drop=()):
     if (i - 1) in dict(f.pairs):
         g0 = dict(f.pairs)[i - 1]
         f0 = f.sample(i - 1, g0, E.window(f, i - 1))
-        a, s = mb.fit(mb.state(f0[0], f0[1], f0[4], g0), f0[2], f0[3])
-        panels.append((f"calibrated on pair {i - 1} (a={a:+.2f}, s={s:+.2f})", mb.logits(st, a, s).numpy()))
+        a, s = mb.fit([(mb.state(f0[0], f0[1], f0[4], g0), f0[2], f0[3])])
+        panels.append((f"calibrated on pair {i - 1} (a={a:+.2f})", mb.logits(st, a, s).numpy()))
     fig, axs = plt.subplots(2, len(panels), figsize=(5.2 * len(panels), 9.4))
     axs = np.array(axs).reshape(2, -1)
     H, W = b0.shape

@@ -45,8 +45,10 @@ from physics import solver as S  # noqa: E402
 from hybrid import spread_or_spot  # noqa: E402
 
 POS_WEIGHT = 8.0                 # same weighting as the training loss, so calibrated logits keep their scale
-CAL_A, CAL_S = 1.5, 1.0          # calibration limits: rate x/÷ 4.5, softness x/÷ 2.7
-CAL_PRIOR = 0.02                 # pull toward "no change" (matters when the last growth was tiny)
+CAL_A = 1.0                      # calibration limit: spread rate x/÷ e (U-Net: logit bias +-1)
+CAL_HISTORY = 3                  # fit on up to the 3 previous pairs of the fire
+CAL_MIN_BURNED = 30              # skip calibration when they burned fewer cells than this
+CAL_SHRINK_BURNED = 300          # a is scaled by n / (n + 300): weak evidence -> small adjustment
 CAL_STEPS, CAL_MAX_CELLS = 60, 200_000
 FUEL_NAMES = [n for n, _, _ in D.FUEL_FAMILIES] + ["unknown"]
 WIND_EDGES = [3, 6, 9]           # m/s: <3, 3-6, 6-9, >=9  (~<11, 11-22, 22-32, >32 km/h)
@@ -128,7 +130,7 @@ class Member:
         costs = S.step_costs(R[0], P[1], P[2], P[3], m.dx)
         horizon = float(m.log_h.exp()) * gap_h / 24
         # wide horizon so arrival times stay finite for any rate multiplier calibration may pick
-        T = S.arrival_time(costs, bb, max_iter=m.max_iter, t_max=horizon * 1.5 * math.exp(CAL_A))
+        T = S.arrival_time(costs, bb, max_iter=m.max_iter, t_max=horizon * 1.5 * math.exp(1.5))
         st = {"T": T[:h, :w].clamp(max=1e5).float(), "horizon": horizon, "tau": float(m.log_tau.exp())}
         if z is not None:
             st["z"] = z                                   # expected ember ignitions (calibration leaves them as is)
@@ -140,42 +142,51 @@ class Member:
         lg = (st["horizon"] - st["T"] * math.exp(-a)) / (st["tau"] * math.exp(s))
         return spread_or_spot(lg, st["z"]) if "z" in st else lg
 
-    def fit(self, st, y, mask):
-        """Two calibration scalars from one observed pair (the fire's previous growth)."""
-        sel = torch.from_numpy(mask).to(self.device)
-        yy = torch.from_numpy(y).to(self.device)[sel].float()
-        zz = st["z"][sel] if "z" in st else None
-        if "logit" in st:
-            base = st["logit"][sel]
-        else:
-            base = st["T"][sel]
-        if base.numel() == 0:
+    def fit(self, history):
+        """One calibration scalar from the fire's recent observed growth (up to CAL_HISTORY earlier pairs,
+        all known at forecast time): a = log spread-rate multiplier (hybrid / physics) or logit bias
+        (U-Net). It is shrunk toward 0 by how much growth was seen, and skipped when that was tiny,
+        because one small pair says little about the next day's weather-driven growth."""
+        parts, n_pos = [], 0
+        for st, y, mask in history:
+            sel = torch.from_numpy(mask).to(self.device)
+            yy = torch.from_numpy(y).to(self.device)[sel].float()
+            if yy.numel() == 0:
+                continue
+            base = st["logit"][sel] if "logit" in st else st["T"][sel]
+            zz = st["z"][sel] if "z" in st else None
+            cap = CAL_MAX_CELLS // max(len(history), 1)
+            if base.numel() > cap:                         # keep every burned cell, sample the rest
+                pos = torch.nonzero(yy > 0)[:, 0]
+                neg = torch.nonzero(yy == 0)[:, 0]
+                keep = torch.cat([pos, neg[torch.randperm(len(neg), device=neg.device)[:max(cap - len(pos), 0)]]])
+                base, yy = base[keep], yy[keep]
+                zz = zz[keep] if zz is not None else None
+            n_pos += int(yy.sum())
+            parts.append((st, base, yy, zz))
+        if n_pos < CAL_MIN_BURNED:
             return 0.0, 0.0
-        if base.numel() > CAL_MAX_CELLS:                   # keep every burned cell, sample the rest
-            pos = torch.nonzero(yy > 0)[:, 0]
-            neg = torch.nonzero(yy == 0)[:, 0]
-            keep = torch.cat([pos, neg[torch.randperm(len(neg), device=neg.device)[:CAL_MAX_CELLS - len(pos)]]])
-            base, yy = base[keep], yy[keep]
-            zz = zz[keep] if zz is not None else None
         a = torch.zeros((), device=self.device, requires_grad=True)
-        s = torch.zeros((), device=self.device, requires_grad=True)
-        opt = torch.optim.Adam([a, s], lr=0.1)
-        pw = torch.tensor(POS_WEIGHT, device=self.device)
+        opt = torch.optim.Adam([a], lr=0.1)
+        pw = torch.tensor(1.0, device=self.device)        # unweighted: expected burned area matches what was seen
         for _ in range(CAL_STEPS):
-            if "logit" in st:
-                lg = base * torch.exp(-s) + a
-            else:
-                lg = (st["horizon"] - base * torch.exp(-a)) / (st["tau"] * torch.exp(s))
-                if zz is not None:
-                    lg = spread_or_spot(lg, zz)
-            loss = torch.nn.functional.binary_cross_entropy_with_logits(lg, yy, pos_weight=pw) + CAL_PRIOR * (a ** 2 + s ** 2)
+            losses = []
+            for st, base, yy, zz in parts:
+                if "logit" in st:
+                    lg = base + a
+                else:
+                    lg = (st["horizon"] - base * torch.exp(-a)) / st["tau"]
+                    if zz is not None:
+                        lg = spread_or_spot(lg, zz)
+                losses.append(torch.nn.functional.binary_cross_entropy_with_logits(lg, yy, pos_weight=pw, reduction="sum"))
+            loss = torch.stack(losses).sum() / sum(len(p[2]) for p in parts)
             opt.zero_grad()
             loss.backward()
             opt.step()
             with torch.no_grad():
                 a.clamp_(-CAL_A, CAL_A)
-                s.clamp_(-CAL_S, CAL_S)
-        return float(a.detach()), float(s.detach())
+        shrink = n_pos / (n_pos + CAL_SHRINK_BURNED)       # little evidence -> stay close to the model
+        return float(a.detach()) * shrink, 0.0
 
 
 def ens_logit(logits):
@@ -209,7 +220,7 @@ def run_split(members, fires, calibrate, max_pairs=None, log_every=200):
     cursor, n, t0 = 0, 0, time.time()
     for f in fires:
         final_km2 = float((f.arrival >= 0).sum() * f.cell_km ** 2)
-        prev = None                       # (pair index, per-member state, y, mask) of the previous pair
+        hist = []                         # earlier pairs of this fire: (per-member states, y, mask)
         for i, gap in f.pairs:
             feats, phys, y, m, b0 = f.sample(i, gap, window(f, i))
             states = [mb.state(feats, phys, b0, gap) for mb in members]
@@ -218,9 +229,11 @@ def run_split(members, fires, calibrate, max_pairs=None, log_every=200):
             rec = dict(fire=f.fid, year=f.year, i=i, gap_h=gap, new=int(y[m].sum()), cells=int(m.sum()),
                        start=cursor, stop=cursor + int(m.sum()))
             if calibrate:
-                if prev is not None and prev[0] == i - 1:
-                    params = [mb.fit(pst, prev[2], prev[3]) for mb, pst in zip(members, prev[1])]
+                if hist:
+                    params = [mb.fit([(h[0][k], h[1], h[2]) for h in hist[-CAL_HISTORY:]]) for k, mb in enumerate(members)]
                     rec["cal"] = [[round(a, 3), round(s, 3)] for a, s in params]
+                    if not any(a for a, _ in params):
+                        rec["cal"] = None                        # too little recent growth: left as the model
                 else:
                     params = [(0.0, 0.0)] * len(members)     # first pair of a fire: nothing to calibrate on
                     rec["cal"] = None
@@ -243,7 +256,7 @@ def run_split(members, fires, calibrate, max_pairs=None, log_every=200):
             rec["_y"], rec["_m"] = y, m
             rows.append(rec)
             cursor = rec["stop"]
-            prev = (i, states, y, m)
+            hist = (hist + [(states, y, m)])[-CAL_HISTORY:]
             n += 1
             if n % log_every == 0:
                 print(f"    {n} pairs ({(time.time() - t0) / 60:.1f} min)", flush=True)
@@ -407,7 +420,7 @@ def main():
               f"{m.get('edge_km_mean', float('nan')):8.2f}")
     if "calibration_params" in res:
         c = res["calibration_params"]
-        print(f"  calibration: {c['pairs_calibrated']}/{c['pairs_total']} pairs calibrated on the previous pair")
+        print(f"  calibration: {c['pairs_calibrated']}/{c['pairs_total']} pairs calibrated on up to {CAL_HISTORY} earlier pairs (the rest had too little recent growth)")
         for mb in members:
             q = c[mb.name]
             if "rate_multiplier_median" in q:
