@@ -135,9 +135,17 @@ def st_history(g, ctx):
               "maxAllowableOffset": 0.0005, "f": "geojson", "resultRecordCount": 1000}
     feats, off = [], 0
     while True:
-        js = requests.get(f"{HIST_URL}/query", params=dict(params, resultOffset=off), timeout=180).json()
-        if "error" in js:
-            raise RuntimeError(js["error"])
+        for attempt in range(6):          # the history service sometimes answers with an HTML error page
+            try:
+                r = requests.get(f"{HIST_URL}/query", params=dict(params, resultOffset=off), timeout=180)
+                js = r.json()
+                if "error" in js:
+                    raise RuntimeError(js["error"])
+                break
+            except (ValueError, RuntimeError, requests.RequestException):
+                if attempt == 5:
+                    raise
+                time.sleep(5 * 2 ** attempt + np.random.uniform(0, 3))
         batch = js.get("features", [])
         feats += batch
         if len(batch) < 1000:
