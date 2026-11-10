@@ -46,9 +46,18 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(HERE.parent))
 
-RES_M = 150.0
-PAD = 64                     # cells (9.6 km) around the union of all perimeters
-MAX_CELLS = 1600             # per side (240 km); larger fires are skipped and logged
+RES_M = 150.0                # grid cell size (m); --res changes it (e.g. 75 for the fine-resolution build)
+PAD_KM = 9.6                 # margin around the union of all perimeters
+MAX_KM = 240.0               # larger fires (per side) are skipped and logged
+PAD = int(round(PAD_KM * 1000 / RES_M))
+MAX_CELLS = int(round(MAX_KM * 1000 / RES_M))
+
+
+def set_resolution(res_m):
+    global RES_M, PAD, MAX_CELLS
+    RES_M = float(res_m)
+    PAD = int(round(PAD_KM * 1000 / RES_M))
+    MAX_CELLS = int(round(MAX_KM * 1000 / RES_M))
 DAYS_BEFORE, DAYS_AFTER = 14, 2
 STAGES = ["grid", "labels", "history", "viirs", "terrain", "weather", "landfire", "tessera", "suppression",
           "hrrr", "goes", "human"]
@@ -66,7 +75,7 @@ def make_grid(row):
     W = int(math.ceil((row.east - row.west) / dx)) + 2 * PAD
     H = int(math.ceil((row.north - row.south) / dy)) + 2 * PAD
     x0, y0 = row.west - PAD * dx, row.north + PAD * dy
-    return dict(fire_id=row.fire_id, name=row["name"], year=int(row.year), transform=[dx, 0.0, x0, 0.0, -dy, y0],
+    return dict(fire_id=row.fire_id, name=row["name"], year=int(row.year), res_m=RES_M, transform=[dx, 0.0, x0, 0.0, -dy, y0],
                 height=H, width=W, bounds_lonlat=[x0, y0 - H * dy, x0 + W * dx, y0],
                 first=str(row["first"]), last=str(row["last"]))
 
@@ -189,8 +198,9 @@ def st_viirs(g, ctx):
         r = np.floor((pts["latitude"].values - y0) / ey).astype(int)
         night = (pts["daynight"].astype(str) == "N").values
         f = pd.to_numeric(pts["frp"], errors="coerce").fillna(0).values
-        for dr in (-1, 0, 1):                 # 375 m footprint ~ 3 x 3 cells of 150 m
-            for dc in (-1, 0, 1):
+        fp = max(1, int(round(187.5 / g.get("res_m", 150.0))))   # 375 m VIIRS footprint, in cells each side
+        for dr in range(-fp, fp + 1):
+            for dc in range(-fp, fp + 1):
                 rr, cc = r + dr, c + dc
                 ok = (di >= 0) & (di < D) & (rr >= 0) & (rr < H) & (cc >= 0) & (cc < W)
                 np.add.at(af_night, (di[ok & night], rr[ok & night], cc[ok & night]), 1)
@@ -206,9 +216,11 @@ def st_terrain(g, ctx):
     from scipy.ndimage import uniform_filter
     elev, slope, aspect = B.dem_region(g["transform"], (0, g["height"], 0, g["width"]))
     # terrain position: elevation minus the mean around it (ridge > 0, valley < 0), at 0.5 km and 2 km
-    tpi_s = elev - uniform_filter(elev, 7, mode="nearest")
-    tpi_l = elev - uniform_filter(elev, 27, mode="nearest")
-    rough = np.sqrt(np.maximum(uniform_filter(elev ** 2, 5, mode="nearest") - uniform_filter(elev, 5, mode="nearest") ** 2, 0))
+    cells = lambda m: max(3, int(round(m / g.get("res_m", 150.0))) | 1)  # noqa: E731  (odd window in cells)
+    tpi_s = elev - uniform_filter(elev, cells(1050), mode="nearest")
+    tpi_l = elev - uniform_filter(elev, cells(4050), mode="nearest")
+    w = cells(750)
+    rough = np.sqrt(np.maximum(uniform_filter(elev ** 2, w, mode="nearest") - uniform_filter(elev, w, mode="nearest") ** 2, 0))
     return dict(elev=elev, slope=slope.astype(np.float16), aspect=aspect.astype(np.float16),
                 tpi_500m=tpi_s.astype(np.float16), tpi_2km=tpi_l.astype(np.float16), rough=rough.astype(np.float16))
 
@@ -239,7 +251,7 @@ def st_tessera(g, ctx):
     if ty < TESSERA_FIRST_YEAR:
         return dict(missing=np.array(True), year=np.array(ty))
     gt = ctx["tessera"]()
-    k = 15                                        # 15 x 10 m = 150 m blocks
+    k = max(1, int(round(g.get("res_m", 150.0) / 10)))   # 10 m Tessera pixels per grid cell (15 at 150 m)
     acc = cnt = None
     tr0 = crs = None
     for strip, tr, crs in gt.iter_region(tuple(g["bounds_lonlat"]), ty, strip_rows=10 * k):
@@ -359,7 +371,7 @@ def _ctx(out, catalog):
     qp = Path(catalog) / "qc_perimeters.csv"
     if qp.exists():
         qc = pd.read_csv(qp, usecols=["fire_id", "perim_time", "drop"])
-        qc["perim_time"] = pd.to_datetime(qc["perim_time"], utc=True)
+        qc["perim_time"] = pd.to_datetime(qc["perim_time"], utc=True, format="mixed")   # some have fractional seconds
         _CTX["qc"] = qc
     sess = requests.Session()
     cache = Path(out) / "cache" / "hrrr"
@@ -788,7 +800,9 @@ def main():
     ap.add_argument("--fires", nargs="*")
     ap.add_argument("--years")
     ap.add_argument("--include-bad", action="store_true", help="also build fires that qc_fires.py rated bad")
+    ap.add_argument("--res", type=float, default=150.0, help="grid cell size in metres (75 for the fine build)")
     a = ap.parse_args()
+    set_resolution(a.res)
     os.environ["BUILD_WORKERS"] = str(a.workers)
     out = Path(a.out)
     (out / "fires").mkdir(parents=True, exist_ok=True)

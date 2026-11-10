@@ -28,9 +28,20 @@ import data as D  # noqa: E402
 from hybrid import Hybrid, loss_fn  # noqa: E402
 from nets import UNet  # noqa: E402
 
-CROP = 160                       # 24 km training crops
-EDGE = 16                        # cells at crop edges excluded from the loss (fire may enter from outside)
-EVAL_MAX = 768                   # evaluate whole regions up to this size, tile above it
+CROP_KM = 24.0                   # training crops cover 24 km (160 cells at 150 m, 320 at 75 m)
+EDGE_KM = 2.4                    # crop edge excluded from the loss (fire may enter from outside)
+EVAL_PAD_KM = 9.6                # evaluation window: current fire + this margin
+EVAL_MAX_KM = 115.0              # very large fires: window this size centred on the fire
+CROP, EDGE, EVAL_PAD, EVAL_MAX = 160, 16, 64, 768
+
+
+def set_grid(cell_km):
+    """Turn the km constants into cells for this dataset's resolution (multiples of 8 for the U-Net)."""
+    global CROP, EDGE, EVAL_PAD, EVAL_MAX
+    CROP = int(round(CROP_KM / cell_km / 8)) * 8
+    EDGE = int(round(EDGE_KM / cell_km))
+    EVAL_PAD = int(round(EVAL_PAD_KM / cell_km))
+    EVAL_MAX = int(round(EVAL_MAX_KM / cell_km / 8)) * 8
 HIDE_P = 0.15                    # chance of hiding each optional group during training
 
 
@@ -102,8 +113,9 @@ class Crops(torch.utils.data.Dataset):
         f = self.fires[fi]
         fc = f.front_cells(i)
         r, c = fc[rng.integers(len(fc))] if len(fc) else (f.H // 2, f.W // 2)
-        r0 = int(np.clip(r - CROP // 2 + rng.integers(-24, 25), 0, max(f.H - CROP, 0)))
-        c0 = int(np.clip(c - CROP // 2 + rng.integers(-24, 25), 0, max(f.W - CROP, 0)))
+        jit = CROP // 7
+        r0 = int(np.clip(r - CROP // 2 + rng.integers(-jit, jit + 1), 0, max(f.H - CROP, 0)))
+        c0 = int(np.clip(c - CROP // 2 + rng.integers(-jit, jit + 1), 0, max(f.W - CROP, 0)))
         win = (r0, min(r0 + CROP, f.H), c0, min(c0 + CROP, f.W))
         hide = tuple(g for g in D.OPTIONAL if rng.random() < HIDE_P)
         feats, phys, y, m, b0 = f.sample(i, gap, win, hide)
@@ -136,12 +148,12 @@ def flip_x_channels(groups):
     return out
 
 
-def build_model(mode, n_in, width, device):
+def build_model(mode, n_in, width, device, dx=150.0):
     if mode == "unet":
         return UNet(n_in, 1, width).to(device)
     if mode == "hybrid":
-        return Hybrid(UNet(n_in, 2, width)).to(device)
-    return Hybrid(ZeroNet()).to(device)
+        return Hybrid(UNet(n_in, 2, width), dx=dx, max_iter=int(400 * 150 / dx)).to(device)
+    return Hybrid(ZeroNet(), dx=dx, max_iter=int(400 * 150 / dx)).to(device)
 
 
 class ZeroNet(torch.nn.Module):
@@ -193,8 +205,8 @@ def evaluate(model, mode, fires, groups, device, max_pairs=None, thr=None):
         for i, gap in f.pairs:
             b = f.burned(i)
             rr, cc = np.nonzero(b)
-            r0, r1 = max(rr.min() - 64, 0), min(rr.max() + 65, f.H)
-            c0, c1 = max(cc.min() - 64, 0), min(cc.max() + 65, f.W)
+            r0, r1 = max(rr.min() - EVAL_PAD, 0), min(rr.max() + EVAL_PAD + 1, f.H)
+            c0, c1 = max(cc.min() - EVAL_PAD, 0), min(cc.max() + EVAL_PAD + 1, f.W)
             if (r1 - r0) > EVAL_MAX or (c1 - c0) > EVAL_MAX:   # very large fire: centre window on the front
                 rm, cm = int(rr.mean()), int(cc.mean())
                 r0, r1 = max(rm - EVAL_MAX // 2, 0), min(rm + EVAL_MAX // 2, f.H)
@@ -209,8 +221,8 @@ def evaluate(model, mode, fires, groups, device, max_pairs=None, thr=None):
             Y.append(y[m])
             rec = dict(fire=f.fid, year=f.year, i=i, gap_h=gap, new=int(y[m].sum()), cells=int(m.sum()))
             if thr is not None:
-                rec["edge_km"] = edge_error_km(b0, (s >= thr) & m, y & m)
-                rec["edge_km_persist"] = edge_error_km(b0, np.zeros_like(b0), y & m)   # "no growth" reference
+                rec["edge_km"] = edge_error_km(b0, (s >= thr) & m, y & m, f.cell_km)
+                rec["edge_km_persist"] = edge_error_km(b0, np.zeros_like(b0), y & m, f.cell_km)   # "no growth" reference
             rows.append(rec)
             n += 1
             if max_pairs and n >= max_pairs:
@@ -292,7 +304,13 @@ def main():
           f"{len(split['train'])}/{len(split['val'])}/{len(split['test'])}  pairs = "
           f"{sum(len(f.pairs) for f in split['train'])}/{sum(len(f.pairs) for f in split['val'])}/"
           f"{sum(len(f.pairs) for f in split['test'])}", flush=True)
-    model = build_model(a.mode, n_in, a.width, a.device)
+    res = {f.res_m for f in fires}
+    if len(res) != 1:
+        raise SystemExit(f"mixed grid resolutions in {a.data}: {sorted(res)}")
+    res_m = res.pop()
+    set_grid(res_m / 1000)
+    print(f"  grid {res_m:.0f} m: crops {CROP} cells, eval margin {EVAL_PAD} cells", flush=True)
+    model = build_model(a.mode, n_in, a.width, a.device, dx=res_m)
 
     if a.mode == "physics":
         sv, yv, _ = evaluate(model, a.mode, split["val"], groups, a.device)

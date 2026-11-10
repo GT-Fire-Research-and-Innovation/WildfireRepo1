@@ -40,6 +40,8 @@ class Fire:
         self.fid = self.g["fire_id"]
         self.year = self.g["year"]
         self.H, self.W = self.g["height"], self.g["width"]
+        self.res_m = float(self.g.get("res_m", 150.0))
+        self.cell_km = self.res_m / 1000
         lab = np.load(d / "labels.npz")
         self.arrival, self.other = lab["arrival"], lab["other"]
         self.times = pd.to_datetime(lab["times"], utc=True)
@@ -81,11 +83,12 @@ class Fire:
         B2 = self.burned(i - 2)[sl] if i >= 2 else B1
         age1 = ((t_i - self.times[i - 1]).total_seconds() / 3600 if i >= 1 else 0.0) / 48
         age2 = ((t_i - self.times[i - 2]).total_seconds() / 3600 if i >= 2 else 0.0) / 48
-        dist = distance_transform_edt(~B0) * 0.15 if B0.any() else np.full((h, w), 30.0)
+        ck = self.cell_km
+        dist = distance_transform_edt(~B0) * ck if B0.any() else np.full((h, w), 30.0)
         oth = self.other[sl]
         full = lambda v: np.full((h, w), v, np.float32)  # noqa: E731
         f["fire"] = np.stack([B0, B1, B2, full(age1), full(age2), full(gap_h / 48), np.clip(dist, 0, 15) / 15,
-                              np.exp(-dist / 2), oth, full(math.log1p(B0.sum() * 0.0225) / 8),
+                              np.exp(-dist / 2), oth, full(math.log1p(B0.sum() * ck * ck) / 8),
                               full(math.sin(2 * math.pi * (t_i.hour + self.g["transform"][2] / 15) / 24))]).astype(np.float32)
 
         # VIIRS (FIRMS) over the 24 h before t_i (local solar days)
@@ -123,7 +126,7 @@ class Fire:
                 since = np.full((h, w), 72.0, np.float32)
                 cnt6 = np.zeros((h, w), np.float32)
                 pw6 = np.zeros((h, w), np.float32)
-                rad = 7                                    # ~1 km: a GOES pixel is ~2-3 km
+                rad = max(1, int(round(1.05 / ck)))         # ~1 km: a GOES pixel is ~2-3 km
                 for k in range(len(rr)):
                     a0, a1, b0, b1 = max(rr[k] - rad, 0), min(rr[k] + rad + 1, h), max(cc[k] - rad, 0), min(cc[k] + rad + 1, w)
                     if a0 >= a1 or b0 >= b1:
@@ -143,7 +146,7 @@ class Fire:
                 rr = np.clip(np.floor((gz["lat"][dur] - y0) / ey).astype(int), 0, self.H - 1)
                 gev = np.zeros((self.H, self.W), bool)
                 gev[rr, cc] = True
-                evidence |= binary_dilation(gev, iterations=10)
+                evidence |= binary_dilation(gev, iterations=max(1, int(round(1.5 / ck))))
         f["goes"] = goes
 
         ter = self.z("terrain")
