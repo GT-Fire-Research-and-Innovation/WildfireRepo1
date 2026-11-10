@@ -11,4 +11,4 @@
 module purge
 export PATH="$HOME/scratch/envs/wildfire/bin:$PATH"
 cd "$SLURM_SUBMIT_DIR"
-bash scripts/build_all.sh "$HOME/scratch/wildfire" 12
+bash scripts/build_all.sh "$HOME/scratch/wildfire" 8      # 8 parallel fires fit in 64 GB

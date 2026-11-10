@@ -262,7 +262,7 @@ def st_tessera(g, ctx):
     k = max(1, int(round(g.get("res_m", 150.0) / 10)))   # 10 m Tessera pixels per grid cell (15 at 150 m)
     acc = cnt = None
     tr0 = crs = None
-    for strip, tr, crs in gt.iter_region(tuple(g["bounds_lonlat"]), ty, strip_rows=10 * k):
+    for strip, tr, crs in gt.iter_region(tuple(g["bounds_lonlat"]), ty, strip_rows=2 * k):   # thin strips: wide fires stay < 1 GB
         if tr0 is None:
             tr0 = tr
         r_off = int(round((tr.f - tr0.f) / tr0.e))   # rows below the first strip
@@ -318,7 +318,7 @@ def st_suppression(g, ctx):
             else SL.archive_features([])
         layers = SL.rasterize_layers(feats, g, dates, incidents if incidents["names"] else None)
         has_spatial = True
-    ics = ctx["ics"]()
+    ics = ctx["ics"]() if g["year"] <= 2020 else None      # ICS-209-PLUS covers 1999-2020; don't load it otherwise
     fields = ics[2] if ics else []
     vals = np.full((len(dates), len(fields) + 1), np.nan, np.float32)
     ids = []
@@ -853,13 +853,37 @@ def main():
     if "suppression" in pstages:
         prewarm_suppression(out, sorted({g["year"] for g in grids}))
     if pstages:
-        t0 = time.time()
-        with ProcessPoolExecutor(a.workers) as ex:
-            futs = [ex.submit(build_one, str(out), a.catalog, g, pstages) for g in grids]
-            for k, f in enumerate(as_completed(futs)):
-                fid, done = f.result()
-                print(f"[{k + 1}/{len(grids)}] {fid}: {' '.join(done) or 'already done'} "
-                      f"({(time.time() - t0) / 60:.0f} min)", flush=True)
+        from concurrent.futures.process import BrokenProcessPool
+        t0, workers, todo, k, crashes = time.time(), a.workers, list(grids), 0, {}
+        while todo:
+            left = []
+            try:
+                with ProcessPoolExecutor(workers) as ex:
+                    futs = {ex.submit(build_one, str(out), a.catalog, g, pstages): g for g in todo}
+                    for f in as_completed(futs):
+                        g = futs[f]
+                        try:
+                            fid, done = f.result()
+                        except BrokenProcessPool:
+                            left.append(g)
+                            continue
+                        k += 1
+                        print(f"[{k}/{len(grids)}] {fid}: {' '.join(done) or 'already done'} "
+                              f"({(time.time() - t0) / 60:.0f} min)", flush=True)
+            except BrokenProcessPool:
+                pass
+            if not left:
+                break
+            # a worker was killed (usually out of memory): retry the unfinished fires with fewer workers;
+            # a fire that keeps crashing even alone is skipped and logged
+            for g in left:
+                crashes[g["fire_id"]] = crashes.get(g["fire_id"], 0) + 1
+            workers = max(1, workers // 2)
+            todo = [g for g in left if crashes[g["fire_id"]] <= 3 or workers > 1]
+            print(f"worker crash: retrying {len(todo)} fires with {workers} workers", flush=True)
+            if workers == 1 and all(crashes[g["fire_id"]] > 3 for g in left):
+                print("skipping fires that crash even alone:", [g["fire_id"] for g in left], flush=True)
+                break
     if "hrrr" in stages:
         hrrr_stage(out, grids)
     if "goes" in stages:
