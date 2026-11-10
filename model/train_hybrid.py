@@ -335,6 +335,10 @@ def main():
     D.TEST_YEARS = {int(y) for y in a.test_years.split(",")}
     runs = Path(a.data) / "runs"
     runs.mkdir(parents=True, exist_ok=True)
+    ck = runs / f"{a.name}.ckpt"
+    if ck.exists() and "data_version" not in torch.load(ck, weights_only=False, map_location="cpu"):
+        D.DATA_VERSION = 1      # started before the label/GOES clean-up: finish it on the data it began with
+    print(f"  data version {D.DATA_VERSION}", flush=True)
     torch.manual_seed(a.seed)
     pca = fit_pca(a.data, runs)
     fires = load_fires(a.data, pca, None, a.catalog)
@@ -373,7 +377,6 @@ def main():
 
     opt = torch.optim.AdamW(model.parameters(), lr=a.lr, weight_decay=1e-4)
     sched = torch.optim.lr_scheduler.OneCycleLR(opt, a.lr, total_steps=a.epochs * a.steps, pct_start=0.1)
-    ck = runs / f"{a.name}.ckpt"
     start, best, hist = 0, (-1.0, None, None), []
     if ck.exists():
         c = torch.load(ck, weights_only=False, map_location=a.device)
@@ -407,7 +410,7 @@ def main():
               (f"  val AP {rec['val_ap']:.3f} F1 {rec['val_f1']:.3f}" if "val_ap" in rec else "") +
               f"  ({rec['min']:.1f} min)", flush=True)
         torch.save({"model": model.state_dict(), "opt": opt.state_dict(), "sched": sched.state_dict(), "best": best,
-                    "hist": hist, "epoch": ep + 1}, ck)
+                    "hist": hist, "epoch": ep + 1, "data_version": D.DATA_VERSION}, ck)
     model.load_state_dict(best[1])
     st, yt, rows = evaluate(model, a.mode, split["test"], groups, a.device, thr=best[2]["thr"])
     mt = metrics(st, yt, best[2]["thr"])
@@ -421,7 +424,7 @@ def main():
                      spot_beta=model.spot_b.item())
         print(f"  learned: crown weight {extra['crown_weight']:.2f}, spotting alpha {extra['spot_alpha']:.2f} "
               f"beta {extra['spot_beta']:.2f}, burning {extra['effective_minutes_per_day']:.0f} min/day", flush=True)
-    json.dump({"name": a.name, "mode": a.mode, "drop": a.drop, "val": best[2], "test": mt, "history": hist,
+    json.dump({"name": a.name, "mode": a.mode, "drop": a.drop, "data_version": D.DATA_VERSION, "val": best[2], "test": mt, "history": hist,
                "pairs": rows, **extra}, open(runs / f"{a.name}.json", "w"), indent=1)
     print(f"[{a.name}] TEST AP {mt['ap']:.3f} F1 {mt['f1']:.3f} IoU {mt['iou']:.3f} P {mt['precision']:.3f} "
           f"R {mt['recall']:.3f} area {mt['area_ratio']:.2f}  edge {mt.get('edge_km_mean', float('nan')):.2f} km "

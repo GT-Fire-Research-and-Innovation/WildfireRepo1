@@ -18,6 +18,11 @@ import pandas as pd
 
 MIN_GAP_H, MAX_GAP_H = 3.0, 168.0          # pairs up to 7 days apart (98 % of kept pairs); the gap is a model input
 CLEAN_FAR_KM = 3.0                 # new burn farther than this with no satellite fire nearby -> unknown
+DATA_VERSION = 2                   # 2: per-pair satellite-support check on labels + isolated GOES pixels removed
+                                   # 1: original behaviour (kept for checkpoints trained before the change)
+SUPPORT_MIN_CELLS = 20             # v2: new-burn patches at least this big (0.45 km² at 150 m) ...
+SUPPORT_KM, SUPPORT_FRAC = 1.0, 0.2    # ... with under 20 % of cells within 1 km of VIIRS/GOES fire -> unknown
+GOES_ISOLATED_KM, GOES_ISOLATED_H = 4.0, 3.0   # v2: a GOES pixel with no other within 4 km and 3 h is dropped
 HERB, WOODY = 0.6, 0.9             # live fuel moisture defaults (fraction)
 GM = ["vpd", "fm100", "fm1000", "bi", "erc", "rmin", "vs", "th", "tmmx"]
 GM_SCALE = {"vpd": (1.5, 1.0), "fm100": (12, 5), "fm1000": (14, 5), "bi": (50, 25), "erc": (50, 25),
@@ -132,6 +137,9 @@ class Fire:
 
         # GOES: hours since a fire pixel was seen here (before t_i), detections and power in the last 6 h
         gz = self.z("goes")
+        if gz is not None and DATA_VERSION >= 2 and len(gz["t"]):
+            keep = self.goes_keep(gz)
+            gz = {k: (v[keep] if getattr(v, "ndim", 0) == 1 and len(v) == len(keep) else v) for k, v in gz.items()}
         goes = np.zeros((4, h, w), np.float32)
         if gz is not None and "goes" not in hide and len(gz["t"]):
             t = pd.to_datetime(gz["t"], utc=True)
@@ -157,7 +165,10 @@ class Fire:
                 goes = np.stack([1 - since / 72, np.minimum(cnt6, 6) / 6, np.log1p(pw6) / 7, full(1.0)])
             else:
                 goes[3] = 1.0
-            # GOES pixels during (t_i, t_j] count as label evidence too
+        # GOES pixels during (t_i, t_j] count as label evidence too: v2 adds them even when the GOES
+        # input is hidden, so labels never depend on which inputs were hidden (v1 kept the old coupling)
+        if gz is not None and len(gz["t"]) and ("goes" not in hide or DATA_VERSION >= 2):
+            t = pd.to_datetime(gz["t"], utc=True)
             dur = (t > t_i - pd.Timedelta(hours=24)) & (t <= t_j + pd.Timedelta(hours=24))
             if dur.any():
                 dx, _, x0, _, ey, y0 = self.g["transform"]
@@ -299,7 +310,43 @@ class Fire:
         mask = ~B0 & ~oth
         far = target & (dist > CLEAN_FAR_KM) & ~evidence[sl]
         mask &= ~far
+        if DATA_VERSION >= 2:
+            mask &= ~self.unsupported(target & ~B0 & ~oth, evidence[sl])
         return f, phys, target, mask, B0
+
+    def unsupported(self, new, evidence):
+        """v2 label check: patches of new burn with almost no satellite fire nearby (re-mapping of
+        area that burned earlier, or digitising errors). They become unknown, never 'did not burn'."""
+        from scipy.ndimage import binary_dilation, label
+        out = np.zeros_like(new)
+        if not new.any():
+            return out
+        near = binary_dilation(evidence, iterations=max(1, int(round(SUPPORT_KM / self.cell_km))))
+        lab, n = label(new, structure=np.ones((3, 3)))
+        if n == 0:
+            return out
+        idx = np.arange(1, n + 1)
+        from scipy.ndimage import sum as nsum
+        size = nsum(new, lab, idx)
+        sup = nsum(new & near, lab, idx) / np.maximum(size, 1)
+        bad = idx[(size >= SUPPORT_MIN_CELLS) & (sup < SUPPORT_FRAC)]
+        if len(bad):
+            out = np.isin(lab, bad)
+        return out
+
+    def goes_keep(self, gz):
+        """v2: drop GOES pixels with no other detection within 4 km and 3 h (single-frame false alarms)."""
+        if getattr(self, "_goes_keep", None) is not None and len(self._goes_keep) == len(gz["t"]):
+            return self._goes_keep
+        from scipy.spatial import cKDTree
+        lat0 = math.radians(float(np.mean(gz["lat"])))
+        x = gz["lon"].astype(np.float64) * 111.32 * math.cos(lat0)
+        y = gz["lat"].astype(np.float64) * 110.57
+        t = pd.to_datetime(gz["t"], utc=True).view("int64") / 3.6e12 * (GOES_ISOLATED_KM / GOES_ISOLATED_H)
+        tree = cKDTree(np.c_[x, y, t])
+        counts = np.array([len(c) for c in tree.query_ball_point(np.c_[x, y, t], r=GOES_ISOLATED_KM)])
+        self._goes_keep = counts > 1
+        return self._goes_keep
 
     def rothermel(self, fb, gmv, u, v, slope_deg, aspect_deg, h, w):
         import torch
