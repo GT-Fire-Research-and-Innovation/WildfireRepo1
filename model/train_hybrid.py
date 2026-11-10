@@ -309,12 +309,13 @@ def main():
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--val-years", default="2023", help="comma list (default 2023)")
     ap.add_argument("--test-years", default="2024,2025", help="comma list (default 2024,2025)")
+    ap.add_argument("--seed", type=int, default=0, help="different seeds = ensemble members")
     a = ap.parse_args()
     D.VAL_YEARS = {int(y) for y in a.val_years.split(",")}
     D.TEST_YEARS = {int(y) for y in a.test_years.split(",")}
     runs = Path(a.data) / "runs"
     runs.mkdir(parents=True, exist_ok=True)
-    torch.manual_seed(0)
+    torch.manual_seed(a.seed)
     pca = fit_pca(a.data, runs)
     fires = load_fires(a.data, pca, None, a.catalog)
     split = {s: [f for f in fires if D.year_split(f.year) == s] for s in ("train", "val", "test")}
@@ -358,7 +359,7 @@ def main():
         model.load_state_dict(c["model"]); opt.load_state_dict(c["opt"]); sched.load_state_dict(c["sched"])
         start, best, hist = c["epoch"], c["best"], c["hist"]
         print(f"  resumed after epoch {start}", flush=True)
-    ds = Crops(split["train"], groups, a.steps * a.batch)
+    ds = Crops(split["train"], groups, a.steps * a.batch, seed=a.seed)
     dl = torch.utils.data.DataLoader(ds, batch_size=a.batch, num_workers=a.workers, persistent_workers=a.workers > 0)
     for ep in range(start, a.epochs):
         model.train()
