@@ -25,7 +25,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
 sys.path.insert(0, str(HERE))
 import data as D  # noqa: E402
-from hybrid import Hybrid, loss_fn  # noqa: E402
+from hybrid import Hybrid, Hybrid2, loss_fn  # noqa: E402
 from nets import UNet  # noqa: E402
 
 CROP_KM = 24.0                   # training crops cover 24 km (160 cells at 150 m, 320 at 75 m)
@@ -105,8 +105,17 @@ def fit_pca(root, out, n=16, per_fire=300, seed=0):
     return comp, mean
 
 
-def groups_used(drop):
-    return [g for g in D.GROUPS if g not in drop]
+V2_MODES = ("hybrid2", "physics2")
+
+
+def groups_used(drop, v2=False):
+    """Input groups in channel order; the physics-v2 group only for the v2 modes."""
+    return [g for g in D.GROUPS if g not in drop and (v2 or g not in D.V2_GROUPS)]
+
+
+def phys_stack(phys):
+    keys = ["r_head", "ecc", "head_x", "head_y"] + (["r_crown", "ember"] if "r_crown" in phys else [])
+    return np.stack([phys[k] for k in keys])
 
 
 def pad8(a, size=None):
@@ -150,7 +159,7 @@ class Crops(torch.utils.data.Dataset):
             for g, chans in flip_x_channels(self.groups).items():
                 for ch in chans:
                     x[ch] *= -1
-        P = np.stack([phys["r_head"], phys["ecc"], phys["head_x"], phys["head_y"]])
+        P = phys_stack(phys)
         return (torch.from_numpy(pad8(x, CROP).astype(np.float32)), torch.from_numpy(pad8(P, CROP).astype(np.float32)),
                 torch.from_numpy(pad8(y[None], CROP)[0].copy()), torch.from_numpy(pad8(m[None], CROP)[0].copy()),
                 torch.from_numpy(pad8(b0[None], CROP)[0].copy()), torch.tensor(gap / 24, dtype=torch.float32))
@@ -172,14 +181,22 @@ def build_model(mode, n_in, width, device, dx=150.0):
         return UNet(n_in, 1, width).to(device)
     if mode == "hybrid":
         return Hybrid(UNet(n_in, 2, width), dx=dx, max_iter=int(400 * 150 / dx)).to(device)
+    if mode == "hybrid2":
+        return Hybrid2(UNet(n_in, 3, width), dx=dx, max_iter=int(400 * 150 / dx)).to(device)
+    if mode == "physics2":
+        return Hybrid2(ZeroNet(3), dx=dx, max_iter=int(400 * 150 / dx)).to(device)
     return Hybrid(ZeroNet(), dx=dx, max_iter=int(400 * 150 / dx)).to(device)
 
 
 class ZeroNet(torch.nn.Module):
-    """Physics only: zero correction, zero floor."""
+    """Physics only: zero correction, zero floor (and zero spotting correction for v2)."""
+
+    def __init__(self, channels=2):
+        super().__init__()
+        self.channels = channels
 
     def forward(self, x):
-        z = torch.zeros(x.shape[0], 2, *x.shape[2:], device=x.device)
+        z = torch.zeros(x.shape[0], self.channels, *x.shape[2:], device=x.device)
         z[:, 1] = -20
         return z
 
@@ -188,6 +205,8 @@ def forward(model, mode, x, P, b0, gap_days):
     if mode == "unet":
         return model(x)[:, 0], None
     phys = {"r_head": P[:, 0], "ecc": P[:, 1], "head_x": P[:, 2], "head_y": P[:, 3]}
+    if P.shape[1] >= 6:
+        phys["r_crown"], phys["ember"] = P[:, 4], P[:, 5]
     logits, T, c = model(x, phys, b0.bool(), gap_days)
     return logits, c
 
@@ -232,7 +251,7 @@ def evaluate(model, mode, fires, groups, device, max_pairs=None, thr=None):
                 c0, c1 = max(cm - EVAL_MAX // 2, 0), min(cm + EVAL_MAX // 2, f.W)
             feats, phys, y, m, b0 = f.sample(i, gap, (r0, r1, c0, c1))
             x = torch.from_numpy(pad8(D.stack(feats, groups)))[None].to(device)
-            P = torch.from_numpy(pad8(np.stack([phys["r_head"], phys["ecc"], phys["head_x"], phys["head_y"]])))[None].to(device)
+            P = torch.from_numpy(pad8(phys_stack(phys)))[None].to(device)
             bb = torch.from_numpy(pad8(b0[None]))[None, 0].to(device)
             logit, _ = forward(model, mode, x.float(), P.float(), bb, torch.tensor([gap / 24], device=device))
             s = logit[0, :y.shape[0], :y.shape[1]].float().cpu().numpy()
@@ -295,7 +314,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--data", required=True)
     ap.add_argument("--name", default="hybrid")
-    ap.add_argument("--mode", default="hybrid", choices=["hybrid", "unet", "physics"])
+    ap.add_argument("--mode", default="hybrid", choices=["hybrid", "unet", "physics", "hybrid2", "physics2"],
+                    help="hybrid2 / physics2 add crown fire and spotting (physics v2)")
     ap.add_argument("--drop", nargs="*", default=[], help="input groups to leave out (ablations)")
     ap.add_argument("--epochs", type=int, default=30)
     ap.add_argument("--steps", type=int, default=600, help="training batches per epoch")
@@ -324,7 +344,8 @@ def main():
         split = {"train": split["train"][:max(1, n * 3 // 5)], "val": split["val"][:max(1, n // 5)],
                  "test": split["test"][:max(1, n // 5)]}
         fires = split["train"] + split["val"] + split["test"]
-    groups = groups_used(set(a.drop))
+    D.PHYSICS_V2 = a.mode in V2_MODES
+    groups = groups_used(set(a.drop), v2=D.PHYSICS_V2)
     n_in = sum(D.GROUPS[g] for g in groups)
     print(f"[{a.name}] mode={a.mode} inputs={n_in} ch  fires train/val/test = "
           f"{len(split['train'])}/{len(split['val'])}/{len(split['test'])}  pairs = "
@@ -393,8 +414,13 @@ def main():
     mt.update(edge_summary(rows))
     torch.save(model.state_dict(), runs / f"{a.name}.pt")
     extra = {}
-    if a.mode == "hybrid":
+    if a.mode in ("hybrid",) + V2_MODES:
         extra = {"effective_minutes_per_day": model.log_h.exp().item(), "softness_min": model.log_tau.exp().item()}
+    if a.mode in V2_MODES:
+        extra.update(crown_weight=torch.sigmoid(model.crown_logit).item(), spot_alpha=model.log_spot_a.exp().item(),
+                     spot_beta=model.spot_b.item())
+        print(f"  learned: crown weight {extra['crown_weight']:.2f}, spotting alpha {extra['spot_alpha']:.2f} "
+              f"beta {extra['spot_beta']:.2f}, burning {extra['effective_minutes_per_day']:.0f} min/day", flush=True)
     json.dump({"name": a.name, "mode": a.mode, "drop": a.drop, "val": best[2], "test": mt, "history": hist,
                "pairs": rows, **extra}, open(runs / f"{a.name}.json", "w"), indent=1)
     print(f"[{a.name}] TEST AP {mt['ap']:.3f} F1 {mt['f1']:.3f} IoU {mt['iou']:.3f} P {mt['precision']:.3f} "

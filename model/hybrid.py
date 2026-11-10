@@ -64,3 +64,51 @@ def loss_fn(logits, y, mask, pos_weight=8.0, corr=None, corr_weight=1e-3):
     if corr is not None:
         loss = loss + corr_weight * (corr ** 2).mean()
     return loss
+
+
+def combine_logits(a, b):
+    """Logit of P = 1 - (1 - sigmoid(a)) (1 - sigmoid(b)): burned by spread OR by embers."""
+    l1p = -nn.functional.softplus(a) - nn.functional.softplus(b)          # log(1 - P)
+    lp = torch.log(-torch.expm1(l1p.clamp(max=-1e-7)))                    # log(P)
+    return lp - l1p
+
+
+class Hybrid2(Hybrid):
+    """Physics v2: crown fire and spotting (physics/crown_spot.py).
+
+        R      = (R_surface + w (R_crown - R_surface)) * exp(c) + floor       w learned, starts at 0.5
+        spread = sigmoid((H_eff * gap - T) / tau)                             as in Hybrid
+        spot   = sigmoid(alpha * log(embers * gap + 1e-4) + beta + g)         alpha, beta learned
+        P      = 1 - (1 - spread) (1 - spot)
+
+    The network outputs three channels: c (spread correction), f (floor) and g (spotting correction).
+    w, alpha and beta are scalars, so the physics keeps its shape and the data sets the strengths."""
+
+    def __init__(self, net, dx=150.0, r_floor=2.0, h_eff_init=480.0, tau_init=60.0, max_iter=400):
+        super().__init__(net, dx, r_floor, h_eff_init, tau_init, max_iter)
+        self.crown_logit = nn.Parameter(torch.tensor(0.0))
+        self.log_spot_a = nn.Parameter(torch.tensor(0.0))
+        self.spot_b = nn.Parameter(torch.tensor(-4.0))
+
+    def rate2(self, x, r_surf, r_crown):
+        out = self.net(x)
+        c = MAX_LOG_CORR * torch.tanh(out[:, 0] / MAX_LOG_CORR)
+        floor = self.r_floor * torch.sigmoid(out[:, 1] - 4.0)
+        w = torch.sigmoid(self.crown_logit)
+        return (r_surf + w * (r_crown - r_surf).clamp_min(0)) * torch.exp(c) + floor, c, out[:, 2]
+
+    def spot_logit(self, ember, gap, g):
+        return self.log_spot_a.exp() * torch.log(ember * gap.view(-1, 1, 1) + 1e-4) + self.spot_b + g
+
+    def forward(self, x, phys, burning, gap):
+        R, c, g = self.rate2(x, phys["r_head"], phys["r_crown"])
+        logits, Ts = [], []
+        h_eff, tau = self.log_h.exp(), self.log_tau.exp()
+        for b in range(x.shape[0]):
+            costs = S.step_costs(R[b], phys["ecc"][b], phys["head_x"][b], phys["head_y"][b], self.dx)
+            horizon = h_eff * gap[b]
+            T = S.arrival_time(costs, burning[b], max_iter=self.max_iter, t_max=float(horizon.detach()) * 1.5)
+            Ts.append(T)
+            logits.append((horizon - T.clamp(max=1e5)) / tau)
+        spread = torch.stack(logits)
+        return combine_logits(spread, self.spot_logit(phys["ember"], gap, g)), torch.stack(Ts), c

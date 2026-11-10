@@ -203,7 +203,8 @@ def spread(fuel_idx, m1, m10, m100, m_herb, m_woody, wind10_ms, wind_from_deg, s
     u_eff = torch.where(burnable, u_eff, zero)
     i_r = torch.where(burnable, i_r, zero)
     return dict(r0=r0 * FT, r_head=r_head * FT, head_x=head_x, head_y=head_y, lb=lb, ecc=ecc,
-                u_eff=u_eff * FT, i_r=i_r * 1.055056 / FT ** 2 / 60.0, burnable=burnable)
+                u_eff=u_eff * FT, i_r=i_r * 1.055056 / FT ** 2 / 60.0, burnable=burnable,
+                sigma=torch.where(burnable, sig, torch.ones_like(r0)))          # characteristic SAV, 1/ft
 
 
 def ray_speed(r_head, ecc, head_x, head_y, dir_x, dir_y):

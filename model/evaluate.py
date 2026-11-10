@@ -42,6 +42,7 @@ sys.path.insert(0, str(HERE))
 import data as D  # noqa: E402
 import train_hybrid as TH  # noqa: E402
 from physics import solver as S  # noqa: E402
+from hybrid import combine_logits  # noqa: E402
 
 POS_WEIGHT = 8.0                 # same weighting as the training loss, so calibrated logits keep their scale
 CAL_A, CAL_S = 1.5, 1.0          # calibration limits: rate x/÷ 4.5, softness x/÷ 2.7
@@ -75,9 +76,10 @@ class Member:
         if ":" in rest:
             drop = [g for g in rest.split(":")[1].split("+") if g]
         if mode is None:
-            mode = next((m for m in ("physics", "unet", "hybrid") if name.startswith(m)), "hybrid")
+            mode = next((m for m in ("physics2", "hybrid2", "physics", "unet", "hybrid") if name.startswith(m)), "hybrid")
         self.name, self.mode, self.device = name, mode, device
-        self.groups = [g for g in groups_all if g not in set(drop)]
+        v2 = mode in TH.V2_MODES
+        self.groups = [g for g in TH.groups_used(set(drop), v2=v2)]
         n_in = sum(D.GROUPS[g] for g in self.groups)
         if mode == "physics":
             self.model = TH.build_model(mode, n_in, width, device, dx=dx)
@@ -111,26 +113,35 @@ class Member:
         h, w = b0.shape
         if self.mode == "unet":
             return {"logit": self.model(x)[0, 0, :h, :w].float()}
-        P = torch.from_numpy(TH.pad8(np.stack([phys["r_head"], phys["ecc"], phys["head_x"], phys["head_y"]])))
-        P = P.float().to(self.device)
+        P = torch.from_numpy(TH.pad8(TH.phys_stack(phys))).float().to(self.device)
         bb = torch.from_numpy(TH.pad8(b0[None]))[0].to(self.device).bool()
         m = self.model
-        R, _ = m.rate(x, P[None, 0])
+        z = None
+        if self.mode in TH.V2_MODES:
+            R, _, g = m.rate2(x, P[None, 0], P[None, 4])
+            z = m.spot_logit(P[None, 5], torch.tensor([gap_h / 24], device=self.device), g)[0, :h, :w].float()
+        else:
+            R, _ = m.rate(x, P[None, 0])
         costs = S.step_costs(R[0], P[1], P[2], P[3], m.dx)
         horizon = float(m.log_h.exp()) * gap_h / 24
         # wide horizon so arrival times stay finite for any rate multiplier calibration may pick
         T = S.arrival_time(costs, bb, max_iter=m.max_iter, t_max=horizon * 1.5 * math.exp(CAL_A))
-        return {"T": T[:h, :w].clamp(max=1e5).float(), "horizon": horizon, "tau": float(m.log_tau.exp())}
+        st = {"T": T[:h, :w].clamp(max=1e5).float(), "horizon": horizon, "tau": float(m.log_tau.exp())}
+        if z is not None:
+            st["z"] = z                                   # spotting logit (calibration leaves it as is)
+        return st
 
     def logits(self, st, a=0.0, s=0.0):
         if "logit" in st:
             return st["logit"] * math.exp(-s) + a
-        return (st["horizon"] - st["T"] * math.exp(-a)) / (st["tau"] * math.exp(s))
+        lg = (st["horizon"] - st["T"] * math.exp(-a)) / (st["tau"] * math.exp(s))
+        return combine_logits(lg, st["z"]) if "z" in st else lg
 
     def fit(self, st, y, mask):
         """Two calibration scalars from one observed pair (the fire's previous growth)."""
         sel = torch.from_numpy(mask).to(self.device)
         yy = torch.from_numpy(y).to(self.device)[sel].float()
+        zz = st["z"][sel] if "z" in st else None
         if "logit" in st:
             base = st["logit"][sel]
         else:
@@ -142,6 +153,7 @@ class Member:
             neg = torch.nonzero(yy == 0)[:, 0]
             keep = torch.cat([pos, neg[torch.randperm(len(neg), device=neg.device)[:CAL_MAX_CELLS - len(pos)]]])
             base, yy = base[keep], yy[keep]
+            zz = zz[keep] if zz is not None else None
         a = torch.zeros((), device=self.device, requires_grad=True)
         s = torch.zeros((), device=self.device, requires_grad=True)
         opt = torch.optim.Adam([a, s], lr=0.1)
@@ -151,6 +163,8 @@ class Member:
                 lg = base * torch.exp(-s) + a
             else:
                 lg = (st["horizon"] - base * torch.exp(-a)) / (st["tau"] * torch.exp(s))
+                if zz is not None:
+                    lg = combine_logits(lg, zz)
             loss = torch.nn.functional.binary_cross_entropy_with_logits(lg, yy, pos_weight=pw) + CAL_PRIOR * (a ** 2 + s ** 2)
             opt.zero_grad()
             loss.backward()
@@ -334,6 +348,9 @@ def main():
     res_m = fires[0].res_m
     TH.set_grid(res_m / 1000)
     groups_all = TH.groups_used(set())
+    D.PHYSICS_V2 = any(sp.partition(":")[2].split(":")[0] in TH.V2_MODES or sp.split(":")[0].startswith(("hybrid2", "physics2"))
+                       for sp in a.model) or any(json.loads((runs / f"{sp.split(':')[0]}.json").read_text()).get("mode") in TH.V2_MODES
+                                                 for sp in a.model if (runs / f"{sp.split(':')[0]}.json").exists())
     members = [Member(runs, sp, None, groups_all, a.device, res_m, a.width) for sp in a.model]
     calibrate = not a.no_calibration
     print(f"[{a.out}] {len(members)} model(s); val/test fires {len(split['val'])}/{len(split['test'])}; "

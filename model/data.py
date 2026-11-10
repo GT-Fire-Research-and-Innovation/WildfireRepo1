@@ -29,7 +29,10 @@ OPTIONAL = ["goes", "fuels", "tessera", "human", "hrrr", "suppression", "history
 GROUPS = {  # name -> number of channels (including its mask channel where optional)
     "fire": 11, "viirs": 3, "goes": 4, "terrain": 7, "fuels": 12, "tessera": 17, "human": 10, "history": 3,
     "weather": 14, "hrrr": 7, "suppression": 12, "physics": 4,
+    "crownspot": 4,          # physics v2 only: crown probability, crown-adjusted spread, embers, intensity
 }
+V2_GROUPS = ["crownspot"]    # left out unless PHYSICS_V2 (keeps v1 models and checkpoints unchanged)
+PHYSICS_V2 = False           # set by the hybrid2 / physics2 modes: compute crown fire and spotting
 
 
 from collections import OrderedDict
@@ -286,6 +289,8 @@ class Fire:
         # Rothermel fields (physics backbone)
         phys = self.rothermel(fb, gmv, u_mean, v_mean, slope, ter["aspect"][sl].astype(np.float32), h, w)
         f["physics"] = np.stack([np.log1p(phys["r_head"]) / 3, phys["ecc"], phys["head_x"], phys["head_y"]]).astype(np.float32)
+        if PHYSICS_V2:
+            f["crownspot"] = self.crown_spot(phys, lf if fb is not None else None, sl, B0, hr, gmv, h, w)
 
         for k in f:                                   # last line of defence: no NaN / inf reaches the network
             f[k] = np.nan_to_num(f[k], nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
@@ -302,7 +307,10 @@ class Fire:
         t = lambda a: torch.from_numpy(np.ascontiguousarray(a, dtype=np.float32))  # noqa: E731
         if fb is None or not gmv:
             return dict(r_head=np.ones((h, w), np.float32), ecc=np.zeros((h, w), np.float32),
-                        head_x=np.zeros((h, w), np.float32), head_y=np.ones((h, w), np.float32))
+                        head_x=np.zeros((h, w), np.float32), head_y=np.ones((h, w), np.float32),
+                        i_r=np.zeros((h, w), np.float32), sigma=np.ones((h, w), np.float32),
+                        effm=np.full((h, w), 8.0, np.float32), ws=np.zeros((h, w), np.float32),
+                        burnable=np.ones((h, w), bool), sfc=np.zeros((h, w), np.float32))
         tf = (gmv["tmmx"] - 273.15) * 9 / 5 + 32
         rh = np.clip(gmv["rmin"], 1, 100)
         emc = np.where(rh < 10, 0.03229 + 0.281073 * rh - 0.000578 * rh * tf,
@@ -312,10 +320,46 @@ class Fire:
             ws, wd = np.hypot(u, v), (np.degrees(np.arctan2(-u, -v)) + 360) % 360
         else:
             ws, wd = gmv["vs"], gmv["th"]
-        out = R.spread(R.fuel_index(torch.from_numpy(fb.astype(np.int64))), t(1.03 * emc / 100), t(1.28 * emc / 100),
+        idx = R.fuel_index(torch.from_numpy(fb.astype(np.int64)))
+        out = R.spread(idx, t(1.03 * emc / 100), t(1.28 * emc / 100),
                        t(gmv["fm100"] / 100), torch.full((h, w), HERB), torch.full((h, w), WOODY), t(ws), t(wd),
                        t(np.tan(np.radians(slope_deg))), t(aspect_deg))
-        return {k: out[k].numpy().astype(np.float32) for k in ("r_head", "ecc", "head_x", "head_y")}
+        res = {k: out[k].numpy().astype(np.float32) for k in ("r_head", "ecc", "head_x", "head_y", "i_r", "sigma")}
+        res["burnable"] = out["burnable"].numpy()
+        res["effm"] = (1.03 * emc).astype(np.float32)          # fine dead fuel moisture, %
+        res["ws"] = np.asarray(ws, np.float32) * np.ones((h, w), np.float32)
+        if PHYSICS_V2:
+            from physics import crown_spot as CS
+            load = R._params(idx, torch.float64)[3].numpy()
+            res["sfc"] = CS.surface_fuel_kg_m2(load).astype(np.float32)
+        return res
+
+    def crown_spot(self, phys, lf, sl, B0, hr, gmv, h, w):
+        """Physics v2 fields (see physics/crown_spot.py). Adds phys['r_crown'] (crown-adjusted head
+        spread, m/min) and phys['ember'] (ember-landing density per day); returns the 4 input channels."""
+        from physics import crown_spot as CS
+        r = phys["r_head"]
+        if lf is not None:
+            cbh = np.clip(lf["cbh"][sl], 0, 1000) / 10.0
+            cbd = np.clip(lf["cbd"][sl], 0, 100) / 100.0
+            cc = np.clip(lf["cc"][sl], 0, 100).astype(np.float32)
+            p, _, r_tot = CS.crown_fire(r, cbh, cbd, cc, phys["ws"] * 3.6, phys["effm"],
+                                        phys.get("sfc", np.zeros_like(r)), phys["burnable"])
+        else:
+            p, r_tot = np.zeros_like(r), r
+        inten = CS.fireline_intensity(phys["i_r"], phys["sigma"], r_tot)
+        if hr[6].max() > 0:
+            u, v = float(np.mean(hr[0]) * 8), float(np.mean(hr[1]) * 8)
+        elif gmv:
+            th, vs = float(np.mean(gmv["th"])), float(np.mean(gmv["vs"]))
+            u, v = -vs * math.sin(math.radians(th)), -vs * math.cos(math.radians(th))
+        else:
+            u = v = 0.0
+        ember = CS.ember_field(B0, inten, p, phys["ws"], u, v, self.res_m)
+        phys["r_crown"] = np.nan_to_num(r_tot).astype(np.float32)
+        phys["ember"] = np.nan_to_num(ember).astype(np.float32)
+        return np.stack([p, np.log1p(r_tot) / 3, np.log1p(10 * ember) / 3,
+                         np.log1p(inten / 1000.0) / 3]).astype(np.float32)
 
 
 def stack(f, groups):

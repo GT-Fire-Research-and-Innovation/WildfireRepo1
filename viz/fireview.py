@@ -496,3 +496,38 @@ def prediction(d, i, weights, mode="hybrid", pca=None, drop=()):
         _tpfp(axs[1, k], b0, _matched(lg, y, m), y, m, f"{mode} {name}, same area as burned")
     fig.tight_layout()
     return fig
+
+
+def crownspot(d, i=None):
+    """Physics v2 fields for one pair: crown fire probability, how much crowning speeds spread,
+    fireline intensity, and where embers land (cyan = what actually burned next)."""
+    plt = _plt()
+    import data as D
+    D.PHYSICS_V2 = True
+    f = D.Fire(d)
+    if i is None:
+        i = max(f.pairs, key=lambda p: f.sample(p[0], p[1], (0, f.H, 0, f.W))[2].sum())[0]
+    gap = dict(f.pairs)[i]
+    feats, phys, y, m, b0 = f.sample(i, gap, _eval_window(f, i))
+    cs = feats["crownspot"]
+    inten = np.expm1(cs[3] * 3) * 1000
+    boost = np.log10(np.clip(phys["r_crown"], 1e-2, None)) - np.log10(np.clip(phys["r_head"], 1e-2, None))
+    E = phys["ember"]
+    fig, axs = plt.subplots(1, 4, figsize=(17, 4.6))
+    panels = [(cs[0], "crown fire probability", dict(cmap="YlOrRd", vmin=0, vmax=1)),
+              (boost, "crowning speed-up (log10 crown-adjusted / surface)", dict(cmap="magma", vmin=0, vmax=1.5)),
+              (np.log10(inten + 1), "fireline intensity (log10 kW/m)", dict(cmap="inferno", vmin=1, vmax=4.5)),
+              (np.where(b0, np.nan, np.log10(E + 1e-4)), "ember landing (log), cyan = burned next", dict(cmap="viridis", vmin=-4, vmax=0))]
+    for ax, (img, title, kw) in zip(axs, panels):
+        im = ax.imshow(img, interpolation="nearest", **kw)
+        _outline(ax, b0, [0, b0.shape[1], b0.shape[0], 0], "w")
+        ax.set_xlim(0, b0.shape[1]); ax.set_ylim(b0.shape[0], 0)
+        fig.colorbar(im, ax=ax, fraction=0.046)
+        _clean(ax, title)
+    _outline(axs[3], y & m, [0, b0.shape[1], b0.shape[0], 0], "c")
+    fig.tight_layout()
+    D.PHYSICS_V2 = False
+    new = y & m
+    print(f"pair #{i}: ember density on cells that burned next is "
+          f"{E[new].mean() / max(E[m & ~y].mean(), 1e-9):.1f}x that on cells that did not")
+    return fig
