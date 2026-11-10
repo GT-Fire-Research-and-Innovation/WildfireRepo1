@@ -316,8 +316,13 @@ def main():
     runs.mkdir(parents=True, exist_ok=True)
     torch.manual_seed(0)
     pca = fit_pca(a.data, runs)
-    fires = load_fires(a.data, pca, a.max_fires, a.catalog)
+    fires = load_fires(a.data, pca, None, a.catalog)
     split = {s: [f for f in fires if D.year_split(f.year) == s] for s in ("train", "val", "test")}
+    if a.max_fires:   # quick runs: a few fires from every split, so validation and test are never empty
+        n = a.max_fires
+        split = {"train": split["train"][:max(1, n * 3 // 5)], "val": split["val"][:max(1, n // 5)],
+                 "test": split["test"][:max(1, n // 5)]}
+        fires = split["train"] + split["val"] + split["test"]
     groups = groups_used(set(a.drop))
     n_in = sum(D.GROUPS[g] for g in groups)
     print(f"[{a.name}] mode={a.mode} inputs={n_in} ch  fires train/val/test = "
