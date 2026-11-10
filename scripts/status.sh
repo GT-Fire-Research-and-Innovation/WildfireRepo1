@@ -18,7 +18,16 @@ for log in $(ls -t logs/train-*.out 2>/dev/null); do
   [ -n "$err" ] && echo "$err"
 done
 echo
-echo "=== evaluations"
+echo "=== evaluations (current labels only; earlier old-label runs are listed by name)"
+RUNS="$HOME/scratch/wildfire/my/runs"
 for log in $(ls -t logs/eval-*.out 2>/dev/null); do
-  if grep -q "TEST (" "$log"; then sed -n '/TEST (/,/saved/p' "$log"; else echo "$log: running ($(grep -c pairs "$log") progress lines)"; fi
+  name=$(grep -o "^\[[^]]*\] TEST" "$log" | head -1 | sed 's/^\[\(.*\)\] TEST/\1/')
+  if [ -z "$name" ]; then
+    grep -q "validation pass\|test pass" "$log" && echo "$log: running ($(grep -c "pairs (" "$log") progress lines)"
+    continue
+  fi
+  case " $shown " in *" $name "*) continue ;; esac; shown="$shown $name"
+  if grep -q '"data_version": 2' "$RUNS/eval_$name.json" 2>/dev/null; then sed -n '/TEST (/,/saved/p' "$log"
+  else echo "[$name] earlier run on the old labels (re-scored in the evaluation period)"; fi
 done
+[ -f "$RUNS/compare.md" ] && echo && echo "full comparison: cat $RUNS/compare.md"
