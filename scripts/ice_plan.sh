@@ -12,13 +12,14 @@
 #   report: runs/compare.md once every evaluation is done
 #
 #   bash scripts/ice_plan.sh          (safe to rerun: nothing is queued twice)
-set -euo pipefail
+set -uo pipefail          # no -e: one slow Slurm reply must not stop the plan halfway
 cd "$(dirname "$0")/.."
 mkdir -p logs
 RUNS="$HOME/scratch/wildfire/my/runs"
 PY="$HOME/scratch/envs/wildfire/bin/python"
-q() { squeue -h -u "$USER" -n "$1" -o %i | sort -n; }
-sub() { sbatch --parsable "$@"; }
+q() { local out; for k in 1 2 3; do out=$(squeue -h -u "$USER" -n "$1" -o %i 2>/dev/null) && { echo "$out" | sort -n; return; }; sleep 3; done; }
+sub() { local j; for k in 1 2 3; do j=$(sbatch --parsable "$@") && [ -n "$j" ] && { echo "$j"; return 0; }; echo "  (sbatch failed, retrying)" >&2; sleep 5; done
+        echo "  !! could not submit: sbatch $*" >&2; return 1; }
 
 # 0. clear the old one-by-one evaluations; old-label results are kept as *_oldlabels.json
 EV_OLD=$(squeue -h -u "$USER" -o "%i %j" | awk '$2 ~ /^wf-eval/ || $2 == "wf-compare" {print $1}' | tr '\n' ' ')
