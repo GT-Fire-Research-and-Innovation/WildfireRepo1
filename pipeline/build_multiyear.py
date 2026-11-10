@@ -262,7 +262,7 @@ def st_tessera(g, ctx):
     k = max(1, int(round(g.get("res_m", 150.0) / 10)))   # 10 m Tessera pixels per grid cell (15 at 150 m)
     acc = cnt = None
     tr0 = crs = None
-    for strip, tr, crs in gt.iter_region(tuple(g["bounds_lonlat"]), ty, strip_rows=2 * k):   # thin strips: wide fires stay < 1 GB
+    for strip, tr, crs in gt.iter_region(tuple(g["bounds_lonlat"]), ty, strip_rows=5 * k):   # 75-row strips: ~2 GB peak on the widest fires, half the old memory
         if tr0 is None:
             tr0 = tr
         r_off = int(round((tr.f - tr0.f) / tr0.e))   # rows below the first strip
