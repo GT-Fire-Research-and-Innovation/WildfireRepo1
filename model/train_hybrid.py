@@ -45,10 +45,29 @@ def set_grid(cell_km):
 HIDE_P = 0.15                    # chance of hiding each optional group during training
 
 
-def load_fires(root, pca, max_fires=None):
+def excluded_fires(catalog):
+    """Fires rated bad by qc_fires.py (incl. the post-build satellite check) or dropped on the QC page."""
+    import pandas as pd
+    cat = Path(catalog)
+    bad = set()
+    if (cat / "qc_fires.csv").exists():
+        q = pd.read_csv(cat / "qc_fires.csv")
+        bad = set(q.loc[q["rating"] == "bad", "fire_id"])
+    if (cat / "overrides.csv").exists():
+        o = pd.read_csv(cat / "overrides.csv")
+        bad = (bad - set(o.loc[o.verdict == "keep", "fire_id"])) | set(o.loc[o.verdict == "drop", "fire_id"])
+    return bad
+
+
+def load_fires(root, pca, max_fires=None, catalog=None):
     dirs = sorted(p.parent for p in Path(root, "fires").glob("*/labels.npz"))
     need = ["labels", "terrain", "weather", "viirs"]
     dirs = [d for d in dirs if all((d / f"{n}.npz").exists() for n in need)]
+    bad = excluded_fires(catalog or Path(root).parent / "catalog")
+    if bad:
+        n0 = len(dirs)
+        dirs = [d for d in dirs if d.name not in bad]
+        print(f"  QC: left out {n0 - len(dirs)} fires rated bad or dropped by the team", flush=True)
     if max_fires:
         dirs = dirs[:max_fires]
     fires = [D.Fire(d, pca) for d in dirs]
@@ -286,6 +305,7 @@ def main():
     ap.add_argument("--workers", type=int, default=6)
     ap.add_argument("--eval-every", type=int, default=3)
     ap.add_argument("--max-fires", type=int)
+    ap.add_argument("--catalog", help="catalog folder with qc_fires.csv (default: <data>/../catalog)")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--val-years", default="2023", help="comma list (default 2023)")
     ap.add_argument("--test-years", default="2024,2025", help="comma list (default 2024,2025)")
@@ -296,7 +316,7 @@ def main():
     runs.mkdir(parents=True, exist_ok=True)
     torch.manual_seed(0)
     pca = fit_pca(a.data, runs)
-    fires = load_fires(a.data, pca, a.max_fires)
+    fires = load_fires(a.data, pca, a.max_fires, a.catalog)
     split = {s: [f for f in fires if D.year_split(f.year) == s] for s in ("train", "val", "test")}
     groups = groups_used(set(a.drop))
     n_in = sum(D.GROUPS[g] for g in groups)
