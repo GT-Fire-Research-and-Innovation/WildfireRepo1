@@ -35,8 +35,13 @@ GROUPS = {  # name -> number of channels (including its mask channel where optio
     "fire": 11, "viirs": 3, "goes": 4, "terrain": 7, "fuels": 12, "tessera": 17, "human": 10, "history": 3,
     "weather": 14, "hrrr": 7, "suppression": 12, "physics": 4,
     "crownspot": 4,          # physics v2 only: crown probability, crown-adjusted spread, embers, intensity
+    "hrrr_seq": 16,          # unet3 (time) only: HRRR over the gap in 4 equal segments x (u, v, speed, RH)
+    "seq": 24,               # unet3 (time) only: last 6 days x (burned, VIIRS detections, snapshot age, valid); kept LAST
 }
 V2_GROUPS = ["crownspot"]    # left out unless PHYSICS_V2 (keeps v1 models and checkpoints unchanged)
+T3_GROUPS = ["hrrr_seq", "seq"]  # left out unless TEMPORAL (unet3 with its time dimension)
+TEMPORAL = False             # set for unet3 runs that use the day-by-day history
+SEQ_DAYS, SEQ_CH, SEQ_SEG = 6, 4, 4
 PHYSICS_V2 = False           # set by the hybrid2 / physics2 modes: compute crown fire and spotting
 WEATHER_MODE = "observed"    # "observed": HRRR analyses over the gap (oracle weather, best case)
                              # "forecast": only what a forecaster has at t_i: HRRR analyses of the last 24 h
@@ -138,6 +143,8 @@ class Fire:
                 if local_i - pd.Timedelta(days=1) <= dday <= local_j + pd.Timedelta(days=1):
                     evidence |= (v["af_day"][k] + v["af_night"][k]) > 0
         f["viirs"] = np.stack([np.minimum(af24, 4) / 4, np.minimum(afn, 4) / 4, np.log1p(frp) / 6]).astype(np.float32)
+        if TEMPORAL:
+            f["seq"] = self.history(i, sl, v, h, w)
 
         # GOES: hours since a fire pixel was seen here (before t_i), detections and power in the last 6 h
         gz = self.z("goes")
@@ -265,6 +272,7 @@ class Fire:
         rz = self.z("hrrr")
         hr = np.zeros((7, h, w), np.float32)
         u_mean = v_mean = None
+        hseq = None
         if rz is not None and "hrrr" not in hide:
             ts = pd.to_datetime(rz["times"], utc=True)
             if WEATHER_MODE == "forecast":
@@ -276,6 +284,7 @@ class Fire:
                 if WEATHER_MODE == "forecast":
                     sel &= (ts <= t_i)
             F = rz["fields"][sel].astype(np.float32)          # (T, 4, hh, wh): gust, u10, v10, rh2
+            tF = ts[sel]
             if WEATHER_MODE == "forecast" and "fc" in rz and len(rz["fc_times"]):
                 vt = pd.to_datetime(rz["fc_times"], utc=True)          # valid times (12z init + 9 h)
                 issued = (pd.to_datetime(rz["fc_issued"], utc=True) if "fc_issued" in rz and len(rz["fc_issued"]) == len(vt)
@@ -283,6 +292,7 @@ class Fire:
                 use = (vt > t_i) & (vt <= t_j) & (issued <= t_i - pd.Timedelta(hours=2))
                 if use.any():
                     F = np.concatenate([F, rz["fc"][use].astype(np.float32)]) if len(F) else rz["fc"][use].astype(np.float32)
+                    tF = tF.append(vt[use])
             idx = rz["idx"][sl]
             flat = F.reshape(F.shape[0], 4, -1)[:, :, idx]   # (T, 4, h, w)
             if np.isfinite(flat).any():
@@ -291,7 +301,11 @@ class Fire:
                 u_mean, v_mean = u.mean(0), vv.mean(0)
                 hr = np.stack([u_mean / 8, v_mean / 8, spd.mean(0) / 8, spd.max(0) / 12, gust.max(0) / 20,
                                rh.min(0) / 100, full(1.0)])
+                if TEMPORAL:
+                    hseq = self.hrrr_segments(tF, u, vv, spd, rh, t_i, t_j, hr)
         f["hrrr"] = hr
+        if TEMPORAL:
+            f["hrrr_seq"] = hseq if hseq is not None else np.zeros((SEQ_SEG * 4, h, w), np.float32)
 
         # suppression on perimeter i's burn day
         sz = self.z("suppression")
@@ -333,6 +347,47 @@ class Fire:
         if DATA_VERSION >= 2:
             mask &= ~self.unsupported(target & ~B0 & ~oth, evidence[sl])
         return f, phys, target, mask, B0
+
+    def history(self, i, sl, v, h, w):
+        """Day-by-day look back from t_i (unet3): for k = 0..5 days before t_i, the burned area at the
+        latest observation not after t_i - k days, that local day's VIIRS detections (day + night),
+        the snapshot's age and a valid flag. Uses nothing after t_i (the k = 0 VIIRS day is the same
+        local day the 'viirs' group already uses)."""
+        t_i = self.times[i]
+        out = np.zeros((SEQ_DAYS, SEQ_CH, h, w), np.float32)
+        days = pd.to_datetime(v["dates"]) if v is not None else None
+        lon_c = self.g["transform"][2]
+        local_i = (t_i.tz_convert(None) + pd.Timedelta(hours=lon_c / 15)).normalize()
+        for k in range(SEQ_DAYS):
+            cut = t_i - pd.Timedelta(days=k) + pd.Timedelta(minutes=1)
+            js = np.nonzero(self.times[: i + 1] <= cut)[0]
+            if len(js):
+                j = int(js[-1])
+                out[k, 0] = self.burned(j)[sl]
+                out[k, 2] = (t_i - self.times[j]).total_seconds() / 3600 / (24 * SEQ_DAYS)
+                out[k, 3] = 1.0
+            if days is not None:
+                hit = np.nonzero(days == local_i - pd.Timedelta(days=k))[0]
+                if len(hit):
+                    q = int(hit[0])
+                    af = (v["af_day"][q][sl] + v["af_night"][q][sl]).astype(np.float32)
+                    out[k, 1] = np.minimum(np.log1p(af) / np.log(5), 1.0)
+        return out.reshape(SEQ_DAYS * SEQ_CH, h, w)
+
+    @staticmethod
+    def hrrr_segments(tF, u, vv, spd, rh, t_i, t_j, hr):
+        """HRRR over the gap in SEQ_SEG equal time segments (unet3): mean u, v, speed and RH per segment.
+        In forecast mode only forecasts valid in the gap fall in it; an empty segment takes the gap mean."""
+        tt = np.asarray(pd.DatetimeIndex(tF).asi8, dtype=np.float64)
+        edges = np.linspace(t_i.value, t_j.value, SEQ_SEG + 1)
+        segs = []
+        for s in range(SEQ_SEG):
+            sel = (tt >= edges[s]) & ((tt < edges[s + 1]) if s < SEQ_SEG - 1 else (tt <= edges[s + 1]))
+            if sel.any():
+                segs += [u[sel].mean(0) / 8, vv[sel].mean(0) / 8, spd[sel].mean(0) / 8, rh[sel].mean(0) / 100]
+            else:
+                segs += [hr[0], hr[1], hr[2], rh.mean(0) / 100]
+        return np.stack(segs).astype(np.float32)
 
     def unsupported(self, new, evidence):
         """v2 label check: patches of new burn with almost no satellite fire nearby (re-mapping of
