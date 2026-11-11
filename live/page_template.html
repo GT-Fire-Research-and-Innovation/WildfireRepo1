@@ -1,0 +1,209 @@
+<title>Wildfire Spread Forecast</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@500;600;700&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+/* Layout: incident-map console. Map on the left at full height, briefing panel on the right, active-fire roster below. */
+:root {
+  --bg: #eef1f2; --panel: #ffffff; --ink: #172026; --muted: #5b6770; --rule: #d3d9dc;
+  --accent: #d1490f; --accent-ink: #ffffff; --chip: #e3e8ea; --good: #2f7d4f; --map: #c9cfd2;
+  --f-display: "Barlow Condensed", "Arial Narrow", system-ui, sans-serif;
+  --f-body: "IBM Plex Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --f-data: "IBM Plex Mono", ui-monospace, "SFMono-Regular", Menlo, monospace;
+}
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
+  --bg: #0f1417; --panel: #172026; --ink: #e6ecef; --muted: #98a6ae; --rule: #2a363d;
+  --accent: #ff7a3d; --accent-ink: #1a0d06; --chip: #22303a; --good: #66c08a; --map: #222c31; color-scheme: dark } }
+:root[data-theme="dark"] {
+  --bg: #0f1417; --panel: #172026; --ink: #e6ecef; --muted: #98a6ae; --rule: #2a363d;
+  --accent: #ff7a3d; --accent-ink: #1a0d06; --chip: #22303a; --good: #66c08a; --map: #222c31; color-scheme: dark }
+body { background: var(--bg); color: var(--ink); font-family: var(--f-body); font-size: 14px; line-height: 1.5; }
+.wrap { max-width: 1240px; margin: 0 auto; padding-block: 20px 40px;
+  padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px)); }
+header { display: flex; flex-wrap: wrap; align-items: end; justify-content: space-between; gap: 12px 24px; margin-bottom: 16px; }
+h1 { font-family: var(--f-display); font-weight: 700; font-size: 34px; letter-spacing: .01em; margin: 0; line-height: 1; text-wrap: balance; }
+.sub { color: var(--muted); margin: 6px 0 0; max-width: 62ch; }
+.tabs { display: flex; flex-wrap: wrap; gap: 8px; }
+.tab { font: 500 13px var(--f-body); border: 1px solid var(--rule); background: var(--panel); color: var(--ink);
+  padding: 7px 12px; border-radius: 6px; cursor: pointer; display: flex; align-items: center; gap: 8px; }
+.tab[aria-selected="true"] { border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
+.tab:focus-visible, .lyr input:focus-visible, input[type=range]:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.badge { font: 600 11px var(--f-data); letter-spacing: .06em; text-transform: uppercase; padding: 2px 6px; border-radius: 4px; background: var(--chip); color: var(--muted); }
+.badge.live { background: var(--accent); color: var(--accent-ink); }
+.grid { display: grid; grid-template-columns: minmax(0, 1fr) 340px; gap: 16px; align-items: start; }
+@media (max-width: 900px) { .grid { grid-template-columns: minmax(0, 1fr); } }
+.mapbox { background: var(--panel); border: 1px solid var(--rule); border-radius: 8px; padding: 12px; min-width: 0; }
+.map { position: relative; width: 100%; background: var(--map); border-radius: 4px; overflow: hidden; max-width: 100%; }
+.map img { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+.map img.terrain { image-rendering: auto; }
+.north { position: absolute; top: 10px; right: 10px; font: 600 12px var(--f-data); color: #172026; background: rgba(255,255,255,.85);
+  border-radius: 4px; padding: 3px 6px; text-align: center; line-height: 1.1; }
+.scale { position: absolute; left: 10px; bottom: 10px; background: rgba(255,255,255,.85); border-radius: 4px; padding: 4px 6px;
+  font: 500 11px var(--f-data); color: #172026; }
+.scale i { display: block; height: 4px; background: #172026; margin-top: 3px; }
+.controls { display: flex; flex-wrap: wrap; gap: 6px 14px; margin-top: 10px; align-items: center; }
+.lyr { display: flex; align-items: center; gap: 6px; font-size: 13px; cursor: pointer; }
+.sw { width: 12px; height: 12px; border-radius: 2px; display: inline-block; }
+.opac { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--muted); margin-left: auto; }
+aside { display: flex; flex-direction: column; gap: 12px; min-width: 0; }
+.card { background: var(--panel); border: 1px solid var(--rule); border-radius: 8px; padding: 14px 16px; }
+.card h2 { font-family: var(--f-display); font-weight: 600; font-size: 22px; margin: 0 0 2px; line-height: 1.1; }
+.card h3 { font: 600 11px var(--f-data); letter-spacing: .08em; text-transform: uppercase; color: var(--muted); margin: 0 0 8px; }
+.meta { color: var(--muted); font-size: 13px; margin: 0; }
+dl { display: grid; grid-template-columns: 1fr auto; gap: 6px 12px; margin: 0; }
+dt { color: var(--muted); }
+dd { margin: 0; font-family: var(--f-data); font-variant-numeric: tabular-nums; text-align: right; }
+.big { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 10px; }
+.big div { border-top: 2px solid var(--rule); padding-top: 6px; }
+.big b { display: block; font: 600 26px var(--f-display); line-height: 1; }
+.big span { font-size: 12px; color: var(--muted); }
+.score b { color: var(--good); }
+.ramp { height: 10px; border-radius: 2px; margin: 4px 0 2px; }
+.ramplab { display: flex; justify-content: space-between; font: 11px var(--f-data); color: var(--muted); }
+.legend p { margin: 8px 0 0; font-size: 12px; color: var(--muted); }
+.note { font-size: 12px; color: var(--muted); margin: 0; }
+section.roster { margin-top: 20px; }
+section.roster h2 { font-family: var(--f-display); font-weight: 600; font-size: 22px; margin: 0 0 4px; }
+.tablewrap { overflow-x: auto; background: var(--panel); border: 1px solid var(--rule); border-radius: 8px; }
+table { border-collapse: collapse; width: 100%; font-size: 13px; }
+th, td { text-align: left; padding: 8px 12px; border-bottom: 1px solid var(--rule); white-space: nowrap; }
+th { font: 600 11px var(--f-data); letter-spacing: .06em; text-transform: uppercase; color: var(--muted); }
+td.num { font-family: var(--f-data); font-variant-numeric: tabular-nums; text-align: right; }
+tr:last-child td { border-bottom: 0; }
+.dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--rule); margin-right: 6px; }
+.dot.on { background: var(--accent); }
+@media (prefers-reduced-motion: no-preference) { .map img { transition: opacity .2s; } }
+</style>
+
+<div class="wrap">
+  <header>
+    <div>
+      <h1>Wildfire Spread Forecast</h1>
+      <p class="sub">Where a fire is likely to burn next, from the project's physics-informed model, with the crown-fire and ember maps behind it. Replay shows a past forecast against what really burned.</p>
+    </div>
+    <div class="tabs" role="tablist" id="tabs"></div>
+  </header>
+
+  <div class="grid">
+    <div class="mapbox">
+      <div class="map" id="map"></div>
+      <div class="controls" id="controls"></div>
+    </div>
+    <aside>
+      <div class="card" id="brief"></div>
+      <div class="card legend" id="legend"></div>
+      <div class="card"><h3>How this forecast is made</h3>
+        <p class="note">Rothermel surface spread with crown fire (Cruz et al. 2004–2005) and ember spotting, run on a 150 m grid by a travel-time solver. Weather is forecast-only: HRRR observations up to the start time plus HRRR forecasts already issued then. Fuels from LANDFIRE, terrain from Copernicus GLO-30, fire from WFIGS perimeters and VIIRS detections. Prototype: not for operational decisions.</p>
+      </div>
+    </aside>
+  </div>
+
+  <section class="roster">
+    <h2>Fires on the map today</h2>
+    <p class="meta" id="rostersub"></p>
+    <div class="tablewrap"><table id="roster"></table></div>
+  </section>
+</div>
+
+<script>
+const DATA = /*__DATA__*/null;
+const LAYERS = [
+  ["terrain", "Terrain", null, true, true],
+  ["crown", "Crown fire chance", "#3f9a5c", false, false],
+  ["ember", "Ember landing", "#7c3aed", false, false],
+  ["forecast", "Burn probability", "#e8591e", true, false],
+  ["viirs", "Satellite fire (48 h)", "#d60078", true, false],
+  ["burning", "Fire now", "#3c1812", true, false],
+  ["actual", "What actually burned", "#00c8e6", true, false],
+];
+const fmt = (x, d = 1) => (x == null || isNaN(x)) ? "–" : Number(x).toLocaleString(undefined, { maximumFractionDigits: d, minimumFractionDigits: d });
+const fmtTime = s => { if (!s) return "–"; const t = new Date(String(s).replace(" ", "T")); return isNaN(t) ? s :
+  t.toLocaleString(undefined, { month: "short", day: "numeric", year: "numeric", hour: "2-digit", minute: "2-digit", timeZoneName: "short" }); };
+let cur = 0, opacity = 0.9, vis = {};
+
+function tabs() {
+  const el = document.getElementById("tabs"); el.innerHTML = "";
+  DATA.items.forEach((it, i) => {
+    const b = document.createElement("button");
+    b.className = "tab"; b.id = "tab-" + i; b.setAttribute("role", "tab"); b.setAttribute("aria-selected", i === cur);
+    const live = it.meta.mode === "live";
+    b.innerHTML = `<span class="badge ${live ? "live" : ""}">${live ? "Live" : "Replay"}</span>${it.meta.name}`;
+    b.onclick = () => { cur = i; render(); };
+    el.appendChild(b);
+  });
+}
+
+function render() {
+  tabs();
+  const it = DATA.items[cur], m = it.meta, s = it.stats, L = it.layers;
+  const map = document.getElementById("map");
+  map.style.aspectRatio = `${s.px_w} / ${s.px_h}`;
+  map.innerHTML = "";
+  LAYERS.forEach(([key, label, , on, base]) => {
+    if (!L[key]) return;
+    if (vis[key] === undefined) vis[key] = on;
+    const img = new Image(); img.src = L[key]; img.alt = label; img.className = key;
+    img.style.opacity = vis[key] ? (key === "forecast" || key === "crown" || key === "ember" ? opacity : 1) : 0;
+    img.id = "img-" + key; map.appendChild(img);
+  });
+  const km = s.width_km > 30 ? 10 : s.width_km > 12 ? 5 : s.width_km > 5 ? 2 : 1;
+  map.insertAdjacentHTML("beforeend", `<div class="north">N<br>↑</div><div class="scale">${km} km<i id="scalebar"></i></div>`);
+  const sizeBar = () => { const bar = document.getElementById("scalebar"); if (bar) bar.style.width = Math.max(20, map.clientWidth * km / s.width_km) + "px"; };
+  sizeBar(); window.onresize = sizeBar;
+
+  const c = document.getElementById("controls"); c.innerHTML = "";
+  LAYERS.forEach(([key, label, color]) => {
+    if (!L[key]) return;
+    const id = "lyr-" + key;
+    const w = document.createElement("label"); w.className = "lyr"; w.htmlFor = id;
+    w.innerHTML = `<input type="checkbox" id="${id}" ${vis[key] ? "checked" : ""}>${color ? `<span class="sw" style="background:${color}"></span>` : ""}${label}`;
+    w.querySelector("input").onchange = e => { vis[key] = e.target.checked; render(); };
+    c.appendChild(w);
+  });
+  c.insertAdjacentHTML("beforeend", `<label class="opac" for="opacity">Overlay opacity <input type="range" id="opacity" min="0.2" max="1" step="0.05" value="${opacity}"></label>`);
+  document.getElementById("opacity").oninput = e => { opacity = +e.target.value;
+    ["forecast", "crown", "ember"].forEach(k => { const im = document.getElementById("img-" + k); if (im && vis[k]) im.style.opacity = opacity; }); };
+
+  const live = m.mode === "live";
+  const where = [m.state, m.year].filter(Boolean).join(" · ");
+  let score = "";
+  if (m.replay_score) score = `<div class="big score"><div><b>${fmt(m.replay_score.actual_new_km2)}</b><span>km² actually burned next</span></div>
+     <div><b>${Math.round(m.replay_score.hit_rate_same_area * 100)}%</b><span>of it caught when flagging the same area</span></div></div>`;
+  document.getElementById("brief").innerHTML = `
+    <h2>${m.name}</h2><p class="meta">${where}${live && m.contained != null ? ` · ${m.contained}% contained` : ""}</p>
+    <div class="big"><div><b>${fmt(s.expected_new_km2)}</b><span>km² expected to burn in ${Math.round(m.hours)} h</span></div>
+      <div><b>${fmt(s.likely_km2)}</b><span>km² above 50% chance</span></div></div>
+    ${score}
+    <h3 style="margin-top:14px">Forecast</h3>
+    <dl>
+      <dt>Starts</dt><dd>${fmtTime(m.origin)}</dd>
+      <dt>Horizon</dt><dd>${Math.round(m.hours)} h</dd>
+      <dt>Burning now</dt><dd>${fmt(s.burning_km2)} km²</dd>
+      <dt>Crown fire likely (map)</dt><dd>${fmt(s.crown_km2)} km²</dd>
+      ${live ? `<dt>Last perimeter</dt><dd>${fmtTime(m.perimeter_time)}</dd>
+      <dt>HRRR forecast run</dt><dd>${fmtTime(m.hrrr && m.hrrr.forecast_run)}</dd>
+      <dt>VIIRS fire cells, 48 h</dt><dd>${fmt(m.viirs_cells_48h, 0)}</dd>` : ""}
+      <dt>Model</dt><dd>${m.model.split(" ")[0]}</dd>
+      <dt>Map</dt><dd>${fmt(s.width_km)} × ${fmt(s.height_km)} km</dd>
+    </dl>
+    ${live && !s.viirs_cells && s.expected_new_km2 < 0.5 ? `<p class="note" style="margin-top:10px">No satellite fire detected in the last 48 h, so little growth is expected.</p>` : ""}`;
+
+  document.getElementById("legend").innerHTML = `<h3>Reading the map</h3>
+    <div>Burn probability</div><div class="ramp" style="background:linear-gradient(90deg,#ffec8c,#fdae3c,#e8591e,#96141e)"></div>
+    <div class="ramplab"><span>10%</span><span>50%</span><span>100%</span></div>
+    <p>Dark red outline: the fire now. Magenta cells: satellite fire in the last 48 h.${L.actual ? " Cyan outline: where the fire really was at the end of the forecast." : ""} Turn on crown fire and ember landing to see why the forecast spreads where it does.</p>`;
+}
+
+function roster() {
+  const f = DATA.fires || [];
+  document.getElementById("rostersub").textContent = f.length
+    ? `${f.length} perimeters in the WFIGS current service, most active first. Satellite fire = VIIRS detections near the perimeter in the last 48 h.`
+    : "No active-fire list was included.";
+  const rows = f.slice(0, 15).map(r => `<tr><td><span class="dot ${r.detections_48h > 0 ? "on" : ""}"></span>${r.name}</td><td>${r.state || ""}</td>
+    <td class="num">${fmt(r.acres, 0)}</td><td class="num">${r.contained == null ? "–" : r.contained + "%"}</td>
+    <td class="num">${fmtTime(r.updated)}</td><td class="num">${r.detections_48h}</td></tr>`).join("");
+  document.getElementById("roster").innerHTML = `<thead><tr><th>Fire</th><th>State</th><th style="text-align:right">Acres</th>
+    <th style="text-align:right">Contained</th><th style="text-align:right">Last mapped</th><th style="text-align:right">Satellite fire, 48 h</th></tr></thead><tbody>${rows}</tbody>`;
+}
+
+if (DATA && DATA.items && DATA.items.length) { render(); roster(); }
+</script>

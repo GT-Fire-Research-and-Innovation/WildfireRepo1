@@ -97,6 +97,8 @@ class Member:
                     sd, src = best[1], f"best so far (val AP {best[0]:.3f}, after epoch {c['epoch']})"
                 else:
                     sd, src = c["model"], f"latest (epoch {c['epoch']}, no validation yet)"
+            elif mode == "physics2":
+                sd, src = TH.build_model(mode, n_in, width, device, dx=dx).state_dict(), "default settings (not fitted)"
             else:
                 raise SystemExit(f"no checkpoint for {name} in {runs}")
             if mode == "physics2":                        # learned scalars only, no network

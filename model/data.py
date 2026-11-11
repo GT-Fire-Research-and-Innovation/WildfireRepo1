@@ -278,7 +278,8 @@ class Fire:
             F = rz["fields"][sel].astype(np.float32)          # (T, 4, hh, wh): gust, u10, v10, rh2
             if WEATHER_MODE == "forecast" and "fc" in rz and len(rz["fc_times"]):
                 vt = pd.to_datetime(rz["fc_times"], utc=True)          # valid times (12z init + 9 h)
-                issued = vt - pd.Timedelta(hours=9)
+                issued = (pd.to_datetime(rz["fc_issued"], utc=True) if "fc_issued" in rz and len(rz["fc_issued"]) == len(vt)
+                          else vt - pd.Timedelta(hours=9))     # dataset: 12z runs at +9 h; live: the real run time
                 use = (vt > t_i) & (vt <= t_j) & (issued <= t_i - pd.Timedelta(hours=2))
                 if use.any():
                     F = np.concatenate([F, rz["fc"][use].astype(np.float32)]) if len(F) else rz["fc"][use].astype(np.float32)
