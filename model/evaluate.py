@@ -272,6 +272,24 @@ def run_split(members, fires, calibrate, max_pairs=None, log_every=200):
     return arrays, cells, rows
 
 
+def save_preds(path, sv, cv, rows_v, st, ct, rows_t):
+    """Per-cell forecasts of every variant on validation and test, for training a model router later.
+    Cell order is the same for every model (same fires, pairs, windows and masks), so files from
+    different evaluations line up cell by cell; per-pair cell counts are stored to check that."""
+    out = {}
+    for tag, sc, cl, rw in (("val", sv, cv, rows_v), ("test", st, ct, rows_t)):
+        for v, arr in sc.items():
+            out[f"{tag}_{v}"] = arr.astype(np.float16)
+        for k, arr in cl.items():
+            out[f"{tag}_{k}"] = arr
+        out[f"{tag}_pair_fire"] = np.array([str(r["fire"]) for r in rw])
+        out[f"{tag}_pair_i"] = np.array([r["i"] for r in rw], np.int32)
+        out[f"{tag}_pair_gap_h"] = np.array([r["gap_h"] for r in rw], np.float32)
+        out[f"{tag}_pair_cells"] = np.array([r["cells"] for r in rw], np.int64)
+    np.savez_compressed(path, **out)
+    print(f"  per-cell predictions -> {path.name} ({path.stat().st_size / 1e6:.0f} MB)", flush=True)
+
+
 # ---------------------------------------------------------------------------- metrics
 def window_scores(s, y, rows, thr):
     """TS-SatFire style: every pair scored alone (empty prediction on an empty target = 1),
@@ -379,7 +397,7 @@ def main():
 
     res = {"name": a.out, "models": a.model, "resolution_m": res_m, "data_version": D.DATA_VERSION, "weather": D.WEATHER_MODE}
     print("  validation pass (thresholds)", flush=True)
-    sv, cv, _ = run_split(members, split["val"], calibrate, a.max_pairs)
+    sv, cv, rows_v = run_split(members, split["val"], calibrate, a.max_pairs)
     thr = {v: TH.metrics(sv[v], cv["y"])["thr"] for v in sv}
     print("  test pass", flush=True)
     st, ct, rows = run_split(members, split["test"], calibrate, a.max_pairs)
@@ -415,6 +433,10 @@ def main():
     res["pairs"] = rows
     path = runs / f"eval_{a.out}.json"
     json.dump(res, open(path, "w"), indent=1)
+    try:
+        save_preds(runs / f"preds_{a.out}.npz", sv, cv, rows_v, st, ct, rows)
+    except Exception as e:                              # the dump is for the model router; never lose the scores over it
+        print(f"  (could not save per-cell predictions: {e})", flush=True)
 
     print(f"\n[{a.out}] TEST ({len(rows)} pairs, {res['raw']['fires']} fires)")
     print(f"  {'variant':<12} {'AP':>6} {'F1':>6} {'IoU':>6} {'area':>6} {'R@area':>7} {'F1win':>6} {'IoUwin':>7} {'edge km':>8}")
