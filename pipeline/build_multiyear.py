@@ -346,17 +346,62 @@ def st_landfire(g, ctx):
     if v is None:
         return dict(missing=np.array(True), version=np.array("none"))
     tif = ctx["dir"] / "landfire_raw.tif"
-    L.fetch(g["bounds_lonlat"], tif, layers=[f"{v}_{x}" for x in ("FBFM40", "CC", "CH", "CBH", "CBD")])
-    lon, lat = centres(g)
+    res = float(g.get("res_m", 150.0))
+    native = res < 120                                  # finer grids get LANDFIRE at its native 30 m
+    L.fetch(g["bounds_lonlat"], tif, layers=[f"{v}_{x}" for x in ("FBFM40", "CC", "CH", "CBH", "CBD")],
+            resolution=30 if native else 90)
     with rasterio.open(tif) as d:
         a = d.read()
         tr = d.transform
-        col = np.clip(np.floor((lon - tr.c) / tr.a).astype(int), 0, d.width - 1)
-        row = np.clip(np.floor((lat - tr.f) / tr.e).astype(int), 0, d.height - 1)
-    s = a[:, row, col]
+    if native:
+        s = _landfire_per_cell(a, tr, g)
+    else:                                              # 150 m: nearest 90 m pixel (as built so far)
+        lon, lat = centres(g)
+        col = np.clip(np.floor((lon - tr.c) / tr.a).astype(int), 0, a.shape[2] - 1)
+        row = np.clip(np.floor((lat - tr.f) / tr.e).astype(int), 0, a.shape[1] - 1)
+        s = a[:, row, col]
     tif.unlink()
     return dict(fbfm40=s[0].astype(np.int16), cc=s[1].astype(np.int16), ch=s[2].astype(np.int16),
-                cbh=s[3].astype(np.int16), cbd=s[4].astype(np.int16), version=np.array(v), missing=np.array(False))
+                cbh=s[3].astype(np.int16), cbd=s[4].astype(np.int16), version=np.array(v), missing=np.array(False),
+                source_m=np.array(30 if native else 90))
+
+
+def _landfire_per_cell(a, tr, g):
+    """Summarise 30 m LANDFIRE over each grid cell: the most common fuel model (FBFM40), and the mean
+    of canopy cover, height, base height and bulk density. Cells with no 30 m pixel inside take the
+    nearest pixel."""
+    H, W = g["height"], g["width"]
+    dx, _, x0, _, ey, y0 = g["transform"]
+    rows, cols = np.mgrid[0:a.shape[1], 0:a.shape[2]]
+    lon = tr.c + (cols + 0.5) * tr.a
+    lat = tr.f + (rows + 0.5) * tr.e
+    ci = np.floor((lon - x0) / dx).astype(np.int64)
+    ri = np.floor((lat - y0) / ey).astype(np.int64)
+    ok = (ri >= 0) & (ri < H) & (ci >= 0) & (ci < W)
+    cell = (ri * W + ci)[ok]
+    n = np.bincount(cell, minlength=H * W)
+    out = np.zeros((5, H * W), np.float64)
+    for b in range(1, 5):
+        v = a[b][ok].astype(np.float64)
+        valid = v >= 0
+        s = np.bincount(cell[valid], weights=v[valid], minlength=H * W)
+        c = np.bincount(cell[valid], minlength=H * W)
+        out[b] = np.where(c > 0, s / np.maximum(c, 1), 0)
+    code = a[0][ok].astype(np.int64)                  # majority fuel model per cell
+    key = cell * 1024 + np.clip(code, 0, 1023)
+    uk, cnt = np.unique(key, return_counts=True)
+    kc, kv = uk // 1024, uk % 1024
+    order = np.lexsort((-cnt, kc))
+    first = np.ones(len(order), bool)
+    first[1:] = kc[order][1:] != kc[order][:-1]
+    out[0, kc[order][first]] = kv[order][first]
+    empty = n == 0
+    if empty.any():                                    # fall back to the nearest pixel
+        lonc, latc = centres(g)
+        col = np.clip(np.floor((lonc.ravel()[empty] - tr.c) / tr.a).astype(int), 0, a.shape[2] - 1)
+        row = np.clip(np.floor((latc.ravel()[empty] - tr.f) / tr.e).astype(int), 0, a.shape[1] - 1)
+        out[:, empty] = a[:, row, col]
+    return np.rint(out).reshape(5, H, W)
 
 
 FUNCS = {"labels": st_labels, "history": st_history, "viirs": st_viirs, "terrain": st_terrain,

@@ -37,10 +37,11 @@ def email():
     return e
 
 
-def fetch(bounds, dst, layers=LAYERS, tries=3):
+def fetch(bounds, dst, layers=LAYERS, tries=3, resolution=90):
+    """resolution: 90 m for 150 m grids (unchanged), 30 m (native) for finer grids."""
     w, s, e, n = bounds
     params = {"Email": email(), "Layer_List": ";".join(layers), "Area_of_Interest": f"{w:.4f} {s:.4f} {e:.4f} {n:.4f}",
-              "Output_Projection": "4326", "Resample_Resolution": "90"}
+              "Output_Projection": "4326", "Resample_Resolution": str(int(resolution))}
     for t in range(tries):
         try:
             job = requests.get(f"{LFPS}/submit", params=params, timeout=120).json()

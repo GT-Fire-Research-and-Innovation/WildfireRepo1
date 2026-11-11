@@ -332,6 +332,8 @@ def main():
     ap.add_argument("--val-years", default="2023", help="comma list (default 2023)")
     ap.add_argument("--test-years", default="2024,2025", help="comma list (default 2024,2025)")
     ap.add_argument("--seed", type=int, default=0, help="different seeds = ensemble members")
+    ap.add_argument("--crop-km", type=float, default=24.0,
+                    help="training crop size; 12 at 75 m keeps the cost per crop the same as 24 km at 150 m")
     ap.add_argument("--weather", default="observed", choices=["observed", "forecast"],
                     help="forecast: only weather a forecaster has at forecast time (see data.WEATHER_MODE)")
     a = ap.parse_args()
@@ -354,6 +356,8 @@ def main():
         fires = split["train"] + split["val"] + split["test"]
     D.PHYSICS_V2 = a.mode in V2_MODES
     D.WEATHER_MODE = a.weather
+    global CROP_KM
+    CROP_KM = a.crop_km
     groups = groups_used(set(a.drop), v2=D.PHYSICS_V2)
     n_in = sum(D.GROUPS[g] for g in groups)
     print(f"[{a.name}] mode={a.mode} inputs={n_in} ch  fires train/val/test = "
