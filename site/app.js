@@ -503,8 +503,8 @@
     const fig = (label, val, hot) => el("div", {}, el("dt", { text: label }), el("dd", { class: hot ? "hot" : "", text: val }));
     const figs = el("dl", { class: "figs" }, fig("Size now", ac(m?.acres ?? inc?.IncidentSize ?? per?.properties.poly_GISAcres)),
       m?.example ? fig("Forecast window", `${m.hours} h`) : fig("Contained", (m?.contained ?? inc?.PercentContained) === null || (m?.contained ?? inc?.PercentContained) === undefined ? "not reported" : `${m?.contained ?? inc?.PercentContained}%`));
-    if (F) figs.append(fig(`Expected growth, ${hrs} h`, ac(s.expected_new_acres), true), fig("Likely (50%+ cells)", ac(s.likely_acres)),
-      fig("Possible (10%+ cells)", ac(s.possible_acres)), s.actual_new_acres !== undefined ? fig("Actually burned", ac(s.actual_new_acres)) : fig("Forecast from", when(m.origin)));
+    if (F) figs.append(fig(`Growth, next ${hrs} h`, ac(s.expected_new_acres), true), fig("Likely, 50%+", ac(s.likely_acres)),
+      fig("Possible, 10%+", ac(s.possible_acres)), s.actual_new_acres !== undefined ? fig("Actually burned", ac(s.actual_new_acres)) : fig("Forecast from", when(m.origin)));
     const w = s.wind;
     box.replaceChildren(...[
       el("button", { class: "close", onclick: () => { state.selected = null; box.hidden = true; renderList(); }, text: "Close" }),
