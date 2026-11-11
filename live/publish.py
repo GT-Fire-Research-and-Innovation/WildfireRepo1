@@ -216,6 +216,59 @@ def summary(f, feats, b0, p):
     return out
 
 
+# ------------------------------------------------------------------------------ which fires
+INCIDENTS = ("https://services3.arcgis.com/T4QMspbfLg3qTGWY/arcgis/rest/services/"
+             "WFIGS_Incident_Locations_Current/FeatureServer/0/query")
+
+
+def all_fires(FN, now):
+    """Every current wildfire worth considering: WFIGS perimeters of any size, plus WFIGS incidents
+    that have no perimeter yet (most new fires, and most fires in the East). A fire without a
+    perimeter gets its starting shape from its VIIRS detections of the last 48 h (375 m pixels)
+    near the incident point, plus a circle of its reported size."""
+    import requests
+    from shapely import affinity
+    from shapely.geometry import Point, box, mapping
+    from shapely.ops import unary_union
+    from live import firms
+    fires = FN.active_fires(min_acres=0)
+    for r in fires:
+        r["source"] = "perimeter"
+    have = {r["id"] for r in fires}
+    det = pd.concat([firms.get("VIIRS_NOAA20_NRT", (-125, 24, -66, 50), 1, (now - pd.Timedelta(days=k)).date().isoformat())
+                     for k in (1, 0)], ignore_index=True)
+    since = (now - pd.Timedelta(days=21)).strftime("%Y-%m-%d %H:%M:%S")
+    js = requests.get(INCIDENTS, params=dict(
+        where=f"IncidentTypeCategory='WF' AND (PercentContained IS NULL OR PercentContained<100) AND ModifiedOnDateTime_dt >= TIMESTAMP '{since}'",
+        outFields="IncidentName,IncidentSize,PercentContained,POOState,ModifiedOnDateTime_dt,UniqueFireIdentifier",
+        outSR=4326, f="json", resultRecordCount=2000), timeout=120).json()
+    added = 0
+    for f in js.get("features", []):
+        a, g = f["attributes"], f.get("geometry") or {}
+        if "x" not in g or a["UniqueFireIdentifier"] in have:
+            continue
+        acres = float(a["IncidentSize"] or 0)
+        rad_km = max(3.0, 1.5 * math.sqrt(acres * ACRE_M2 / 1e6 / math.pi) + 1.5)
+        k = math.cos(math.radians(g["y"]))
+        near = det[((det.latitude - g["y"]).abs() < rad_km / 111) & ((det.longitude - g["x"]).abs() < rad_km / (111 * k))] if len(det) else det
+        if not len(near):
+            continue
+        hy, hx = 0.0017, 0.0017 / k                       # half a 375 m VIIRS pixel
+        parts = [box(x - hx, y - hy, x + hx, y + hy) for x, y in zip(near.longitude, near.latitude)]
+        r_deg = max(math.sqrt(acres * ACRE_M2 / math.pi), 100) / 111000
+        parts.append(affinity.scale(Point(g["x"], g["y"]).buffer(r_deg, 16), xfact=1 / k, yfact=1))
+        geom = unary_union(parts)
+        t = pd.to_datetime(a["ModifiedOnDateTime_dt"], unit="ms", utc=True) if a["ModifiedOnDateTime_dt"] else now
+        fires.append(dict(id=a["UniqueFireIdentifier"], name=a["IncidentName"], state=a["POOState"], acres=round(acres),
+                          contained=a["PercentContained"], updated=min(t, now).isoformat(), lon=round(g["x"], 4), lat=round(g["y"], 4),
+                          detections_48h=int(len(near)), source="incident",
+                          feature=dict(type="Feature", geometry=mapping(geom),
+                                       properties=dict(poly_MapMethod="VIIRS detections + incident location (no perimeter yet)"))))
+        added += 1
+    print(f"{len(fires) - added} perimeters + {added} incidents without a perimeter but with satellite detections", flush=True)
+    return fires
+
+
 # ------------------------------------------------------------------------------ main
 def main():
     ap = argparse.ArgumentParser()
@@ -223,7 +276,7 @@ def main():
     ap.add_argument("--work", default="data/live_run")
     ap.add_argument("--models", default=str(ROOT / "live" / "models"))
     ap.add_argument("--max-fires", type=int, default=12)
-    ap.add_argument("--min-detections", type=int, default=5, help="VIIRS detections in 48 h to count as active")
+    ap.add_argument("--min-detections", type=int, default=3, help="VIIRS detections in 48 h to count as active")
     ap.add_argument("--hours", type=float, default=24)
     ap.add_argument("--fire", help="forecast only this incident (name or WFIGS id)")
     a = ap.parse_args()
@@ -231,18 +284,17 @@ def main():
     t0 = time.time()
     site = Path(a.site)
     (site / "data" / "forecast").mkdir(parents=True, exist_ok=True)
-    fires = FN.active_fires()
-    print(f"{len(fires)} active fires (100+ acres, mapped in the last 60 days)", flush=True)
+    now = pd.Timestamp.now(tz="UTC").floor("min")
+    fires = all_fires(FN, now)
     pick = [r for r in fires if r["detections_48h"] >= a.min_detections]
     if a.fire:
         pick = [r for r in fires if a.fire.lower() in (r["name"].lower(), r["id"].lower())]
     pick = sorted(pick, key=lambda r: (-r["detections_48h"], -r["acres"]))[: a.max_fires]
     model = Model(a.models)
-    print(f"model: {model.label['name']}; forecasting {len(pick)} fires", flush=True)
-    now = pd.Timestamp.now(tz="UTC").floor("min")
+    print(f"model: {model.label['name']}; forecasting {len(pick)} fires: {', '.join(r['name'] for r in pick)}", flush=True)
     entries = []
     for r in fires:
-        e = {k: r[k] for k in ("id", "name", "state", "acres", "contained", "updated", "lon", "lat", "detections_48h")}
+        e = {k: r.get(k) for k in ("id", "name", "state", "acres", "contained", "updated", "lon", "lat", "detections_48h", "source")}
         e["forecast"] = None
         entries.append(e)
     by_id = {e["id"]: e for e in entries}

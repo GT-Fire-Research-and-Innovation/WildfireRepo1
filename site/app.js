@@ -459,7 +459,7 @@
       figs,
       w ? el("p", { class: "wind", text: `Forecast wind: from ${w.from_compass} at ${w.mean_mph} mph, gusts to ${w.peak_gust_mph} mph, humidity down to ${w.min_rh_pct}%` }) : null,
       F ? el("p", { class: "note", text: m.example ? m.note : `Forecast from ${when(m.origin)} to ${when(new Date(+new Date(m.origin) + hrs * 3600e3))}. Weather: HRRR run ${when(m.hrrr_run)}.` })
-        : el("p", { class: "noforecast", text: "No forecast for this fire: fewer than 5 satellite fire detections in the last 48 hours, so it is not actively spreading." })].filter(Boolean));
+        : el("p", { class: "noforecast", text: "No forecast for this fire: fewer than 3 satellite fire detections near it in the last 48 hours, so it does not look actively spreading. Forecasts refresh every 2 hours." })].filter(Boolean));
     box.hidden = false;
   }
   function select(id, fly) {
