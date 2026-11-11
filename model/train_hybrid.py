@@ -105,7 +105,9 @@ def fit_pca(root, out, n=16, per_fire=300, seed=0):
     return comp, mean
 
 
-V2_MODES = ("hybrid2", "physics2")
+V2_MODES = ("hybrid2", "physics2", "unet2")      # use the crown-fire / ember group
+HYBRID_V2 = ("hybrid2", "physics2")               # have the crown weight and ember scalars
+UNET_MODES = ("unet", "unet2")
 
 
 def groups_used(drop, v2=False):
@@ -177,7 +179,7 @@ def flip_x_channels(groups):
 
 
 def build_model(mode, n_in, width, device, dx=150.0):
-    if mode == "unet":
+    if mode in UNET_MODES:
         return UNet(n_in, 1, width).to(device)
     if mode == "hybrid":
         return Hybrid(UNet(n_in, 2, width), dx=dx, max_iter=int(400 * 150 / dx)).to(device)
@@ -202,7 +204,7 @@ class ZeroNet(torch.nn.Module):
 
 
 def forward(model, mode, x, P, b0, gap_days):
-    if mode == "unet":
+    if mode in UNET_MODES:
         return model(x)[:, 0], None
     phys = {"r_head": P[:, 0], "ecc": P[:, 1], "head_x": P[:, 2], "head_y": P[:, 3]}
     if P.shape[1] >= 6:
@@ -314,8 +316,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--data", required=True)
     ap.add_argument("--name", default="hybrid")
-    ap.add_argument("--mode", default="hybrid", choices=["hybrid", "unet", "physics", "hybrid2", "physics2"],
-                    help="hybrid2 / physics2 add crown fire and spotting (physics v2)")
+    ap.add_argument("--mode", default="hybrid", choices=["hybrid", "unet", "physics", "hybrid2", "physics2", "unet2"],
+                    help="hybrid2 / physics2 add crown fire and spotting (physics v2); unet2 = U-Net that also sees the crown-fire and ember maps")
     ap.add_argument("--drop", nargs="*", default=[], help="input groups to leave out (ablations)")
     ap.add_argument("--epochs", type=int, default=30)
     ap.add_argument("--steps", type=int, default=600, help="training batches per epoch")
@@ -426,9 +428,9 @@ def main():
     mt.update(edge_summary(rows))
     torch.save(model.state_dict(), runs / f"{a.name}.pt")
     extra = {}
-    if a.mode in ("hybrid",) + V2_MODES:
+    if a.mode in ("hybrid",) + HYBRID_V2:
         extra = {"effective_minutes_per_day": model.log_h.exp().item(), "softness_min": model.log_tau.exp().item()}
-    if a.mode in V2_MODES:
+    if a.mode in HYBRID_V2:
         extra.update(crown_weight=torch.sigmoid(model.crown_logit).item(), ember_ignitability=model.log_k.exp().item())
         print(f"  learned: crown weight {extra['crown_weight']:.2f}, ember ignitability {extra['ember_ignitability']:.3f}, "
               f"burning {extra['effective_minutes_per_day']:.0f} min/day", flush=True)

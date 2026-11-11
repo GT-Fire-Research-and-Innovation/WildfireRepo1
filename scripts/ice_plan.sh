@@ -6,6 +6,7 @@
 #     hybrid2_v1    hybrid, crown fire + spotting
 #     physics2_v1   physics only, crown fire + spotting (5 learned settings)
 #     unet_h21      U-Net with 2021 held out, for the head-to-head with the group's TS-SatFire model
+#     unet2_v1      U-Net that also sees the crown-fire and ember maps (physics as inputs, no solver)
 #   evaluation period (starts by itself when ALL training above has finished; pulls the latest code first):
 #     physics_v1, unet_v1, hybrid_v1_before, hybrid_v1, hybrid2_v1, physics2_v1  on the 2024-2025 test years
 #     unet_h21 on the 19 TS-SatFire test fires (2021)
@@ -60,6 +61,7 @@ train hybrid_v1   hybrid   wf-hybrid   2
 train hybrid2_v1  hybrid2  wf-hybrid2  2
 train physics2_v1 physics2 wf-phys2    1 "--epochs 4 --steps 200 --lr 0.02 --eval-every 2" 4:00:00
 train unet_h21    unet     wf-unet-h21 1 "--val-years 2020 --test-years 2021" 6:00:00
+train unet2_v1    unet2    wf-unet2    1 "" 8:00:00
 DEP=""; [ ${#TRAIN[@]} -gt 0 ] && DEP="--dependency=afterany:$(IFS=:; echo "${TRAIN[*]}")"
 
 # 2. evaluation period
@@ -74,6 +76,7 @@ ev "unet_v1"                 unet_v1_eval
 ev "hybrid_v1"               hybrid_v1_eval
 ev "hybrid2_v1"              hybrid2_eval
 ev "physics2_v1"             physics2_eval
+ev "unet2_v1"                unet2_eval
 ev "unet_h21"                unet_h21_vs_tssatfire "--val-years 2020 --test-years 2021 --fires ../benchmarks/tssatfire_2021_test_match.csv"
 
 # 3. report

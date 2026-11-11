@@ -78,7 +78,7 @@ class Member:
         if ":" in rest:
             drop = [g for g in rest.split(":")[1].split("+") if g]
         if mode is None:
-            mode = next((m for m in ("physics2", "hybrid2", "physics", "unet", "hybrid") if name.startswith(m)), "hybrid")
+            mode = next((m for m in ("physics2", "hybrid2", "unet2", "physics", "unet", "hybrid") if name.startswith(m)), "hybrid")
         self.name, self.mode, self.device = name, mode, device
         v2 = mode in TH.V2_MODES
         self.groups = [g for g in TH.groups_used(set(drop), v2=v2)]
@@ -116,13 +116,13 @@ class Member:
     def state(self, feats, phys, b0, gap_h):
         x = torch.from_numpy(TH.pad8(D.stack(feats, self.groups))).float()[None].to(self.device)
         h, w = b0.shape
-        if self.mode == "unet":
+        if self.mode in TH.UNET_MODES:
             return {"logit": self.model(x)[0, 0, :h, :w].float()}
         P = torch.from_numpy(TH.pad8(TH.phys_stack(phys))).float().to(self.device)
         bb = torch.from_numpy(TH.pad8(b0[None]))[0].to(self.device).bool()
         m = self.model
         z = None
-        if self.mode in TH.V2_MODES:
+        if self.mode in TH.HYBRID_V2:
             R, _, g = m.rate2(x, P[None, 0], P[None, 4])
             z = m.ignitions(P[None, 5], torch.tensor([gap_h / 24], device=self.device), g)[0, :h, :w].float()
         else:
@@ -364,7 +364,7 @@ def main():
     res_m = fires[0].res_m
     TH.set_grid(res_m / 1000)
     groups_all = TH.groups_used(set())
-    D.PHYSICS_V2 = any(sp.partition(":")[2].split(":")[0] in TH.V2_MODES or sp.split(":")[0].startswith(("hybrid2", "physics2"))
+    D.PHYSICS_V2 = any(sp.partition(":")[2].split(":")[0] in TH.V2_MODES or sp.split(":")[0].startswith(("hybrid2", "physics2", "unet2"))
                        for sp in a.model) or any(json.loads((runs / f"{sp.split(':')[0]}.json").read_text()).get("mode") in TH.V2_MODES
                                                  for sp in a.model if (runs / f"{sp.split(':')[0]}.json").exists())
     members = [Member(runs, sp, None, groups_all, a.device, res_m, a.width) for sp in a.model]
@@ -401,7 +401,7 @@ def main():
             a_ = arr[:, j, 0]
             res["calibration_params"][mb.name] = (
                 {"logit_bias_median": float(np.median(a_)), "logit_bias_p10_p90": [float(np.percentile(a_, q)) for q in (10, 90)]}
-                if mb.mode == "unet" else
+                if mb.mode in TH.UNET_MODES else
                 {"rate_multiplier_median": float(np.exp(np.median(a_))),
                  "rate_multiplier_p10_p90": [float(np.exp(np.percentile(a_, q))) for q in (10, 90)]})
     for r in rows:
