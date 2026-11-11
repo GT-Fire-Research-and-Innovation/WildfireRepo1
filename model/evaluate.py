@@ -348,9 +348,12 @@ def main():
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--val-years", default="2023")
     ap.add_argument("--test-years", default="2024,2025")
+    ap.add_argument("--weather", default="observed", choices=["observed", "forecast"],
+                    help="weather inputs; use what the model was trained with (forecast = only weather known at t_i)")
     a = ap.parse_args()
     D.VAL_YEARS = {int(y) for y in a.val_years.split(",")}
     D.TEST_YEARS = {int(y) for y in a.test_years.split(",")}
+    D.WEATHER_MODE = a.weather
     torch.manual_seed(0)
     runs = Path(a.data) / "runs"
     pca = TH.fit_pca(a.data, runs)
@@ -372,7 +375,7 @@ def main():
     print(f"[{a.out}] {len(members)} model(s); val/test fires {len(split['val'])}/{len(split['test'])}; "
           f"calibration {'on' if calibrate else 'off'}", flush=True)
 
-    res = {"name": a.out, "models": a.model, "resolution_m": res_m, "data_version": D.DATA_VERSION}
+    res = {"name": a.out, "models": a.model, "resolution_m": res_m, "data_version": D.DATA_VERSION, "weather": D.WEATHER_MODE}
     print("  validation pass (thresholds)", flush=True)
     sv, cv, _ = run_split(members, split["val"], calibrate, a.max_pairs)
     thr = {v: TH.metrics(sv[v], cv["y"])["thr"] for v in sv}

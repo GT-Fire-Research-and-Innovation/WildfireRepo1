@@ -332,6 +332,8 @@ def main():
     ap.add_argument("--val-years", default="2023", help="comma list (default 2023)")
     ap.add_argument("--test-years", default="2024,2025", help="comma list (default 2024,2025)")
     ap.add_argument("--seed", type=int, default=0, help="different seeds = ensemble members")
+    ap.add_argument("--weather", default="observed", choices=["observed", "forecast"],
+                    help="forecast: only weather a forecaster has at forecast time (see data.WEATHER_MODE)")
     a = ap.parse_args()
     D.VAL_YEARS = {int(y) for y in a.val_years.split(",")}
     D.TEST_YEARS = {int(y) for y in a.test_years.split(",")}
@@ -351,6 +353,7 @@ def main():
                  "test": split["test"][:max(1, n // 5)]}
         fires = split["train"] + split["val"] + split["test"]
     D.PHYSICS_V2 = a.mode in V2_MODES
+    D.WEATHER_MODE = a.weather
     groups = groups_used(set(a.drop), v2=D.PHYSICS_V2)
     n_in = sum(D.GROUPS[g] for g in groups)
     print(f"[{a.name}] mode={a.mode} inputs={n_in} ch  fires train/val/test = "
@@ -434,7 +437,7 @@ def main():
         extra.update(crown_weight=torch.sigmoid(model.crown_logit).item(), ember_ignitability=model.log_k.exp().item())
         print(f"  learned: crown weight {extra['crown_weight']:.2f}, ember ignitability {extra['ember_ignitability']:.3f}, "
               f"burning {extra['effective_minutes_per_day']:.0f} min/day", flush=True)
-    json.dump({"name": a.name, "mode": a.mode, "drop": a.drop, "data_version": D.DATA_VERSION, "val": best[2], "test": mt, "history": hist,
+    json.dump({"name": a.name, "mode": a.mode, "drop": a.drop, "data_version": D.DATA_VERSION, "weather": D.WEATHER_MODE, "val": best[2], "test": mt, "history": hist,
                "pairs": rows, **extra}, open(runs / f"{a.name}.json", "w"), indent=1)
     print(f"[{a.name}] TEST AP {mt['ap']:.3f} F1 {mt['f1']:.3f} IoU {mt['iou']:.3f} P {mt['precision']:.3f} "
           f"R {mt['recall']:.3f} area {mt['area_ratio']:.2f}  edge {mt.get('edge_km_mean', float('nan')):.2f} km "

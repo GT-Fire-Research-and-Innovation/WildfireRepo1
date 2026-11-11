@@ -38,6 +38,10 @@ GROUPS = {  # name -> number of channels (including its mask channel where optio
 }
 V2_GROUPS = ["crownspot"]    # left out unless PHYSICS_V2 (keeps v1 models and checkpoints unchanged)
 PHYSICS_V2 = False           # set by the hybrid2 / physics2 modes: compute crown fire and spotting
+WEATHER_MODE = "observed"    # "observed": HRRR analyses over the gap (oracle weather, best case)
+                             # "forecast": only what a forecaster has at t_i: HRRR analyses of the last 24 h
+                             #   plus the HRRR 12z+9h forecasts issued at least 2 h before t_i that are valid
+                             #   during the gap; GRIDMET from the previous day unless t_i is after 18:00 local
 
 
 from collections import OrderedDict
@@ -236,6 +240,10 @@ class Fire:
             dates = pd.to_datetime(wz["dates"])
             local_i = (t_i.tz_convert(None) + pd.Timedelta(hours=self.g["transform"][2] / 15)).normalize()
             k = int(np.clip(np.searchsorted(dates, local_i), 0, len(dates) - 1))
+            if WEATHER_MODE == "forecast":
+                local_hour = (t_i.tz_convert(None) + pd.Timedelta(hours=self.g["transform"][2] / 15)).hour
+                if local_hour < 18:                           # the day's weather is not observed yet
+                    k = max(k - 1, 0)
             gr, gc = wz["gm_row"][r0:r1].astype(int), wz["gm_col"][c0:c1].astype(int)
             names = [str(x) for x in wz["gm_vars"]]
             gm = wz["gm"]
@@ -259,10 +267,21 @@ class Fire:
         u_mean = v_mean = None
         if rz is not None and "hrrr" not in hide:
             ts = pd.to_datetime(rz["times"], utc=True)
-            sel = (ts >= t_i - pd.Timedelta(hours=1)) & (ts <= t_j)
+            if WEATHER_MODE == "forecast":
+                sel = (ts >= t_i - pd.Timedelta(hours=24)) & (ts <= t_i)
+            else:
+                sel = (ts >= t_i - pd.Timedelta(hours=1)) & (ts <= t_j)
             if sel.sum() == 0:
                 sel = np.abs((ts - t_i).total_seconds()) == np.abs((ts - t_i).total_seconds()).min()
+                if WEATHER_MODE == "forecast":
+                    sel &= (ts <= t_i)
             F = rz["fields"][sel].astype(np.float32)          # (T, 4, hh, wh): gust, u10, v10, rh2
+            if WEATHER_MODE == "forecast" and "fc" in rz and len(rz["fc_times"]):
+                vt = pd.to_datetime(rz["fc_times"], utc=True)          # valid times (12z init + 9 h)
+                issued = vt - pd.Timedelta(hours=9)
+                use = (vt > t_i) & (vt <= t_j) & (issued <= t_i - pd.Timedelta(hours=2))
+                if use.any():
+                    F = np.concatenate([F, rz["fc"][use].astype(np.float32)]) if len(F) else rz["fc"][use].astype(np.float32)
             idx = rz["idx"][sl]
             flat = F.reshape(F.shape[0], 4, -1)[:, :, idx]   # (T, 4, h, w)
             if np.isfinite(flat).any():
