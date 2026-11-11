@@ -371,6 +371,9 @@ def main():
     ap.add_argument("--weather", default="observed", choices=["observed", "forecast"],
                     help="weather inputs; use what the model was trained with (forecast = only weather known at t_i)")
     a = ap.parse_args()
+    if a.device.startswith("cuda") and not torch.cuda.is_available():
+        print("  !! no usable GPU on this node (driver problem): running on the CPU instead, slower", flush=True)
+        a.device = "cpu"
     D.VAL_YEARS = {int(y) for y in a.val_years.split(",")}
     D.TEST_YEARS = {int(y) for y in a.test_years.split(",")}
     D.WEATHER_MODE = a.weather
