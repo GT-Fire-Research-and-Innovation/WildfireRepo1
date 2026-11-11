@@ -110,9 +110,10 @@ HYBRID_V2 = ("hybrid2", "physics2")               # have the crown weight and em
 UNET_MODES = ("unet", "unet2")
 
 
-def groups_used(drop, v2=False):
-    """Input groups in channel order; the physics-v2 group only for the v2 modes."""
-    return [g for g in D.GROUPS if g not in drop and (v2 or g not in D.V2_GROUPS)]
+def groups_used(drop, v2=False, t3=False):
+    """Input groups in channel order; the physics-v2 group only for the v2 modes, the day-by-day
+    history groups only for unet3 with its time dimension (they stay last: the history is the tail)."""
+    return [g for g in D.GROUPS if g not in drop and (v2 or g not in D.V2_GROUPS) and (t3 or g not in D.T3_GROUPS)]
 
 
 def phys_stack(phys):
