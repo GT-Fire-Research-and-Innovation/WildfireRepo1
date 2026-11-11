@@ -13,7 +13,11 @@
 #SBATCH -o logs/eval-%x-%j.out
 module purge
 export PATH="$HOME/scratch/envs/wildfire/bin:$PATH"
-[ "${PULL:-0}" = 1 ] && git -C "$SLURM_SUBMIT_DIR" pull -q --ff-only && echo "code: $(git -C "$SLURM_SUBMIT_DIR" log --oneline -1)"
+# several evaluations start at once: take turns pulling (a lock), and say so when the pull fails
+if [ "${PULL:-0}" = 1 ]; then
+  flock "$SLURM_SUBMIT_DIR/.git/wf-pull.lock" git -C "$SLURM_SUBMIT_DIR" pull -q --ff-only || echo "!! git pull failed: running the code already on disk"
+fi
+echo "code: $(git -C "$SLURM_SUBMIT_DIR" log --oneline -1)"
 cd "$SLURM_SUBMIT_DIR/model"
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
 python evaluate.py --data "$HOME/scratch/wildfire/my" --model ${MODELS:?set MODELS} --out "${OUT:?set OUT}" \
