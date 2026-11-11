@@ -34,7 +34,9 @@ done
 # old seeds and any run of the old hybrid still queued
 SEEDS=$(squeue -h -u "$USER" -n wf-hyb-s1,wf-hyb-s2 -o %i | tr '\n' ' ')
 [ -n "$SEEDS" ] && scancel $SEEDS && echo "cancelled old-physics seeds: $SEEDS"
-if [ -f "$RUNS/hybrid_v1.ckpt" ] && [ ! -f "$RUNS/hybrid_v1_before.ckpt" ]; then
+# only when hybrid_v1.ckpt is still the OLD-label run (never touch the restarted run on the cleaned data)
+if [ -f "$RUNS/hybrid_v1.ckpt" ] && [ ! -f "$RUNS/hybrid_v1_before.ckpt" ] && \
+   ! "$PY" -c "import torch,sys; c=torch.load('$RUNS/hybrid_v1.ckpt',map_location='cpu',weights_only=False); sys.exit(0 if c.get('data_version',1)==2 else 1)" 2>/dev/null; then
   OLD=$(q wf-hybrid | tr '\n' ' '); [ -n "$OLD" ] && scancel $OLD && sleep 5
   cp "$RUNS/hybrid_v1.ckpt" "$RUNS/hybrid_v1_before.ckpt"; rm -f "$RUNS"/hybrid_v1.{ckpt,json,pt}
   echo "saved the old hybrid_v1 as hybrid_v1_before"
