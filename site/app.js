@@ -1,6 +1,6 @@
-/* GT Fire Prediction: live NIFC perimeters / incidents / VIIRS hotspots (fetched in the browser)
-   and the model's forecast drawn as its own 150 m cells (data/index.json + data/forecast/*.json,
-   written by live/publish.py). */
+/* GT Fire Prediction (MapLibre): vector basemap with shaded relief; live NIFC perimeters,
+   incidents and VIIRS hotspots fetched in the browser; the model's forecast drawn as its own
+   150 m cells (data/index.json + data/forecast/*.json, written by live/publish.py). */
 (() => {
   "use strict";
 
@@ -11,11 +11,15 @@
     incidents: `${ARC}/WFIGS_Incident_Locations_Current/FeatureServer/0/query`,
     viirs: "https://services9.arcgis.com/RHVPKKiFTONKtxq3/arcgis/rest/services/Satellite_VIIRS_Thermal_Hotspots_and_Fire_Activity/FeatureServer/0/query",
   };
+  const OFM = "https://tiles.openfreemap.org/styles/";
+  const DEM = { type: "raster-dem", tiles: ["https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png"], encoding: "terrarium", tileSize: 256, maxzoom: 14, attribution: "Terrain: Mapzen / AWS Open Data" };
+  const ESRI = (s) => `https://server.arcgisonline.com/ArcGIS/rest/services/${s}/MapServer/tile/{z}/{y}/{x}`;
+  const USGS = (s) => `https://basemap.nationalmap.gov/arcgis/rest/services/${s}/MapServer/tile/{z}/{y}/{x}`;
   const LIVE_MS = 5 * 60e3, INDEX_MS = 10 * 60e3, HOT_MIN_ZOOM = 6;
-  // chance of burning, 10 classes: 1-9 %, 10-19 %, ... 90-100 %
   const RAMP = ["#fff4c2", "#ffe17a", "#ffc94a", "#ffad33", "#ff8c1f", "#f56a10", "#e2480d", "#c8300f", "#a51d14", "#6e0f12"];
   const START_FILL = "#2a211c", START_EDGE = "#b42318", ACTUAL_EDGE = "#0b7285";
-  const CROWN = { 1: "#9bd49a", 2: "#2f7d32" }, EMBER = { 1: "#d6c8ff", 2: "#9f84f2", 3: "#6a3fd4" };
+  const CROWN = { 1: [155, 212, 154], 2: [47, 125, 50] }, EMBER = { 1: [214, 200, 255], 2: [159, 132, 242], 3: [106, 63, 212] };
+  const hex = (h) => [1, 3, 5].map((i) => parseInt(h.slice(i, i + 2), 16));
 
   // ------------------------------------------------------------------ helpers
   const $ = (s) => document.querySelector(s);
@@ -33,18 +37,13 @@
     set(k, v) { try { localStorage.setItem("gtfp:" + k, JSON.stringify(v)); } catch { /* private mode */ } },
   };
   const ac = (a) => (a === null || a === undefined || isNaN(a)) ? "–" : `${Math.round(a).toLocaleString()} ac`;
-  const when = (t) => {
-    const d = t ? new Date(t) : null;
-    return d && !isNaN(d) ? d.toLocaleString([], { month: "short", day: "numeric", hour: "numeric", minute: "2-digit", timeZoneName: "short" }) : "–";
-  };
+  const when = (t) => { const d = t ? new Date(t) : null; return d && !isNaN(d) ? d.toLocaleString([], { month: "short", day: "numeric", hour: "numeric", minute: "2-digit", timeZoneName: "short" }) : "–"; };
   const clock = (t) => { const d = new Date(t); return isNaN(d) ? "–" : d.toLocaleString([], { weekday: "short", hour: "numeric", minute: "2-digit" }); };
   const ago = (t) => {
     if (!t) return "";
     const m = Math.round((Date.now() - +new Date(t)) / 60000);
-    if (m < 1) return "just now";
-    if (m < 60) return `${m} min ago`;
-    const h = Math.round(m / 60);
-    return h < 48 ? `${h} h ago` : `${Math.round(h / 24)} days ago`;
+    if (m < 1) return "just now"; if (m < 60) return `${m} min ago`;
+    const h = Math.round(m / 60); return h < 48 ? `${h} h ago` : `${Math.round(h / 24)} days ago`;
   };
   const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
   const st = (s) => (s || "").replace("US-", "");
@@ -58,6 +57,7 @@
   }
   function toast(msg, ms = 3500) { const t = $("#toast"); t.textContent = msg; t.hidden = false; clearTimeout(toast.t); toast.t = setTimeout(() => (t.hidden = true), ms); }
   const b64 = (s) => { const bin = atob(s), a = new Uint8Array(bin.length); for (let i = 0; i < bin.length; i++) a[i] = bin.charCodeAt(i); return a; };
+  const FC = (features = []) => ({ type: "FeatureCollection", features });
 
   // ------------------------------------------------------------------ theme
   const root = document.documentElement;
@@ -65,294 +65,331 @@
   const dark = () => root.dataset.theme ? root.dataset.theme === "dark" : matchMedia("(prefers-color-scheme: dark)").matches;
   $("#btn-theme").addEventListener("click", () => { root.dataset.theme = dark() ? "light" : "dark"; store.set("theme", root.dataset.theme); });
 
-  // ------------------------------------------------------------------ map
-  L.Popup.mergeOptions({ autoPanPadding: [16, 16], maxWidth: 320 });
-  const v0 = store.get("view", [39.5, -112, 5]);
-  const map = L.map("map", { zoomControl: false, worldCopyJump: true, minZoom: 3, maxZoom: 18 }).setView([v0[0], v0[1]], v0[2]);
-  L.control.zoom({ position: "bottomright" }).addTo(map);
-  L.control.scale({ position: "bottomright" }).addTo(map);
-  map.on("moveend", () => { const c = map.getCenter(); store.set("view", [+c.lat.toFixed(4), +c.lng.toFixed(4), map.getZoom()]); });
-  [["overlay", 250], ["hill", 260], ["roads", 270], ["labels", 280], ["cells", 400], ["perim", 420], ["hot", 430], ["inc", 440], ["hi", 450]]
-    .forEach(([n, z]) => { map.createPane(n); map.getPane(n).style.zIndex = z; });
-  map.getPane("roads").style.pointerEvents = map.getPane("labels").style.pointerEvents = map.getPane("hill").style.pointerEvents = map.getPane("overlay").style.pointerEvents = "none";
-
-  const esri = (s) => `https://server.arcgisonline.com/ArcGIS/rest/services/${s}/MapServer/tile/{z}/{y}/{x}`;
-  const usgs = (s) => `https://basemap.nationalmap.gov/arcgis/rest/services/${s}/MapServer/tile/{z}/{y}/{x}`;
-  const USGS_ATT = 'USGS <a href="https://www.usgs.gov/programs/national-geospatial-program/national-map" target="_blank" rel="noopener">The National Map</a>';
-  const BASES = {
-    usgsTopo: { name: "USGS Topo", note: "Contours, trails, roads (US)", url: usgs("USGSTopo"), o: { maxNativeZoom: 16, attribution: USGS_ATT } },
-    usgsImagery: { name: "USGS Imagery + Topo", note: "Aerial photos with contours (US)", url: usgs("USGSImageryTopo"), o: { maxNativeZoom: 16, attribution: USGS_ATT } },
-    esriTopo: { name: "Esri Topographic", note: "Worldwide topo", url: esri("World_Topo_Map"), o: { maxNativeZoom: 19, attribution: "Esri, HERE, Garmin, USGS, NGA, EPA, USDA, NPS" } },
-    imagery: { name: "Satellite imagery", note: "High-resolution aerial", url: esri("World_Imagery"), o: { maxNativeZoom: 19, attribution: "Esri, Maxar, Earthstar Geographics" } },
-    openTopo: { name: "OpenTopoMap", note: "Terrain style", url: "https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png", o: { maxNativeZoom: 17, attribution: "&copy; OpenStreetMap contributors, SRTM | OpenTopoMap (CC-BY-SA)" } },
-    darkGray: { name: "Dark gray", note: "Low-light canvas", url: esri("Canvas/World_Dark_Gray_Base"), o: { maxNativeZoom: 16, attribution: "Esri, HERE, Garmin, OpenStreetMap contributors" } },
-  };
+  // ------------------------------------------------------------------ layer registry
   const yday = new Date(Date.now() - 86400e3).toISOString().slice(0, 10);
   const OVERLAYS = {
-    roads: { name: "Roads", note: "Highways and local roads", tile: [esri("Reference/World_Transportation"), { pane: "roads", maxNativeZoom: 19 }], on: false },
-    labels: { name: "Place names", note: "Towns and boundaries", tile: [esri("Reference/World_Boundaries_and_Places"), { pane: "labels", maxNativeZoom: 19 }], on: false },
-    hillshade: { name: "Hillshade", note: "Shaded terrain relief", tile: [esri("Elevation/World_Hillshade"), { pane: "hill", maxNativeZoom: 16, opacity: 0.45, className: "hillshade" }], on: false },
-    viirsImage: { name: `NASA VIIRS image (${yday})`, note: "Yesterday's true-color satellite view: smoke plumes, burn scars",
-      tile: [`https://gibs.earthdata.nasa.gov/wmts/epsg3857/best/VIIRS_NOAA20_CorrectedReflectance_TrueColor/default/${yday}/GoogleMapsCompatible_Level9/{z}/{y}/{x}.jpg`,
-        { pane: "overlay", maxNativeZoom: 9, opacity: 0.85, attribution: "NASA GIBS / VIIRS NOAA-20" }], on: false },
+    roads: { name: "Roads", note: "Highways, local roads, trails", on: true },
+    labels: { name: "Place names", note: "Towns, peaks, lakes", on: true },
+    hillshade: { name: "Shaded relief", note: "Terrain shading", on: null },
+    viirsImage: { name: `NASA VIIRS image (${yday})`, note: "Yesterday's true-color satellite view: smoke plumes, burn scars", on: false },
     hotspots: { name: "Satellite hotspots, 24 h", note: "NASA VIIRS fire detections (zoom in to load)", on: true },
     perimeters: { name: "NIFC perimeters", note: "Current interagency fire perimeters", on: true },
-    incidents: { name: "Incident locations", note: "Wildfires of 10+ acres", on: true },
+    incidents: { name: "Incidents", note: "Wildfires of 10+ acres, with names", on: true },
   };
   const MODEL = {
     pred: { name: "Predicted growth", note: "Chance each 150 m cell burns in the forecast window", on: true },
     start: { name: "Fire now", note: "Burning or burned at forecast start (perimeter + 48 h detections)", on: true },
-    grid: { name: "Cell outlines", note: "Draw each forecast cell when zoomed in", on: true },
+    grid: { name: "Cell outlines", note: "Outline each forecast cell when zoomed in", on: true },
     crown: { name: "Crown fire potential", note: "Where fire would move into the canopy if it arrives", on: false },
     ember: { name: "Ember landing", note: "Where embers would land downwind of intense fire", on: false },
     actual: { name: "What actually burned", note: "Replay example only", on: true },
   };
-  const saved = store.get("layers", {});
+  const saved = store.get("layers2", {});
   for (const reg of [OVERLAYS, MODEL]) for (const [k, l] of Object.entries(reg)) if (saved[k] !== undefined) l.on = saved[k];
-  let predOpacity = store.get("predOpacity", 0.8);
-  const saveLayers = () => store.set("layers", Object.fromEntries([...Object.entries(OVERLAYS), ...Object.entries(MODEL)].map(([k, l]) => [k, l.on])));
+  let predOpacity = store.get("predOpacity", 0.85);
+  const saveLayers = () => store.set("layers2", Object.fromEntries([...Object.entries(OVERLAYS), ...Object.entries(MODEL)].map(([k, l]) => [k, l.on])));
 
-  let baseLayer = null, baseKey = null;
-  function setBase(k) {
-    if (baseLayer) map.removeLayer(baseLayer);
-    baseLayer = L.tileLayer(BASES[k].url, { maxZoom: 18, ...BASES[k].o }).addTo(map);
-    baseKey = k; store.set("base", k);
-    document.querySelectorAll('input[name="base"]').forEach((i) => (i.checked = i.value === k));
-    if (cellLayer) cellLayer.redraw();
+  // ------------------------------------------------------------------ base maps (each is a full style; our layers are re-added on every style load)
+  const BASES = {
+    terrain: { name: "Terrain", note: "Vector map with shaded relief", vector: "liberty", hill: true },
+    light: { name: "Light", note: "Muted vector map with relief", vector: "positron", hill: true },
+    satellite: { name: "Satellite", note: "Aerial imagery with roads and names", raster: ESRI("World_Imagery"), max: 19, att: "Imagery: Esri, Maxar, Earthstar Geographics", labels: true },
+    usgsTopo: { name: "USGS Topo", note: "Contours, trails (US)", raster: USGS("USGSTopo"), max: 16, att: "USGS The National Map" },
+    usgsImagery: { name: "USGS Imagery + Topo", note: "Aerial photos with contours (US)", raster: USGS("USGSImageryTopo"), max: 16, att: "USGS The National Map" },
+    dark: { name: "Dark", note: "Low-light canvas", raster: ESRI("Canvas/World_Dark_Gray_Base"), max: 16, att: "Esri, HERE, Garmin, OpenStreetMap contributors", labels: true },
+  };
+  const vecCache = {};
+  async function vectorStyle(name) { if (!vecCache[name]) vecCache[name] = await getJSON(OFM + name); return JSON.parse(JSON.stringify(vecCache[name])); }
+  const isRoad = (l) => l["source-layer"] === "transportation" || l["source-layer"] === "transportation_name";
+  const isPlace = (l) => l.type === "symbol" && ["place", "water_name", "mountain_peak"].includes(l["source-layer"]);
+  async function buildStyle(key) {
+    const b = BASES[key];
+    let style;
+    if (b.vector) style = await vectorStyle(b.vector);
+    else {
+      const lib = await vectorStyle("liberty");
+      style = { version: 8, glyphs: lib.glyphs, sprite: lib.sprite, sources: { base: { type: "raster", tiles: [b.raster], tileSize: 256, maxzoom: b.max, attribution: b.att } }, layers: [{ id: "base", type: "raster", source: "base" }] };
+      if (b.labels) {               // roads + names from the vector map on top of the imagery
+        style.sources.openmaptiles = lib.sources.openmaptiles;
+        const keep = lib.layers.filter((l) => l.source === "openmaptiles" && (isPlace(l) || (isRoad(l) && (l.type === "symbol" || /motorway|trunk|primary|secondary|tertiary|minor/.test(l.id)))));
+        for (const l of keep) {
+          if (l.type === "symbol") l.paint = { ...(l.paint || {}), "text-color": key === "satellite" ? "#ffffff" : "#e6e6e6", "text-halo-color": "rgba(0,0,0,.75)", "text-halo-width": 1.4 };
+          if (l.type === "line") l.paint = { ...(l.paint || {}), "line-opacity": key === "satellite" ? 0.7 : 0.35 };
+          style.layers.push(l);
+        }
+      }
+    }
+    style.sources.dem = DEM;
+    const firstSym = style.layers.findIndex((l) => l.type === "symbol");
+    style.layers.splice(firstSym < 0 ? style.layers.length : firstSym, 0, {
+      id: "hillshade", type: "hillshade", source: "dem",
+      layout: { visibility: (OVERLAYS.hillshade.on ?? b.hill) ? "visible" : "none" },
+      paint: { "hillshade-exaggeration": b.vector ? 0.32 : 0.22, "hillshade-shadow-color": "#473b2f", "hillshade-highlight-color": "#ffffff", "hillshade-accent-color": "#473b2f" },
+    });
+    return style;
   }
-  const tiles = {};
-  for (const [k, l] of Object.entries(OVERLAYS)) if (l.tile) tiles[k] = L.tileLayer(l.tile[0], { maxZoom: 18, ...l.tile[1] });
-  const groups = { hotspots: L.layerGroup(), perimeters: L.layerGroup(), incidents: L.layerGroup() };
-  function applyOverlay(k) {
-    const lay = tiles[k] || groups[k];
-    OVERLAYS[k].on ? lay.addTo(map) : map.removeLayer(lay);
-    if (k === "hotspots") loadHotspots();
-  }
-
-  // ------------------------------------------------------------------ layers panel
-  function option(type, name, value, label, note, checked, onchange) {
-    const id = `opt-${name}-${value}`;
-    const i = el("input", { type, name, value, id });
-    i.checked = checked;
-    i.addEventListener("change", onchange);
-    return el("label", { class: "opt", for: id }, i, el("b", { text: label }), note ? el("small", { text: note }) : null);
-  }
-  function buildPanel() {
-    $("#base-list").replaceChildren(...Object.entries(BASES).map(([k, b]) => option("radio", "base", k, b.name, b.note, k === baseKey, () => setBase(k))));
-    $("#overlay-list").replaceChildren(...Object.entries(OVERLAYS).map(([k, l]) => option("checkbox", "ov", k, l.name, l.note, l.on, (e) => { l.on = e.target.checked; applyOverlay(k); saveLayers(); renderLegend(); })));
-    $("#model-list").replaceChildren(...Object.entries(MODEL).map(([k, l]) => option("checkbox", "md", k, l.name, l.note, l.on, (e) => setModel(k, e.target.checked))));
-    const op = $("#pred-opacity"); op.value = predOpacity;
-    op.oninput = () => { predOpacity = +op.value; store.set("predOpacity", predOpacity); cellLayer.redraw(); };
-  }
-  function setModel(k, on) {
-    MODEL[k].on = on; saveLayers();
-    if (k === "pred") $("#pred-toggle").checked = on;
-    const box = document.getElementById(`opt-md-${k}`); if (box) box.checked = on;
-    cellLayer.redraw(); renderLegend();
-  }
-  $("#pred-toggle").addEventListener("change", (e) => setModel("pred", e.target.checked));
-  const panel = $("#layers");
-  const showPanel = (on) => { panel.hidden = !on; $("#btn-layers").setAttribute("aria-expanded", String(on)); };
-  $("#btn-layers").addEventListener("click", () => showPanel(panel.hidden));
-  $("#layers-close").addEventListener("click", () => showPanel(false));
 
   // ------------------------------------------------------------------ state
-  const state = { index: null, fires: new Map(), example: null, perims: new Map(), incidents: [], liveAt: null, liveCount: 0, selected: null };
+  const state = { index: null, fires: new Map(), example: null, perims: FC(), incidents: [], incFC: FC(), hot: FC(), liveAt: null, liveCount: 0, selected: null, base: null, fcLayers: 0 };
 
-  // ------------------------------------------------------------------ forecast cells (canvas, drawn in the model's own grid)
+  // ------------------------------------------------------------------ map
+  const v0 = store.get("view", [39.5, -112, 5]);
+  const startBase = BASES[store.get("base2", "terrain")] ? store.get("base2", "terrain") : "terrain";
+  state.base = startBase;
+  const map = new maplibregl.Map({
+    container: "map", style: { version: 8, sources: {}, layers: [] }, center: [v0[1], v0[0]], zoom: v0[2], minZoom: 2.5, maxZoom: 17.5,
+    attributionControl: { compact: true }, dragRotate: false, pitchWithRotate: false, touchPitch: false,
+  });
+  map.touchZoomRotate.disableRotation();
+  map.addControl(new maplibregl.NavigationControl({ showCompass: false }), "bottom-right");
+  map.addControl(new maplibregl.ScaleControl({ unit: "imperial" }), "bottom-right");
+  map.on("moveend", () => { const c = map.getCenter(); store.set("view", [+c.lat.toFixed(4), +c.lng.toFixed(4), +map.getZoom().toFixed(2)]); });
+
+  async function setBase(key) {
+    state.base = key; store.set("base2", key);
+    document.querySelectorAll('input[name="base"]').forEach((i) => (i.checked = i.value === key));
+    const hs = document.getElementById("opt-ov-hillshade"); if (hs && OVERLAYS.hillshade.on === null) hs.checked = BASES[key].hill;
+    try { map.setStyle(await buildStyle(key), { diff: false }); }
+    catch (e) { console.warn(e); toast("That base map could not load; try another"); }
+  }
+  map.on("style.load", () => { if (!map.getStyle().glyphs) return; addFireIcons(); addOurLayers(); applyBaseToggles(); });
+
+  function addFireIcons() {
+    for (const [name, fill] of [["flame", "#d9480f"], ["flame-done", "#7d8790"]]) {
+      if (map.hasImage(name)) continue;
+      const s = 48, c = document.createElement("canvas"); c.width = c.height = s;
+      const x = c.getContext("2d");
+      x.beginPath(); x.arc(s / 2, s / 2, s / 2 - 2, 0, Math.PI * 2); x.fillStyle = fill; x.fill(); x.lineWidth = 3; x.strokeStyle = "#fff"; x.stroke();
+      x.fillStyle = "#fff"; x.beginPath();
+      x.moveTo(24, 9); x.bezierCurveTo(27, 17, 35, 20, 35, 29); x.bezierCurveTo(35, 36, 30, 40, 24, 40); x.bezierCurveTo(18, 40, 13, 36, 13, 30);
+      x.bezierCurveTo(13, 25, 16, 22, 18, 18); x.bezierCurveTo(19, 22, 21, 24, 22, 24); x.bezierCurveTo(22, 18, 23, 13, 24, 9); x.fill();
+      map.addImage(name, x.getImageData(0, 0, s, s), { pixelRatio: 2 });
+    }
+  }
+
+  // ------------------------------------------------------------------ our layers (re-added after every style load)
+  function addOurLayers() {
+    const firstSym = map.getStyle().layers.find((l) => l.type === "symbol");
+    map.addSource("viirs-img", { type: "raster", tiles: [`https://gibs.earthdata.nasa.gov/wmts/epsg3857/best/VIIRS_NOAA20_CorrectedReflectance_TrueColor/default/${yday}/GoogleMapsCompatible_Level9/{z}/{y}/{x}.jpg`], tileSize: 256, maxzoom: 9, attribution: "NASA GIBS / VIIRS NOAA-20" });
+    map.addLayer({ id: "viirs-img", type: "raster", source: "viirs-img", paint: { "raster-opacity": 0.85 } }, firstSym && firstSym.id);
+    map.addSource("perims", { type: "geojson", data: state.perims });
+    map.addLayer({ id: "perim-fill", type: "fill", source: "perims", paint: { "fill-color": ["case", ["==", ["get", "attr_IncidentTypeCategory"], "RX"], "#8a5a2b", "#d42a20"], "fill-opacity": 0.1 } });
+    map.addLayer({ id: "perim-line", type: "line", source: "perims", filter: ["!=", ["get", "attr_IncidentTypeCategory"], "RX"], paint: { "line-color": "#d42a20", "line-width": ["interpolate", ["linear"], ["zoom"], 5, 1, 12, 2.4] } });
+    map.addLayer({ id: "perim-line-rx", type: "line", source: "perims", filter: ["==", ["get", "attr_IncidentTypeCategory"], "RX"], paint: { "line-color": "#8a5a2b", "line-width": 1.6, "line-dasharray": [3, 2] } });
+    map.addSource("hot", { type: "geojson", data: state.hot });
+    map.addLayer({ id: "hot", type: "circle", source: "hot", paint: {
+      "circle-radius": ["interpolate", ["linear"], ["zoom"], 6, 2.5, 10, 4.5, 14, 7],
+      "circle-color": ["step", ["coalesce", ["get", "hours_old"], 24], "#ffe066", 6, "#ff922b", 12, "#d6336c"],
+      "circle-stroke-color": "#3b1d0a", "circle-stroke-width": 0.6, "circle-opacity": 0.95 } });
+    map.addSource("inc", { type: "geojson", data: state.incFC });
+    map.addLayer({ id: "inc", type: "symbol", source: "inc", layout: {
+      "icon-image": ["case", [">=", ["coalesce", ["get", "PercentContained"], 0], 100], "flame-done", "flame"],
+      "icon-size": ["interpolate", ["linear"], ["coalesce", ["get", "IncidentSize"], 0], 10, 0.7, 1000, 0.9, 50000, 1.2],
+      "icon-allow-overlap": true,
+      "text-field": ["step", ["zoom"], "", 6, ["get", "IncidentName"]], "text-font": ["Noto Sans Bold"], "text-size": 12,
+      "text-offset": [0, 1.25], "text-anchor": "top", "text-optional": true, "symbol-sort-key": ["-", 0, ["coalesce", ["get", "IncidentSize"], 0]] },
+      paint: { "text-color": "#3b0d08", "text-halo-color": "rgba(255,255,255,.95)", "text-halo-width": 1.6 } });
+    map.addSource("hi", { type: "geojson", data: FC() });
+    map.addLayer({ id: "hi", type: "line", source: "hi", paint: { "line-color": "#111", "line-width": 2 } });
+    state.fcLayers = 0;
+    addForecastLayers();
+    applyOverlayVisibility();
+  }
+  function vis(id, on) { if (map.getLayer(id)) map.setLayoutProperty(id, "visibility", on ? "visible" : "none"); }
+  function applyOverlayVisibility() {
+    vis("viirs-img", OVERLAYS.viirsImage.on);
+    ["perim-fill", "perim-line", "perim-line-rx"].forEach((id) => vis(id, OVERLAYS.perimeters.on));
+    vis("hot", OVERLAYS.hotspots.on); vis("inc", OVERLAYS.incidents.on);
+  }
+  function applyBaseToggles() {
+    for (const l of map.getStyle().layers) {
+      if (l.source !== "openmaptiles") continue;
+      if (isRoad(l)) vis(l.id, OVERLAYS.roads.on);
+      else if (isPlace(l)) vis(l.id, OVERLAYS.labels.on);
+    }
+    vis("hillshade", OVERLAYS.hillshade.on ?? BASES[state.base].hill);
+  }
+
+  // ------------------------------------------------------------------ forecast cells: crisp images in the model's own grid
   function decodeForecast(meta, d) {
     const g = d.grid, w = g.width, h = g.height, n = w * h;
     const F = { meta, g, w, h, prob: b64(d.prob), start: b64(d.start), crown: d.crown ? b64(d.crown) : null, ember: d.ember ? b64(d.ember) : null, actual: d.actual ? b64(d.actual) : null };
-    F.buckets = RAMP.map(() => []); F.startIdx = []; F.crownIdx = { 1: [], 2: [] }; F.emberIdx = { 1: [], 2: [], 3: [] }; F.probIdx = [];
-    for (let i = 0; i < n; i++) {
-      const p = F.prob[i];
-      if (p) { F.buckets[Math.min(9, Math.floor(p / 10))].push(i); F.probIdx.push(i); }
-      if (F.start[i]) F.startIdx.push(i);
-      if (F.crown) { const c = F.crown[i]; if (c >= 50) F.crownIdx[2].push(i); else if (c >= 20) F.crownIdx[1].push(i); }
-      if (F.ember && F.ember[i]) F.emberIdx[F.ember[i]].push(i);
-    }
-    F.startEdges = edges(F.start, w, h); F.actualEdges = F.actual ? edges(F.actual, w, h) : [];
-    F.bounds = L.latLngBounds([g.north - h * g.dy, g.west], [g.north, g.west + w * g.dx]);
-    // zoom target: the fire and every cell with a 10%+ chance
+    F.coords = [[g.west, g.north], [g.west + w * g.dx, g.north], [g.west + w * g.dx, g.north - h * g.dy], [g.west, g.north - h * g.dy]];
     let r0 = h, r1 = -1, c0 = w, c1 = -1;
     for (let i = 0; i < n; i++) if (F.start[i] || F.prob[i] >= 10 || (F.actual && F.actual[i])) { const r = (i / w) | 0, c = i - r * w; if (r < r0) r0 = r; if (r > r1) r1 = r; if (c < c0) c0 = c; if (c > c1) c1 = c; }
-    F.focus = r1 < 0 ? F.bounds : L.latLngBounds([g.north - (r1 + 1) * g.dy, g.west + c0 * g.dx], [g.north - r0 * g.dy, g.west + (c1 + 1) * g.dx]);
+    F.focus = r1 < 0 ? [[g.west, g.north - h * g.dy], [g.west + w * g.dx, g.north]] : [[g.west + c0 * g.dx, g.north - (r1 + 1) * g.dy], [g.west + (c1 + 1) * g.dx, g.north - r0 * g.dy]];
+    F.startLines = edgeLines(F.start, F);
+    F.actualLines = F.actual ? edgeLines(F.actual, F) : FC();
+    F.images = renderImages(F);
+    F.gridLines = gridLines(F);
     return F;
   }
-  function edges(mask, w, h) {          // cell sides between in-mask and out-of-mask cells: [r, c, side]
-    const out = [];
+  function edgeLines(mask, F) {           // boundary between in-mask and out-of-mask cells, as map lines
+    const { w, h, g } = F, segs = [];
+    const X = (c) => +(g.west + c * g.dx).toFixed(6), Y = (r) => +(g.north - r * g.dy).toFixed(6);
     for (let r = 0; r < h; r++) for (let c = 0; c < w; c++) {
       const i = r * w + c; if (!mask[i]) continue;
-      if (r === 0 || !mask[i - w]) out.push(r, c, 0);
-      if (r === h - 1 || !mask[i + w]) out.push(r, c, 2);
-      if (c === 0 || !mask[i - 1]) out.push(r, c, 3);
-      if (c === w - 1 || !mask[i + 1]) out.push(r, c, 1);
+      if (r === 0 || !mask[i - w]) segs.push([[X(c), Y(r)], [X(c + 1), Y(r)]]);
+      if (r === h - 1 || !mask[i + w]) segs.push([[X(c), Y(r + 1)], [X(c + 1), Y(r + 1)]]);
+      if (c === 0 || !mask[i - 1]) segs.push([[X(c), Y(r)], [X(c), Y(r + 1)]]);
+      if (c === w - 1 || !mask[i + 1]) segs.push([[X(c + 1), Y(r)], [X(c + 1), Y(r + 1)]]);
     }
+    return FC(segs.length ? [{ type: "Feature", properties: {}, geometry: { type: "MultiLineString", coordinates: segs } }] : []);
+  }
+  function gridLines(F) {                 // thin outline of every cell with a 5%+ chance (drawn from zoom 11.5)
+    const { w, h, g } = F, segs = [], on = (i) => F.prob[i] >= 5;
+    const X = (c) => +(g.west + c * g.dx).toFixed(6), Y = (r) => +(g.north - r * g.dy).toFixed(6);
+    for (let r = 0; r < h; r++) for (let c = 0; c < w; c++) {
+      const i = r * w + c;
+      if (!on(i)) continue;
+      segs.push([[X(c), Y(r)], [X(c + 1), Y(r)]], [[X(c), Y(r)], [X(c), Y(r + 1)]]);
+      if (r === h - 1 || !on(i + w)) segs.push([[X(c), Y(r + 1)], [X(c + 1), Y(r + 1)]]);
+      if (c === w - 1 || !on(i + 1)) segs.push([[X(c + 1), Y(r)], [X(c + 1), Y(r + 1)]]);
+    }
+    return FC(segs.length ? [{ type: "Feature", properties: {}, geometry: { type: "MultiLineString", coordinates: segs } }] : []);
+  }
+  function canvasURL(w, h, paint) {
+    const c = document.createElement("canvas"); c.width = w; c.height = h;
+    const x = c.getContext("2d"), im = x.createImageData(w, h);
+    paint(im.data); x.putImageData(im, 0, 0);
+    return c.toDataURL("image/png");
+  }
+  function renderImages(F) {
+    const { w, h } = F, n = w * h, out = {};
+    const rampRGB = RAMP.map(hex);
+    out.prob = canvasURL(w, h, (d) => { for (let i = 0; i < n; i++) { const p = F.prob[i]; if (!p) continue; const k = Math.min(9, Math.floor(p / 10)), c = rampRGB[k]; d.set([c[0], c[1], c[2], k === 0 ? 150 : 235], i * 4); } });
+    const sf = hex(START_FILL);
+    out.start = canvasURL(w, h, (d) => { for (let i = 0; i < n; i++) if (F.start[i]) d.set([sf[0], sf[1], sf[2], 190], i * 4); });
+    if (F.crown) out.crown = canvasURL(w, h, (d) => { for (let i = 0; i < n; i++) { const v = F.crown[i]; if (v >= 20) { const c = CROWN[v >= 50 ? 2 : 1]; d.set([c[0], c[1], c[2], v >= 50 ? 120 : 80], i * 4); } } });
+    if (F.ember) out.ember = canvasURL(w, h, (d) => { for (let i = 0; i < n; i++) { const v = F.ember[i]; if (v) { const c = EMBER[v]; d.set([c[0], c[1], c[2], 60 + v * 35], i * 4); } } });
     return out;
   }
-  const CellLayer = L.Layer.extend({
-    onAdd(m) {
-      this._c = L.DomUtil.create("canvas", "cells leaflet-zoom-hide");
-      m.getPane("cells").appendChild(this._c);
-      m.on("moveend zoomend resize viewreset", this.redraw, this);
-      this.redraw();
-    },
-    onRemove(m) { L.DomUtil.remove(this._c); m.off("moveend zoomend resize viewreset", this.redraw, this); },
-    redraw() {
-      const m = this._map; if (!m) return;
-      const size = m.getSize(), dpr = window.devicePixelRatio || 1, c = this._c;
-      c.width = size.x * dpr; c.height = size.y * dpr; c.style.width = size.x + "px"; c.style.height = size.y + "px";
-      L.DomUtil.setPosition(c, m.containerPointToLayerPoint([0, 0]));
-      const ctx = c.getContext("2d");
-      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-      ctx.clearRect(0, 0, size.x, size.y);
-      for (const F of activeFires()) drawFire(ctx, m, F, size);
-    },
-  });
-  function activeFires() { return state.fires.size ? [...state.fires.values()] : state.example ? [state.example] : []; }
-  function drawFire(ctx, m, F, size) {
-    const g = F.g;
-    if (!m.getBounds().intersects(F.bounds)) return;
-    const xs = new Float64Array(F.w + 1), ys = new Float64Array(F.h + 1);
-    for (let c = 0; c <= F.w; c++) xs[c] = m.latLngToContainerPoint([g.north, g.west + c * g.dx]).x;
-    for (let r = 0; r <= F.h; r++) ys[r] = m.latLngToContainerPoint([g.north - r * g.dy, g.west]).y;
-    const px = xs[1] - xs[0];
-    let cLo = 0, cHi = F.w - 1, rLo = 0, rHi = F.h - 1;
-    while (cLo < F.w - 1 && xs[cLo + 1] < 0) cLo++;
-    while (cHi > 0 && xs[cHi] > size.x) cHi--;
-    while (rLo < F.h - 1 && ys[rLo + 1] < 0) rLo++;
-    while (rHi > 0 && ys[rHi] > size.y) rHi--;
-    const pad = px < 3 ? 0.35 : 0.15;             // a hair of overlap so neighbouring cells never show seams
-    const fill = (idx) => {
-      for (const i of idx) {
-        const r = (i / F.w) | 0, cc = i - r * F.w;
-        if (r < rLo || r > rHi || cc < cLo || cc > cHi) continue;
-        ctx.fillRect(xs[cc], ys[r], xs[cc + 1] - xs[cc] + pad, ys[r + 1] - ys[r] + pad);
-      }
-    };
-    if (MODEL.crown.on) for (const lv of [1, 2]) { ctx.globalAlpha = lv === 2 ? 0.45 : 0.3; ctx.fillStyle = CROWN[lv]; fill(F.crownIdx[lv]); }
-    if (MODEL.ember.on) for (const lv of [1, 2, 3]) { ctx.globalAlpha = 0.25 + lv * 0.12; ctx.fillStyle = EMBER[lv]; fill(F.emberIdx[lv]); }
-    if (MODEL.pred.on) {
-      F.buckets.forEach((idx, k) => { ctx.globalAlpha = predOpacity * (k === 0 ? 0.55 : 0.9); ctx.fillStyle = RAMP[k]; fill(idx); });
-      if (MODEL.grid.on && px >= 9) {
-        ctx.globalAlpha = 1; ctx.strokeStyle = "rgba(40,20,10,.28)"; ctx.lineWidth = px >= 20 ? 0.8 : 0.5;
-        ctx.beginPath();
-        for (const i of F.probIdx) { const r = (i / F.w) | 0, cc = i - r * F.w; if (r < rLo || r > rHi || cc < cLo || cc > cHi) continue; ctx.rect(xs[cc] + 0.5, ys[r] + 0.5, xs[cc + 1] - xs[cc] - 1, ys[r + 1] - ys[r] - 1); }
-        ctx.stroke();
-      }
-    }
-    if (MODEL.start.on) {
-      ctx.globalAlpha = baseKey === "darkGray" ? 0.55 : 0.72; ctx.fillStyle = baseKey === "darkGray" ? "#d9d4cc" : START_FILL; fill(F.startIdx);
-      strokeEdges(ctx, F.startEdges, xs, ys, START_EDGE, px >= 6 ? 2 : 1.5);
-    }
-    if (MODEL.actual.on && F.actualEdges.length) strokeEdges(ctx, F.actualEdges, xs, ys, ACTUAL_EDGE, 2.2);
-    ctx.globalAlpha = 1;
+  function fireList() { return state.fires.size ? [...state.fires.values()] : state.example ? [state.example] : []; }
+  function addForecastLayers() {
+    if (!map.getLayer("perim-fill")) return;
+    fireList().forEach((F, j) => {
+      const id = `fc${j}`;
+      const add = (kind, url, paint, minzoom) => {
+        if (!url) return;
+        map.addSource(`${id}-${kind}`, { type: "image", url, coordinates: F.coords });
+        map.addLayer({ id: `${id}-${kind}`, type: "raster", source: `${id}-${kind}`, minzoom: minzoom || 0,
+          paint: { "raster-resampling": "nearest", "raster-fade-duration": 0, ...paint } }, "perim-fill");
+      };
+      add("crown", F.images.crown, { "raster-opacity": 1 });
+      add("ember", F.images.ember, { "raster-opacity": 1 });
+      add("prob", F.images.prob, { "raster-opacity": predOpacity });
+      map.addSource(`${id}-grid`, { type: "geojson", data: F.gridLines });
+      map.addLayer({ id: `${id}-grid`, type: "line", source: `${id}-grid`, minzoom: 11.5,
+        paint: { "line-color": "rgba(70,35,15,.38)", "line-width": ["interpolate", ["linear"], ["zoom"], 12, 0.4, 15, 0.9] } }, "perim-fill");
+      add("start", F.images.start, { "raster-opacity": 1 });
+      map.addSource(`${id}-startline`, { type: "geojson", data: F.startLines });
+      map.addLayer({ id: `${id}-startline`, type: "line", source: `${id}-startline`, paint: { "line-color": START_EDGE, "line-width": ["interpolate", ["linear"], ["zoom"], 8, 1.2, 14, 2.6] } }, "perim-fill");
+      map.addSource(`${id}-actual`, { type: "geojson", data: F.actualLines });
+      map.addLayer({ id: `${id}-actual`, type: "line", source: `${id}-actual`, paint: { "line-color": ACTUAL_EDGE, "line-width": 2.2 } }, "perim-fill");
+    });
+    state.fcLayers = fireList().length;
+    applyModelVisibility();
   }
-  function strokeEdges(ctx, e, xs, ys, color, width) {
-    ctx.globalAlpha = 1; ctx.strokeStyle = color; ctx.lineWidth = width; ctx.lineCap = "square";
-    ctx.beginPath();
-    for (let k = 0; k < e.length; k += 3) {
-      const r = e[k], c = e[k + 1], s = e[k + 2];
-      if (s === 0) { ctx.moveTo(xs[c], ys[r]); ctx.lineTo(xs[c + 1], ys[r]); }
-      else if (s === 2) { ctx.moveTo(xs[c], ys[r + 1]); ctx.lineTo(xs[c + 1], ys[r + 1]); }
-      else if (s === 3) { ctx.moveTo(xs[c], ys[r]); ctx.lineTo(xs[c], ys[r + 1]); }
-      else { ctx.moveTo(xs[c + 1], ys[r]); ctx.lineTo(xs[c + 1], ys[r + 1]); }
+  function removeForecastLayers() {
+    for (let j = 0; j < state.fcLayers; j++) for (const kind of ["crown", "ember", "prob", "grid", "start", "startline", "actual"]) {
+      const id = `fc${j}-${kind}`; if (map.getLayer(id)) map.removeLayer(id); if (map.getSource(id)) map.removeSource(id);
     }
-    ctx.stroke();
+    state.fcLayers = 0;
   }
-  const cellLayer = new CellLayer().addTo(map);
+  function applyModelVisibility() {
+    for (let j = 0; j < state.fcLayers; j++) {
+      vis(`fc${j}-prob`, MODEL.pred.on); vis(`fc${j}-grid`, MODEL.pred.on && MODEL.grid.on);
+      vis(`fc${j}-start`, MODEL.start.on); vis(`fc${j}-startline`, MODEL.start.on);
+      vis(`fc${j}-crown`, MODEL.crown.on); vis(`fc${j}-ember`, MODEL.ember.on); vis(`fc${j}-actual`, MODEL.actual.on);
+      if (map.getLayer(`fc${j}-prob`)) map.setPaintProperty(`fc${j}-prob`, "raster-opacity", predOpacity);
+    }
+  }
+  function refreshForecastLayers() { if (!map.getLayer("perim-fill")) return; removeForecastLayers(); addForecastLayers(); }
 
   // ------------------------------------------------------------------ cell readout (hover on desktop, tap on phones)
-  const hi = L.rectangle([[0, 0], [0, 0]], { pane: "hi", color: "#111", weight: 2, fill: false, interactive: false });
-  function cellAt(latlng) {
-    for (const F of activeFires()) {
-      const g = F.g, c = Math.floor((latlng.lng - g.west) / g.dx), r = Math.floor((g.north - latlng.lat) / g.dy);
+  function cellAt(ll) {
+    for (const F of fireList()) {
+      const g = F.g, c = Math.floor((ll.lng - g.west) / g.dx), r = Math.floor((g.north - ll.lat) / g.dy);
       if (c < 0 || r < 0 || c >= F.w || r >= F.h) continue;
       const i = r * F.w + c;
-      return { F, r, c, i, p: F.prob[i], start: F.start[i], crown: F.crown ? F.crown[i] : 0, ember: F.ember ? F.ember[i] : 0, actual: F.actual ? F.actual[i] : 0 };
+      return { F, r, c, p: F.prob[i], start: F.start[i], crown: F.crown ? F.crown[i] : 0, ember: F.ember ? F.ember[i] : 0, actual: F.actual ? F.actual[i] : 0 };
     }
     return null;
   }
-  function showCell(latlng) {
-    const ro = $("#readout"), cell = cellAt(latlng);
-    if (!cell || (!cell.p && !cell.start && !cell.actual)) { ro.hidden = true; map.removeLayer(hi); return false; }
+  function hideCell() { $("#readout").hidden = true; const s = map.getSource("hi"); if (s) s.setData(FC()); }
+  function showCell(ll) {
+    const cell = cellAt(ll);
+    if (!cell || !(MODEL.pred.on || MODEL.start.on) || (!cell.p && !cell.start && !cell.actual)) { hideCell(); return false; }
     const { F, r, c } = cell, g = F.g;
-    hi.setBounds([[g.north - (r + 1) * g.dy, g.west + c * g.dx], [g.north - r * g.dy, g.west + (c + 1) * g.dx]]).addTo(map);
+    const x0 = g.west + c * g.dx, x1 = x0 + g.dx, y1 = g.north - r * g.dy, y0 = y1 - g.dy;
+    const hs = map.getSource("hi"); if (hs) hs.setData(FC([{ type: "Feature", properties: {}, geometry: { type: "LineString", coordinates: [[x0, y0], [x1, y0], [x1, y1], [x0, y1], [x0, y0]] } }]));
     const hrs = F.meta.example ? F.meta.hours : (state.index?.horizon_hours || 24);
-    const parts = [];
-    if (cell.start) parts.push(`<b>Fire now</b> <span>burning or burned at forecast start</span>`);
-    else parts.push(`<b>${cell.p}%</b> chance of burning <span>in the next ${hrs} h</span>`);
-    if (cell.crown >= 50 && !cell.start) parts.push("<span>· crown fire likely</span>");
-    if (cell.ember >= 2 && !cell.start) parts.push("<span>· ember landing</span>");
+    const parts = [cell.start ? `<b>Fire now</b> <span>burning or burned at forecast start</span>` : `<b>${cell.p}%</b> chance of burning <span>in the next ${hrs} h</span>`];
+    if (!cell.start && cell.crown >= 50) parts.push("<span>· crown fire likely</span>");
+    if (!cell.start && cell.ember >= 2) parts.push("<span>· ember landing</span>");
     if (cell.actual) parts.push("<span>· really burned</span>");
-    ro.innerHTML = parts.join(" ");
-    ro.hidden = false;
+    const ro = $("#readout"); ro.innerHTML = parts.join(" "); ro.hidden = false;
     return true;
   }
-  map.on("mousemove", (e) => { if (MODEL.pred.on || MODEL.start.on) showCell(e.latlng); });
-  map.on("mouseout", () => { $("#readout").hidden = true; map.removeLayer(hi); });
-  map.on("click", (e) => { if (showCell(e.latlng)) { clearTimeout(showCell.t); showCell.t = setTimeout(() => { $("#readout").hidden = true; map.removeLayer(hi); }, 6000); } });
+  map.on("mousemove", (e) => showCell(e.lngLat));
+  map.on("mouseout", hideCell);
 
-  // ------------------------------------------------------------------ live: perimeters
-  const perimStyle = (p) => {
-    const rx = p.attr_IncidentTypeCategory === "RX";
-    return { pane: "perim", color: rx ? "#8a5a2b" : "#c1121f", weight: 2, dashArray: rx ? "5 4" : null, fill: true, fillColor: rx ? "#8a5a2b" : "#c1121f", fillOpacity: 0.06 };
-  };
+  const popup = new maplibregl.Popup({ closeButton: true, maxWidth: "320px", offset: 10 });
+  map.on("click", (e) => {
+    const layers = ["inc", "hot", "perim-fill"].filter((l) => map.getLayer(l));
+    const hits = layers.length ? map.queryRenderedFeatures(e.point, { layers }) : [];
+    if (showCell(e.lngLat)) { clearTimeout(showCell.t); showCell.t = setTimeout(hideCell, 6000); }
+    if (!hits.length) return;
+    const f = hits[0], p = f.properties;
+    let html;
+    if (f.layer.id === "inc") {
+      html = `<div class="pop"><h5>${esc(p.IncidentName)}</h5><dl><dt>Size</dt><dd>${ac(p.IncidentSize)}</dd><dt>Contained</dt><dd>${p.PercentContained ?? "–"}%</dd>
+        <dt>State</dt><dd>${esc(st(p.POOState))}</dd><dt>Discovered</dt><dd>${when(p.FireDiscoveryDateTime)}</dd>
+        ${p.TotalIncidentPersonnel ? `<dt>Personnel</dt><dd>${Number(p.TotalIncidentPersonnel).toLocaleString()}</dd>` : ""}<dt>Updated</dt><dd>${when(p.ModifiedOnDateTime_dt)}</dd></dl></div>`;
+      select(p.UniqueFireIdentifier, false);
+    } else if (f.layer.id === "hot") {
+      html = `<div class="pop"><h5>Satellite hotspot</h5><dl><dt>Detected</dt><dd>${when(p.esritimeutc)}</dd><dt>Age</dt><dd>${p.hours_old ?? "?"} h</dd>
+        <dt>Fire power</dt><dd>${p.frp ?? "–"} MW</dd><dt>Satellite</dt><dd>${esc(p.satellite ?? "–")} · ${p.daynight === "N" ? "night" : "day"}</dd></dl><p>375 m pixel: the fire is somewhere inside it.</p></div>`;
+    } else {
+      html = `<div class="pop"><h5>${esc(p.attr_IncidentName)}</h5><dl><dt>Size</dt><dd>${ac(p.poly_GISAcres)}</dd><dt>Contained</dt><dd>${p.attr_PercentContained ?? "–"}%</dd>
+        <dt>Perimeter</dt><dd>${when(p.poly_PolygonDateTime)}</dd><dt>Mapped by</dt><dd>${esc(p.poly_MapMethod || "–")}</dd><dt>Type</dt><dd>${p.attr_IncidentTypeCategory === "RX" ? "Prescribed" : "Wildfire"}</dd></dl></div>`;
+    }
+    popup.setLngLat(e.lngLat).setHTML(html).addTo(map);
+  });
+  for (const l of ["inc", "hot", "perim-fill"]) {
+    map.on("mouseenter", l, () => (map.getCanvas().style.cursor = "pointer"));
+    map.on("mouseleave", l, () => (map.getCanvas().style.cursor = ""));
+  }
+
+  // ------------------------------------------------------------------ live data
   async function loadPerimeters() {
     try {
-      const gj = await getJSON(URLS.perimeters, {
+      state.perims = await getJSON(URLS.perimeters, {
         where: "1=1", outSR: 4326, f: "geojson", geometryPrecision: 5, maxAllowableOffset: 0.0002, resultRecordCount: 2000,
         outFields: "attr_UniqueFireIdentifier,attr_IncidentName,poly_GISAcres,attr_PercentContained,poly_PolygonDateTime,poly_MapMethod,attr_IncidentTypeCategory,attr_POOState",
       });
-      groups.perimeters.clearLayers(); state.perims.clear();
-      L.geoJSON(gj, {
-        style: (f) => perimStyle(f.properties),
-        onEachFeature: (f, lay) => { state.perims.set(f.properties.attr_UniqueFireIdentifier, lay); lay.bindPopup(() => perimPopup(f.properties)); },
-      }).addTo(groups.perimeters);
-      state.liveAt = Date.now(); state.liveCount = gj.features.length; freshLive();
+      const s = map.getSource("perims"); if (s) s.setData(state.perims);
+      state.liveAt = Date.now(); state.liveCount = state.perims.features.length; freshLive();
     } catch (e) { $("#fresh-live").textContent = "NIFC unreachable, retrying"; $("#fresh-live").classList.add("stale"); console.warn(e); }
   }
-  function freshLive() { if (state.liveAt) { const d = $("#fresh-live"); d.textContent = `${ago(state.liveAt)} · ${state.liveCount} fires`; d.classList.remove("stale"); } }
-  const perimPopup = (p) => `<div class="pop"><h5>${esc(p.attr_IncidentName)}</h5><dl>
-    <dt>Size</dt><dd>${ac(p.poly_GISAcres)}</dd><dt>Contained</dt><dd>${p.attr_PercentContained ?? "–"}%</dd>
-    <dt>Perimeter</dt><dd>${when(p.poly_PolygonDateTime)}</dd><dt>Mapped by</dt><dd>${esc(p.poly_MapMethod || "–")}</dd>
-    <dt>Type</dt><dd>${p.attr_IncidentTypeCategory === "RX" ? "Prescribed" : "Wildfire"}</dd></dl></div>`;
-
-  // ------------------------------------------------------------------ live: incidents
+  function freshLive() { if (state.liveAt) { const d = $("#fresh-live"); d.textContent = `${ago(state.liveAt)} · ${state.liveCount} perimeters`; d.classList.remove("stale"); } }
   async function loadIncidents() {
     try {
-      const gj = await getJSON(URLS.incidents, {
+      state.incFC = await getJSON(URLS.incidents, {
         where: "IncidentTypeCategory='WF' AND IncidentSize>=10", outSR: 4326, f: "geojson", resultRecordCount: 2000,
-        outFields: "IncidentName,IncidentSize,PercentContained,FireDiscoveryDateTime,ModifiedOnDateTime_dt,POOState,UniqueFireIdentifier,TotalIncidentPersonnel,FireBehaviorGeneral",
+        outFields: "IncidentName,IncidentSize,PercentContained,FireDiscoveryDateTime,ModifiedOnDateTime_dt,POOState,UniqueFireIdentifier,TotalIncidentPersonnel",
       });
-      groups.incidents.clearLayers(); state.incidents = [];
-      L.geoJSON(gj, {
-        pointToLayer: (f, ll) => L.circleMarker(ll, { pane: "inc", radius: Math.max(4.5, Math.min(15, 3 + Math.sqrt(f.properties.IncidentSize || 0) / 20)), color: "#fff", weight: 1.5,
-          fillColor: (f.properties.PercentContained || 0) >= 100 ? "#7d8790" : "#d9480f", fillOpacity: 0.9 }),
-        onEachFeature: (f, lay) => {
-          const p = f.properties;
-          state.incidents.push({ ...p, lat: f.geometry.coordinates[1], lon: f.geometry.coordinates[0], layer: lay });
-          lay.bindPopup(() => `<div class="pop"><h5>${esc(p.IncidentName)}</h5><dl>
-            <dt>Size</dt><dd>${ac(p.IncidentSize)}</dd><dt>Contained</dt><dd>${p.PercentContained ?? "–"}%</dd>
-            <dt>State</dt><dd>${esc(st(p.POOState))}</dd><dt>Discovered</dt><dd>${when(p.FireDiscoveryDateTime)}</dd>
-            ${p.TotalIncidentPersonnel ? `<dt>Personnel</dt><dd>${p.TotalIncidentPersonnel.toLocaleString()}</dd>` : ""}
-            <dt>Updated</dt><dd>${when(p.ModifiedOnDateTime_dt)}</dd></dl></div>`);
-          lay.on("click", () => select(p.UniqueFireIdentifier, false));
-        },
-      }).addTo(groups.incidents);
+      state.incidents = state.incFC.features.map((f) => ({ ...f.properties, lon: f.geometry.coordinates[0], lat: f.geometry.coordinates[1] }));
+      const s = map.getSource("inc"); if (s) s.setData(state.incFC);
       renderList();
     } catch (e) { console.warn(e); }
   }
-
-  // ------------------------------------------------------------------ live: VIIRS hotspots in view
   let hotT = null, hotSeq = 0;
-  const HOT = [[6, "#ffe066"], [12, "#ff922b"], [24, "#d6336c"]];
   function loadHotspots() {
     clearTimeout(hotT);
     hotT = setTimeout(async () => {
-      groups.hotspots.clearLayers();
-      if (!OVERLAYS.hotspots.on || map.getZoom() < HOT_MIN_ZOOM) return;
-      const b = map.getBounds().pad(0.15), seq = ++hotSeq;
+      if (!OVERLAYS.hotspots.on || map.getZoom() < HOT_MIN_ZOOM) { state.hot = FC(); const s = map.getSource("hot"); if (s) s.setData(state.hot); return; }
+      const b = map.getBounds(), seq = ++hotSeq;
       try {
         const gj = await getJSON(URLS.viirs, {
           where: "hours_old<=24", geometry: [b.getWest(), b.getSouth(), b.getEast(), b.getNorth()].map((v) => v.toFixed(4)).join(","),
@@ -360,19 +397,12 @@
           outFields: "esritimeutc,hours_old,frp,confidence,satellite,daynight", resultRecordCount: 8000,
         });
         if (seq !== hotSeq) return;
-        const rend = L.canvas({ pane: "hot" });
-        L.geoJSON(gj, {
-          pointToLayer: (f, ll) => L.circleMarker(ll, { renderer: rend, radius: 4, color: "#3b1d0a", weight: 0.7, fillColor: (HOT.find(([h]) => (f.properties.hours_old ?? 24) <= h) || HOT[2])[1], fillOpacity: 0.95 }),
-          onEachFeature: (f, lay) => lay.bindPopup(() => { const p = f.properties; return `<div class="pop"><h5>Satellite hotspot</h5><dl>
-            <dt>Detected</dt><dd>${when(p.esritimeutc)}</dd><dt>Age</dt><dd>${p.hours_old ?? "?"} h</dd><dt>Fire power</dt><dd>${p.frp ?? "–"} MW</dd>
-            <dt>Satellite</dt><dd>${esc(p.satellite ?? "–")} · ${p.daynight === "N" ? "night" : "day"}</dd></dl><p>375 m pixel: the fire is somewhere inside it.</p></div>`; }),
-        }).addTo(groups.hotspots);
+        state.hot = gj; const s = map.getSource("hot"); if (s) s.setData(gj);
       } catch (e) { console.warn(e); }
     }, 350);
   }
   map.on("moveend", loadHotspots);
 
-  // ------------------------------------------------------------------ model forecasts
   async function loadIndex() {
     let idx;
     try { idx = await getJSON(`data/index.json?t=${Date.now()}`); } catch { idx = null; }
@@ -383,32 +413,61 @@
       $("#fresh-model").textContent = `${clock(idx.generated)} · ${n} forecast${n === 1 ? "" : "s"}`;
       $("#pred-sub").textContent = `next ${idx.horizon_hours || 24} h, chance each cell burns`;
       $("#model-note").textContent = `Model: ${idx.model?.name || "–"}. ${idx.model?.note || ""}${idx.model?.test_ap ? ` Test score (average precision) ${idx.model.test_ap}.` : ""}`;
-      const want = idx.fires.filter((f) => f.forecast);
-      for (const id of [...state.fires.keys()]) if (!want.some((f) => f.id === id)) state.fires.delete(id);
+      const want = idx.fires.filter((f) => f.forecast), next = new Map();
       await Promise.all(want.map(async (f) => {
-        try { state.fires.set(f.id, decodeForecast(f, await getJSON(`${f.forecast}?t=${encodeURIComponent(idx.generated)}`))); }
+        try { next.set(f.id, decodeForecast(f, await getJSON(`${f.forecast}?t=${encodeURIComponent(idx.generated)}`))); }
         catch (e) { console.warn("forecast", f.id, e); }
       }));
+      state.fires = next;
     }
     if (!state.fires.size && !state.example) {
       try { const ex = await getJSON("data/example/index.json"); state.example = decodeForecast(ex, await getJSON(`data/example/${ex.file}`)); }
       catch { /* none shipped */ }
     }
-    if (state.example) $("#pred-sub").textContent = state.fires.size ? $("#pred-sub").textContent : `example replay: chance each cell burned in ${state.example.meta.hours} h`;
-    cellLayer.redraw(); renderList(); renderLegend();
+    if (!state.fires.size && state.example) $("#pred-sub").textContent = `example replay: chance each cell burned in ${state.example.meta.hours} h`;
+    refreshForecastLayers(); renderList(); renderLegend();
     if (state.selected) renderDetail(state.selected);
   }
+
+  // ------------------------------------------------------------------ layers panel
+  function option(type, name, value, label, note, checked, onchange) {
+    const id = `opt-${name}-${value}`, i = el("input", { type, name, value, id });
+    i.checked = checked; i.addEventListener("change", onchange);
+    return el("label", { class: "opt", for: id }, i, el("b", { text: label }), note ? el("small", { text: note }) : null);
+  }
+  function buildPanel() {
+    $("#base-list").replaceChildren(...Object.entries(BASES).map(([k, b]) => option("radio", "base", k, b.name, b.note, k === state.base, () => setBase(k))));
+    $("#overlay-list").replaceChildren(...Object.entries(OVERLAYS).map(([k, l]) => option("checkbox", "ov", k, l.name, l.note, l.on ?? BASES[state.base].hill, (e) => {
+      l.on = e.target.checked; saveLayers();
+      if (["roads", "labels", "hillshade"].includes(k)) applyBaseToggles(); else applyOverlayVisibility();
+      if (k === "hotspots") loadHotspots();
+      renderLegend();
+    })));
+    $("#model-list").replaceChildren(...Object.entries(MODEL).map(([k, l]) => option("checkbox", "md", k, l.name, l.note, l.on, (e) => setModel(k, e.target.checked))));
+    const op = $("#pred-opacity"); op.value = predOpacity;
+    op.oninput = () => { predOpacity = +op.value; store.set("predOpacity", predOpacity); applyModelVisibility(); };
+  }
+  function setModel(k, on) {
+    MODEL[k].on = on; saveLayers();
+    if (k === "pred") $("#pred-toggle").checked = on;
+    const box = document.getElementById(`opt-md-${k}`); if (box) box.checked = on;
+    applyModelVisibility(); renderLegend(); if (!on) hideCell();
+  }
+  $("#pred-toggle").addEventListener("change", (e) => setModel("pred", e.target.checked));
+  const panel = $("#layers");
+  const showPanel = (on) => { panel.hidden = !on; $("#btn-layers").setAttribute("aria-expanded", String(on)); };
+  $("#btn-layers").addEventListener("click", () => showPanel(panel.hidden));
+  $("#layers-close").addEventListener("click", () => showPanel(false));
 
   // ------------------------------------------------------------------ side: list + detail
   function renderList() {
     const q = $("#search").value.trim().toLowerCase();
     const match = (n, s) => !q || (n || "").toLowerCase().includes(q) || st(s).toLowerCase().includes(q);
     const box = $("#fire-list"); box.replaceChildren();
-    const fc = [...state.fires.values()].map((F) => F.meta).filter((m) => match(m.name, m.state))
-      .sort((a, b) => (b.stats?.expected_new_acres || 0) - (a.stats?.expected_new_acres || 0));
+    const fc = [...state.fires.values()].map((F) => F.meta).filter((m) => match(m.name, m.state)).sort((a, b) => (b.stats?.expected_new_acres || 0) - (a.stats?.expected_new_acres || 0));
     if (fc.length) {
       box.append(el("p", { class: "group-label", text: `Forecast available (${fc.length})` }));
-      fc.forEach((m) => box.append(row(m.id, m.name, m.state, m.acres, m.contained, `perimeter ${ago(m.perimeter_time || m.updated)}`, m.stats)));
+      fc.forEach((m) => box.append(row(m.id, m.name, m.state, m.acres, m.contained, m.source === "incident" ? "no perimeter yet" : `perimeter ${ago(m.perimeter_time || m.updated)}`, m.stats)));
     } else if (state.example && match(state.example.meta.name, "")) {
       const m = state.example.meta;
       box.append(el("p", { class: "group-label", text: "No fire is actively spreading · example" }));
@@ -419,10 +478,7 @@
     const open = inc.filter((p) => (p.PercentContained ?? 0) < 100), done = inc.filter((p) => (p.PercentContained ?? 0) >= 100);
     const r = (p) => row(p.UniqueFireIdentifier, p.IncidentName, p.POOState, p.IncidentSize, p.PercentContained, `updated ${ago(p.ModifiedOnDateTime_dt)}`);
     if (open.length) { box.append(el("p", { class: "group-label", text: `Not contained (${open.length})` })); open.slice(0, 200).forEach((p) => box.append(r(p))); }
-    if (done.length) {
-      const d = el("details", { class: "contained" }, el("summary", { class: "group-label", text: `Contained (${done.length})` }));
-      done.slice(0, 200).forEach((p) => d.append(r(p))); if (q) d.open = true; box.append(d);
-    }
+    if (done.length) { const d = el("details", { class: "contained" }, el("summary", { class: "group-label", text: `Contained (${done.length})` })); done.slice(0, 200).forEach((p) => d.append(r(p))); if (q) d.open = true; box.append(d); }
     if (!box.childElementCount) box.append(el("p", { class: "empty", text: q ? "No fires match." : "No wildfires of 10+ acres reported right now." }));
   }
   function row(id, name, s, acres, contained, sub, stats, hours) {
@@ -435,31 +491,30 @@
   }
   $("#search").addEventListener("input", renderList);
 
+  function perimFor(id) { return state.perims.features.find((f) => f.properties.attr_UniqueFireIdentifier === id); }
   function renderDetail(id) {
     const box = $("#detail");
     const F = id === "__example" ? state.example : state.fires.get(id);
-    const inc = state.incidents.find((p) => p.UniqueFireIdentifier === id);
-    const per = state.perims.get(id);
+    const inc = state.incidents.find((p) => p.UniqueFireIdentifier === id), per = perimFor(id);
     const m = F ? F.meta : null;
-    const name = m?.name || inc?.IncidentName || per?.feature?.properties?.attr_IncidentName;
+    const name = m?.name || inc?.IncidentName || per?.properties.attr_IncidentName;
     if (!name) { box.hidden = true; return; }
-    const s = m?.stats || {};
-    const hrs = m?.example ? m.hours : (state.index?.horizon_hours || 24);
+    const s = m?.stats || {}, hrs = m?.example ? m.hours : (state.index?.horizon_hours || 24);
     const fig = (label, val, hot) => el("div", {}, el("dt", { text: label }), el("dd", { class: hot ? "hot" : "", text: val }));
-    const figs = el("dl", { class: "figs" },
-      fig("Size now", ac(m?.acres ?? inc?.IncidentSize ?? per?.feature?.properties?.poly_GISAcres)),
-      m?.example ? fig("Forecast window", `${m.hours} h`) : fig("Contained", `${m?.contained ?? inc?.PercentContained ?? "–"}%`));
+    const figs = el("dl", { class: "figs" }, fig("Size now", ac(m?.acres ?? inc?.IncidentSize ?? per?.properties.poly_GISAcres)),
+      m?.example ? fig("Forecast window", `${m.hours} h`) : fig("Contained", (m?.contained ?? inc?.PercentContained) === null || (m?.contained ?? inc?.PercentContained) === undefined ? "not reported" : `${m?.contained ?? inc?.PercentContained}%`));
     if (F) figs.append(fig(`Expected growth, ${hrs} h`, ac(s.expected_new_acres), true), fig("Likely (50%+ cells)", ac(s.likely_acres)),
       fig("Possible (10%+ cells)", ac(s.possible_acres)), s.actual_new_acres !== undefined ? fig("Actually burned", ac(s.actual_new_acres)) : fig("Forecast from", when(m.origin)));
     const w = s.wind;
     box.replaceChildren(...[
       el("button", { class: "close", onclick: () => { state.selected = null; box.hidden = true; renderList(); }, text: "Close" }),
       el("h3", { text: name }),
-      el("p", { class: "where", text: [st(m?.state || inc?.POOState), m?.example ? "example replay" : null, inc ? `updated ${ago(inc.ModifiedOnDateTime_dt)}` : null].filter(Boolean).join(" · ") }),
+      el("p", { class: "where", text: [st(m?.state || inc?.POOState), m?.example ? "example replay" : null, m?.source === "incident" ? "no NIFC perimeter yet" : null, inc ? `updated ${ago(inc.ModifiedOnDateTime_dt)}` : null].filter(Boolean).join(" · ") }),
       figs,
       w ? el("p", { class: "wind", text: `Forecast wind: from ${w.from_compass} at ${w.mean_mph} mph, gusts to ${w.peak_gust_mph} mph, humidity down to ${w.min_rh_pct}%` }) : null,
-      F ? el("p", { class: "note", text: m.example ? m.note : `Forecast from ${when(m.origin)} to ${when(new Date(+new Date(m.origin) + hrs * 3600e3))}. Weather: HRRR run ${when(m.hrrr_run)}.` })
-        : el("p", { class: "noforecast", text: "No forecast for this fire: fewer than 3 satellite fire detections near it in the last 48 hours, so it does not look actively spreading. Forecasts refresh every 2 hours." })].filter(Boolean));
+      F ? el("p", { class: "note", text: m.example ? m.note : `Forecast from ${when(m.origin)} to ${when(new Date(+new Date(m.origin) + hrs * 3600e3))}. Weather: HRRR run ${when(m.hrrr_run)}.${m.source === "incident" ? " Starting fire estimated from satellite detections (no perimeter yet)." : ""}` })
+        : el("p", { class: "noforecast", text: "No forecast for this fire: fewer than 3 satellite fire detections near it in the last 48 hours, so it does not look actively spreading. Forecasts refresh every 2 hours." }),
+    ].filter(Boolean));
     box.hidden = false;
   }
   function select(id, fly) {
@@ -469,35 +524,40 @@
     try { history.replaceState(null, "", `#fire=${encodeURIComponent(id)}`); } catch { /* sandboxed */ }
     if (!fly) return;
     const F = id === "__example" ? state.example : state.fires.get(id);
-    const per = state.perims.get(id), inc = state.incidents.find((p) => p.UniqueFireIdentifier === id);
-    const pad = { paddingTopLeft: [24, 70], paddingBottomRight: [24, innerWidth <= 780 ? innerHeight * 0.4 : 24], maxZoom: 14 };
-    if (F) map.flyToBounds(F.focus, pad);
-    else if (per) map.flyToBounds(per.getBounds(), pad);
-    else if (inc) map.flyTo([inc.lat, inc.lon], 12);
+    const per = perimFor(id), inc = state.incidents.find((p) => p.UniqueFireIdentifier === id);
+    const padding = { top: 80, left: 40, right: 40, bottom: innerWidth <= 780 ? Math.round(innerHeight * 0.4) : 40 };
+    if (F) map.fitBounds(F.focus, { padding, maxZoom: 14, duration: 1200 });
+    else if (per) map.fitBounds(bbox(per.geometry), { padding, maxZoom: 14, duration: 1200 });
+    else if (inc) map.flyTo({ center: [inc.lon, inc.lat], zoom: 12 });
     if (innerWidth <= 780) setSheet("min");
+  }
+  function bbox(geom) {
+    let w = 180, s = 90, e = -180, n = -90;
+    const walk = (c) => { if (typeof c[0] === "number") { w = Math.min(w, c[0]); e = Math.max(e, c[0]); s = Math.min(s, c[1]); n = Math.max(n, c[1]); } else c.forEach(walk); };
+    walk(geom.coordinates); return [[w, s], [e, n]];
   }
 
   // ------------------------------------------------------------------ legend
   function renderLegend() {
     const lg = $("#legend"); lg.replaceChildren();
-    const fires = activeFires().length;
+    const fires = fireList().length;
     if (MODEL.pred.on && fires) {
       const hrs = state.fires.size ? (state.index?.horizon_hours || 24) : state.example?.meta.hours;
       lg.append(el("h4", { text: `Chance each cell burns, next ${hrs} h` }));
-      const ramp = el("div", { class: "ramp" }); RAMP.forEach((c) => { const s = el("span"); s.style.background = c; ramp.append(s); });
+      const ramp = el("div", { class: "ramp" }); RAMP.forEach((c) => { const sp = el("span"); sp.style.background = c; ramp.append(sp); });
       lg.append(ramp, el("div", { class: "ticks" }, el("span", { text: "1%" }), el("span", { text: "50%" }), el("span", { text: "100%" })));
     }
     const keys = [];
     if (MODEL.start.on && fires) keys.push([START_FILL, "Fire now", START_EDGE]);
     if (MODEL.actual.on && !state.fires.size && state.example) keys.push(["transparent", "What actually burned", ACTUAL_EDGE]);
-    if (MODEL.crown.on && fires) keys.push([CROWN[2], "Crown fire likely"]);
-    if (MODEL.ember.on && fires) keys.push([EMBER[2], "Ember landing"]);
-    if (OVERLAYS.perimeters.on) keys.push(["transparent", "NIFC perimeter", "#c1121f"]);
+    if (MODEL.crown.on && fires) keys.push(["#2f7d32", "Crown fire likely"]);
+    if (MODEL.ember.on && fires) keys.push(["#9f84f2", "Ember landing"]);
+    if (OVERLAYS.perimeters.on) keys.push(["transparent", "NIFC perimeter", "#d42a20"]);
     if (OVERLAYS.hotspots.on) keys.push(["#ffe066", "Hotspot under 6 h", null, true], ["#d6336c", "Hotspot 12–24 h", null, true]);
     if (OVERLAYS.incidents.on) keys.push(["#d9480f", "Incident (grey: contained)", null, true]);
     if (keys.length && lg.childElementCount) lg.append(el("div", { class: "sep" }));
-    for (const [fillc, label, edge, dot] of keys) {
-      const i = el("i", { class: dot ? "dot" : "" }); i.style.background = fillc; if (edge) i.style.boxShadow = `inset 0 0 0 2px ${edge}`;
+    for (const [f, label, edge, dot] of keys) {
+      const i = el("i", { class: dot ? "dot" : "" }); i.style.background = f; if (edge) i.style.boxShadow = `inset 0 0 0 2px ${edge}`;
       lg.append(el("div", { class: "key" }, i, el("span", { text: label })));
     }
     lg.hidden = !lg.childElementCount;
@@ -512,15 +572,21 @@
   $("#grip").addEventListener("click", () => setSheet(side.classList.contains("open") ? "min" : side.classList.contains("min") ? "" : "open"));
   $("#search").addEventListener("focus", () => { if (innerWidth <= 780) setSheet("open"); });
   let me = null;
-  $("#btn-locate").addEventListener("click", () => map.locate({ setView: true, maxZoom: 12 }));
-  map.on("locationfound", (e) => { if (me) map.removeLayer(me); me = L.circleMarker(e.latlng, { pane: "hi", radius: 7, color: "#fff", weight: 2, fillColor: "#1c64f2", fillOpacity: 1 }).addTo(map).bindPopup("You are here"); });
-  map.on("locationerror", () => toast("Location not available (permission denied or no signal)"));
+  $("#btn-locate").addEventListener("click", () => {
+    if (!navigator.geolocation) return toast("Location not available on this device");
+    navigator.geolocation.getCurrentPosition((p) => {
+      const ll = [p.coords.longitude, p.coords.latitude];
+      if (me) me.remove();
+      const dot = el("div"); dot.style.cssText = "width:14px;height:14px;border-radius:50%;background:#1c64f2;border:2px solid #fff;box-shadow:0 0 0 2px rgba(28,100,242,.3)";
+      me = new maplibregl.Marker({ element: dot }).setLngLat(ll).addTo(map);
+      map.flyTo({ center: ll, zoom: Math.max(map.getZoom(), 11) });
+    }, () => toast("Location not available (permission denied or no signal)"), { enableHighAccuracy: true, timeout: 10000 });
+  });
 
   // ------------------------------------------------------------------ start
-  setBase(BASES[store.get("base", "usgsTopo")] ? store.get("base", "usgsTopo") : "usgsTopo");
-  for (const k of Object.keys(OVERLAYS)) if (OVERLAYS[k].on) applyOverlay(k);
   $("#pred-toggle").checked = MODEL.pred.on;
   buildPanel(); renderLegend();
+  setBase(startBase);
   (async () => {
     await Promise.all([loadPerimeters(), loadIncidents(), loadIndex()]);
     renderLegend(); loadHotspots();
