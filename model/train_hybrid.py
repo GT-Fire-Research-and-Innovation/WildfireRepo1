@@ -19,6 +19,7 @@ import time
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 import torch
 
 HERE = Path(__file__).resolve().parent
@@ -328,6 +329,8 @@ def main():
     ap.add_argument("--batch", type=int, default=8)
     ap.add_argument("--width", type=int, default=32)
     ap.add_argument("--lr", type=float, default=2e-4)
+    ap.add_argument("--holdout-fires", help="CSV with fire_id: never trained on (scored separately by the promotion gate)")
+    ap.add_argument("--init", help="start from these weights (runs/<name>.pt): fine-tuning for the continuous-learning loop")
     ap.add_argument("--workers", type=int, default=6)
     ap.add_argument("--eval-every", type=int, default=3)
     ap.add_argument("--max-fires", type=int)
@@ -355,6 +358,10 @@ def main():
     pca = fit_pca(a.data, runs)
     fires = load_fires(a.data, pca, None, a.catalog)
     split = {s: [f for f in fires if D.year_split(f.year) == s] for s in ("train", "val", "test")}
+    if a.holdout_fires:
+        hold = set(pd.read_csv(a.holdout_fires)["fire_id"])
+        split["train"] = [f for f in split["train"] if f.fid not in hold]
+        print(f"  held out {len(hold)} new fires from training (promotion check)", flush=True)
     if a.max_fires:   # quick runs: a few fires from every split, so validation and test are never empty
         n = a.max_fires
         split = {"train": split["train"][:max(1, n * 3 // 5)], "val": split["val"][:max(1, n // 5)],
@@ -381,6 +388,9 @@ def main():
     if arch:
         print(f"  unet3: width {a.width}, time {'on' if arch['time'] else 'off'}, attention {'on' if arch['attn'] else 'off'}", flush=True)
     model = build_model(a.mode, n_in, a.width, a.device, dx=res_m, arch=arch)
+    if a.init and not ck.exists():
+        model.load_state_dict(torch.load(a.init, map_location=a.device, weights_only=False))
+        print(f"  starting from {a.init} (fine-tuning)", flush=True)
 
     if a.mode == "physics":
         sv, yv, _ = evaluate(model, a.mode, split["val"], groups, a.device)

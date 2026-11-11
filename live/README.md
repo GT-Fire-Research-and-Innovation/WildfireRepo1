@@ -48,3 +48,23 @@ cd site && python -m http.server 8000                                  # open ht
 ```
 
 Experimental research forecast, not an official product. The app says so on every view.
+
+## Continuous learning
+
+The model keeps learning from fires as they happen:
+
+1. **Collect** (every 2 h, GitHub Actions): every new NIFC perimeter version is saved to the
+   `perimeter-archive` branch. Perimeters come from NIFC's Current service *and* the Year-to-Date
+   service, because Current drops active fires whose incident record went stale.
+2. **Catalog** (weekly, ICE): `pipeline/archive_catalog.py` turns the archive into training fires with
+   the same cleaning as the main catalog (wildfires only, no hand sketches, one perimeter per burn day,
+   no shrinking re-maps, 3+ burn days, 300+ acres, finished growing).
+3. **Build**: `pipeline/build_multiyear.py` builds each new fire's inputs (terrain, fuels, weather,
+   satellite) into the training data.
+4. **Fine-tune**: the live model continues training on old + new fires (`--init`, 6 epochs, low
+   learning rate). The newest 20% of new fires are held out.
+5. **Gate** (`live/promote.py`): promote only if the candidate is no worse on the frozen 2024-25 test
+   fires (AP within 0.005) **and** at least as good on the held-out new fires.
+6. **Ship**: router refit, `live/export_models.py`, push; the website uses it from its next run.
+
+Run it with `bash scripts/ice_continual.sh` (weekly; every step is a chained Slurm job).
