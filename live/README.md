@@ -8,7 +8,7 @@ hotspots, plus the project's 24-hour spread forecast for every actively burning 
 - **Forecasts:** `.github/workflows/live-forecast.yml` runs every 2 hours on GitHub Actions:
   `live/publish.py` lists active fires, builds each one's inputs from live sources (DEM, LANDFIRE,
   GRIDMET, FIRMS VIIRS, latest HRRR forecast) with the training pipeline's own code, runs the model,
-  and writes `site/data/index.json` + `site/data/forecast/<fire>.geojson`. The workflow then deploys
+  and writes `site/data/index.json` + `site/data/forecast/<fire>.json` (the forecast on the model's own 150 m cells). The workflow then deploys
   `site/` to GitHub Pages.
 - **Retraining feed:** each run also archives every new NIFC perimeter version to the
   `perimeter-archive` branch (`live/wfigs_poller.py`), the raw material for adding new fires to the

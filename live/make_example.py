@@ -24,8 +24,8 @@ def main():
     g = dict(transform=meta["transform"], height=meta["height"], width=meta["width"])
     b0 = z["burning"].astype(bool)
     p = np.nan_to_num(z["prob"])
-    actual = (z["actual_next"].astype(bool) | b0) if "actual_next" in z else None
-    feats = P.vector_layers(g, b0, p, z["crown"], z["ember"], actual)
+    actual = (z["actual_next"].astype(bool) & ~b0) if "actual_next" in z else None
+    cells = P.cell_grid(g, b0, p, z["crown"], z["ember"], actual, res_m=meta["res_m"])
     cell_ac = meta["res_m"] ** 2 / P.ACRE_M2
     stats = dict(expected_new_acres=int(p[~b0].sum() * cell_ac), likely_acres=int(((p >= 0.5) & ~b0).sum() * cell_ac),
                  possible_acres=int(((p >= 0.1) & ~b0).sum() * cell_ac), start_acres=int(b0.sum() * cell_ac))
@@ -33,15 +33,16 @@ def main():
         stats["actual_new_acres"] = int(z["actual_next"].sum() * cell_ac)
     out = Path(a.site) / "data" / "example"
     out.mkdir(parents=True, exist_ok=True)
-    (out / "example.geojson").write_text(json.dumps(dict(type="FeatureCollection", features=feats), separators=(",", ":")))
+    (out / "example.json").write_text(json.dumps(cells, separators=(",", ":")))
+    (out / "example.geojson").unlink(missing_ok=True)
     sc = meta.get("replay_score", {})
     note = (f"Replay of a past forecast, shown because no fire is actively burning. Forecast made {meta['origin'][:10]} "
-            f"for the next {meta['hours']:.0f} h with {meta['model']}; the cyan line is what really burned"
+            f"for the next {meta['hours']:.0f} h with {meta['model']}; cells outlined in cyan really burned"
             + (f" ({sc['hit_rate_same_area']:.0%} of it was in the forecast's top area)." if sc else "."))
     idx = dict(id="__example", name=f"{meta['name']} ({meta['year']})", state="", acres=stats["start_acres"], example=True,
-               file="example.geojson", origin=meta["origin"], hours=round(meta["hours"]), stats=stats, note=note)
+               file="example.json", origin=meta["origin"], hours=round(meta["hours"]), stats=stats, note=note)
     (out / "index.json").write_text(json.dumps(idx, indent=1))
-    print(f"wrote {out} ({len(feats)} features, {(out / 'example.geojson').stat().st_size / 1e3:.0f} kB)")
+    print(f"wrote {out} ({cells['grid']['width']}x{cells['grid']['height']} cells, {(out / 'example.json').stat().st_size / 1e3:.0f} kB)")
 
 
 if __name__ == "__main__":

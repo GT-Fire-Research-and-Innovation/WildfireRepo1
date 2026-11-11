@@ -11,8 +11,8 @@ Publish live spread forecasts for the map app (site/). Run on a schedule (GitHub
    wind, as fitted by model/combine.py) when its weights are there; otherwise the physics-only
    model with its default settings, so the app always has a forecast.
 4. Writes site/data/index.json (run summary + one entry per fire) and
-   site/data/forecast/<fire>.geojson (forecast bands, crown fire, ember landing, starting fire),
-   all in longitude/latitude.
+   site/data/forecast/<fire>.json: the forecast on the model's own 150 m cells (chance of burning per
+   cell, the fire at forecast start, crown fire and ember levels), one byte per cell.
 """
 import argparse
 import json
@@ -159,6 +159,39 @@ def vector_layers(g, b0, p, crown, ember, actual=None):
     return out
 
 
+def cell_grid(g, b0, p, crown, ember, actual=None, res_m=150.0, pad=12):
+    """The forecast as the model's own grid cells, for the map: one byte per cell, base64.
+    prob = chance of burning in percent (0-100), start = burning/burned at forecast start (0/1),
+    crown = crown-fire probability in percent, ember = ember landing level 0-3, actual = replay only.
+    Cropped to the fire and every cell with at least a 1% chance (plus a margin)."""
+    import base64
+    p = np.nan_to_num(p)
+    keep = b0 | (p >= 0.01) | (actual if actual is not None else False)
+    if not keep.any():
+        keep = np.ones_like(b0)
+    rr, cc = np.nonzero(keep)
+    r0, r1 = max(rr.min() - pad, 0), min(rr.max() + pad + 1, b0.shape[0])
+    c0, c1 = max(cc.min() - pad, 0), min(cc.max() + pad + 1, b0.shape[1])
+    sl = (slice(r0, r1), slice(c0, c1))
+    dx, _, x0, _, ndy, y0 = g["transform"]
+    enc = lambda a: base64.b64encode(np.ascontiguousarray(a[sl], dtype=np.uint8).tobytes()).decode()  # noqa: E731
+    pct = np.clip(np.round(p * 100), 0, 100)
+    pct[(p >= 0.005) & (pct == 0)] = 1
+    pct[b0] = 0
+    e = np.nan_to_num(ember)
+    lev = np.zeros(e.shape, np.uint8)
+    if e.max() > 0:
+        rel = e / e.max()
+        lev = (rel >= 1e-3).astype(np.uint8) + (rel >= 1e-2) + (rel >= 1e-1)
+        lev[b0] = 0
+    out = dict(grid=dict(west=x0 + c0 * dx, north=y0 + r0 * ndy, dx=dx, dy=-ndy, width=int(c1 - c0), height=int(r1 - r0),
+                         cell_m=res_m, order="rows from the north-west corner, one byte per cell, base64"),
+               prob=enc(pct), start=enc(b0), crown=enc(np.clip(np.round(np.nan_to_num(crown) * 100), 0, 100)), ember=enc(lev))
+    if actual is not None:
+        out["actual"] = enc(actual)
+    return out
+
+
 def layers(f, feats, phys, b0, p):
     return vector_layers(f.g, b0, p, feats["crownspot"][0], phys.get("ember", np.zeros_like(p)))
 
@@ -220,9 +253,9 @@ def main():
         try:
             d = FN.build_live(r, a.work, int(a.hours), now)
             f, feats, phys, b0, p = model.run(d, a.hours)
-            fc = dict(type="FeatureCollection", features=layers(f, feats, phys, b0, p))
-            name = r["id"].replace("/", "_") + ".geojson"
-            (site / "data" / "forecast" / name).write_text(json.dumps(fc, separators=(",", ":")))
+            cells = cell_grid(f.g, b0, p, feats["crownspot"][0], phys.get("ember", np.zeros_like(p)), res_m=f.res_m)
+            name = r["id"].replace("/", "_") + ".json"
+            (site / "data" / "forecast" / name).write_text(json.dumps(cells, separators=(",", ":")))
             meta = json.loads((Path(d) / "live_meta.json").read_text())
             e.update(forecast=f"data/forecast/{name}", stats=summary(f, feats, b0, p),
                      origin=meta["origin"], hrrr_run=(meta.get("hrrr") or {}).get("forecast_run"),
