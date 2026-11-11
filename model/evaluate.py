@@ -78,8 +78,28 @@ class Member:
         if ":" in rest:
             drop = [g for g in rest.split(":")[1].split("+") if g]
         if mode is None:
-            mode = next((m for m in ("physics2", "hybrid2", "unet2", "physics", "unet", "hybrid") if name.startswith(m)), "hybrid")
+            mode = next((m for m in ("physics2", "hybrid2", "unet3", "unet2", "physics", "unet", "hybrid") if name.startswith(m)), "hybrid")
         self.name, self.mode, self.device = name, mode, device
+        if mode == "unet3":                               # architecture read from the weights
+            pt, ck = runs / f"{name}.pt", runs / f"{name}.ckpt"
+            if pt.exists():
+                sd, src = torch.load(pt, map_location=device, weights_only=False), "final weights"
+            elif ck.exists():
+                c = torch.load(ck, map_location=device, weights_only=False)
+                best = c.get("best")
+                sd, src = (best[1], f"best so far (val AP {best[0]:.3f})") if best and best[1] is not None else (c["model"], "latest")
+            else:
+                raise SystemExit(f"no checkpoint for {name} in {runs}")
+            arch = {"time": any(k.startswith("temporal.") for k in sd), "attn": any(k.startswith("bottleneck.") for k in sd)}
+            if arch["time"]:
+                D.TEMPORAL = True                         # the loader now also builds the day-by-day history
+            self.groups = TH.groups_used(set(drop), v2=True, t3=arch["time"])
+            n_in = sum(D.GROUPS[g] for g in self.groups)
+            self.model = TH.build_model(mode, n_in, int(sd["head.weight"].shape[1]), device, dx=dx, arch=arch)
+            self.model.load_state_dict(sd)
+            self.model.eval()
+            print(f"  {name}: unet3 (time {'on' if arch['time'] else 'off'}, attention {'on' if arch['attn'] else 'off'}), {src}", flush=True)
+            return
         v2 = mode in TH.V2_MODES
         self.groups = [g for g in TH.groups_used(set(drop), v2=v2)]
         n_in = sum(D.GROUPS[g] for g in self.groups)
@@ -390,7 +410,7 @@ def main():
     res_m = fires[0].res_m
     TH.set_grid(res_m / 1000)
     groups_all = TH.groups_used(set())
-    D.PHYSICS_V2 = any(sp.partition(":")[2].split(":")[0] in TH.V2_MODES or sp.split(":")[0].startswith(("hybrid2", "physics2", "unet2"))
+    D.PHYSICS_V2 = any(sp.partition(":")[2].split(":")[0] in TH.V2_MODES or sp.split(":")[0].startswith(("hybrid2", "physics2", "unet2", "unet3"))
                        for sp in a.model) or any(json.loads((runs / f"{sp.split(':')[0]}.json").read_text()).get("mode") in TH.V2_MODES
                                                  for sp in a.model if (runs / f"{sp.split(':')[0]}.json").exists())
     members = [Member(runs, sp, None, groups_all, a.device, res_m, a.width) for sp in a.model]

@@ -106,6 +106,7 @@ def main():
     ap.add_argument("--data", required=True)
     ap.add_argument("--members", nargs="+", default=["unet2_eval", "hybrid_v1_eval", "hybrid2_eval"])
     ap.add_argument("--h2h", help="evaluation name to split by gap, e.g. unet_h21_vs_tssatfire")
+    ap.add_argument("--out", default="combine", help="writes runs/<out>.md and runs/<out>.json")
     a = ap.parse_args()
     runs = Path(a.data) / "runs"
     rng = np.random.default_rng(0)
@@ -115,6 +116,11 @@ def main():
         print(f"\n[{a.h2h}] per-window F1 by gap (TS-SatFire metric)")
         res["h2h"] = h2h(runs, a.h2h)
 
+    missing = [n for n in a.members if not (runs / f"preds_{n}.npz").exists()]
+    if missing:
+        print(f"  !! no saved forecasts for {missing} (evaluation failed or not run): combining the rest", flush=True)
+        a.members = [n for n in a.members if n not in missing]
+        res["members"], res["missing"] = a.members, missing
     print("\nloading per-cell forecasts", flush=True)
     data = {n: load(runs, n) for n in a.members}
     z0 = data[a.members[0]][0]
@@ -148,8 +154,9 @@ def main():
 
     print("\naverages of calibrated probabilities")
     res["average"] = {}
-    for r in range(2, len(a.members) + 1):
-        for combo in itertools.combinations(a.members, r):
+    combos = list(itertools.combinations(a.members, 2)) + ([tuple(a.members)] if len(a.members) > 2 else [])
+    for combo in combos:
+        if True:
             pv = np.mean([1 / (1 + np.exp(-cal_v[n])) for n in combo], 0)
             pt = np.mean([1 / (1 + np.exp(-cal_t[n])) for n in combo], 0)
             sv, st = np.log(pv + 1e-7) - np.log1p(-pv + 1e-7), np.log(pt + 1e-7) - np.log1p(-pt + 1e-7)
@@ -180,9 +187,9 @@ def main():
     res["best_on_validation"] = {"name": best, "val_ap": val_ap[best]}
     print(f"\nbest on validation (the honest pick): {best} (val AP {val_ap[best]:.3f})")
 
-    json.dump(res, open(runs / "combine.json", "w"), indent=1, default=float)
-    write_md(res, runs / "combine.md")
-    print(f"\nwrote {runs / 'combine.md'}")
+    json.dump(res, open(runs / f"{a.out}.json", "w"), indent=1, default=float)
+    write_md(res, runs / f"{a.out}.md")
+    print(f"\nwrote {runs / (a.out + '.md')}")
 
 
 def write_md(res, path):

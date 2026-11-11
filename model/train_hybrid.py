@@ -26,7 +26,7 @@ sys.path.insert(0, str(HERE.parent))
 sys.path.insert(0, str(HERE))
 import data as D  # noqa: E402
 from hybrid import Hybrid, Hybrid2, loss_fn  # noqa: E402
-from nets import UNet  # noqa: E402
+from nets import UNet, UNet3  # noqa: E402
 
 CROP_KM = 24.0                   # training crops cover 24 km (160 cells at 150 m, 320 at 75 m)
 EDGE_KM = 2.4                    # crop edge excluded from the loss (fire may enter from outside)
@@ -105,9 +105,9 @@ def fit_pca(root, out, n=16, per_fire=300, seed=0):
     return comp, mean
 
 
-V2_MODES = ("hybrid2", "physics2", "unet2")      # use the crown-fire / ember group
+V2_MODES = ("hybrid2", "physics2", "unet2", "unet3")      # use the crown-fire / ember group
 HYBRID_V2 = ("hybrid2", "physics2")               # have the crown weight and ember scalars
-UNET_MODES = ("unet", "unet2")
+UNET_MODES = ("unet", "unet2", "unet3")
 
 
 def groups_used(drop, v2=False, t3=False):
@@ -171,7 +171,7 @@ class Crops(torch.utils.data.Dataset):
 def flip_x_channels(groups):
     """Channel indices whose sign flips under an east-west mirror."""
     out, base = {}, 0
-    xs = {"terrain": [2], "hrrr": [0], "physics": [2], "weather": []}
+    xs = {"terrain": [2], "hrrr": [0], "physics": [2], "weather": [], "hrrr_seq": [0, 4, 8, 12]}
     for g in groups:
         if g in xs:
             out[g] = [base + j for j in xs[g]]
@@ -179,7 +179,10 @@ def flip_x_channels(groups):
     return out
 
 
-def build_model(mode, n_in, width, device, dx=150.0):
+def build_model(mode, n_in, width, device, dx=150.0, arch=None):
+    if mode == "unet3":
+        arch = arch or {"time": True, "attn": True}
+        return UNet3(n_in, D.GROUPS["seq"] if arch["time"] else 0, D.SEQ_DAYS, width, attn=arch["attn"]).to(device)
     if mode in UNET_MODES:
         return UNet(n_in, 1, width).to(device)
     if mode == "hybrid":
@@ -317,7 +320,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--data", required=True)
     ap.add_argument("--name", default="hybrid")
-    ap.add_argument("--mode", default="hybrid", choices=["hybrid", "unet", "physics", "hybrid2", "physics2", "unet2"],
+    ap.add_argument("--mode", default="hybrid", choices=["hybrid", "unet", "physics", "hybrid2", "physics2", "unet2", "unet3"],
                     help="hybrid2 / physics2 add crown fire and spotting (physics v2); unet2 = U-Net that also sees the crown-fire and ember maps")
     ap.add_argument("--drop", nargs="*", default=[], help="input groups to leave out (ablations)")
     ap.add_argument("--epochs", type=int, default=30)
@@ -335,6 +338,8 @@ def main():
     ap.add_argument("--seed", type=int, default=0, help="different seeds = ensemble members")
     ap.add_argument("--crop-km", type=float, default=24.0,
                     help="training crop size; 12 at 75 m keeps the cost per crop the same as 24 km at 150 m")
+    ap.add_argument("--u3-time", type=int, default=1, help="unet3: day-by-day history + temporal attention (1/0)")
+    ap.add_argument("--u3-attn", type=int, default=1, help="unet3: transformer bottleneck (1/0)")
     ap.add_argument("--weather", default="observed", choices=["observed", "forecast"],
                     help="forecast: only weather a forecaster has at forecast time (see data.WEATHER_MODE)")
     a = ap.parse_args()
@@ -359,7 +364,9 @@ def main():
     D.WEATHER_MODE = a.weather
     global CROP_KM
     CROP_KM = a.crop_km
-    groups = groups_used(set(a.drop), v2=D.PHYSICS_V2)
+    D.TEMPORAL = a.mode == "unet3" and bool(a.u3_time)
+    arch = {"time": D.TEMPORAL, "attn": bool(a.u3_attn)} if a.mode == "unet3" else None
+    groups = groups_used(set(a.drop), v2=D.PHYSICS_V2, t3=D.TEMPORAL)
     n_in = sum(D.GROUPS[g] for g in groups)
     print(f"[{a.name}] mode={a.mode} inputs={n_in} ch  fires train/val/test = "
           f"{len(split['train'])}/{len(split['val'])}/{len(split['test'])}  pairs = "
@@ -371,7 +378,9 @@ def main():
     res_m = res.pop()
     set_grid(res_m / 1000)
     print(f"  grid {res_m:.0f} m: crops {CROP} cells, eval margin {EVAL_PAD} cells", flush=True)
-    model = build_model(a.mode, n_in, a.width, a.device, dx=res_m)
+    if arch:
+        print(f"  unet3: width {a.width}, time {'on' if arch['time'] else 'off'}, attention {'on' if arch['attn'] else 'off'}", flush=True)
+    model = build_model(a.mode, n_in, a.width, a.device, dx=res_m, arch=arch)
 
     if a.mode == "physics":
         sv, yv, _ = evaluate(model, a.mode, split["val"], groups, a.device)
@@ -399,7 +408,7 @@ def main():
             ck.rename(old)
             print(f"  checkpoint does not match the current model ({type(ex).__name__}); moved to {old.name}, "
                   f"starting fresh", flush=True)
-            model = build_model(a.mode, n_in, a.width, a.device, dx=res_m)
+            model = build_model(a.mode, n_in, a.width, a.device, dx=res_m, arch=arch)
             opt = torch.optim.AdamW(model.parameters(), lr=a.lr, weight_decay=1e-4)
             sched = torch.optim.lr_scheduler.OneCycleLR(opt, a.lr, total_steps=a.epochs * a.steps, pct_start=0.1)
     ds = Crops(split["train"], groups, a.steps * a.batch, seed=a.seed)
@@ -442,6 +451,8 @@ def main():
         extra.update(crown_weight=torch.sigmoid(model.crown_logit).item(), ember_ignitability=model.log_k.exp().item())
         print(f"  learned: crown weight {extra['crown_weight']:.2f}, ember ignitability {extra['ember_ignitability']:.3f}, "
               f"burning {extra['effective_minutes_per_day']:.0f} min/day", flush=True)
+    if arch:
+        extra.update(arch=arch, width=a.width, params=sum(p.numel() for p in model.parameters()))
     json.dump({"name": a.name, "mode": a.mode, "drop": a.drop, "data_version": D.DATA_VERSION, "weather": D.WEATHER_MODE, "val": best[2], "test": mt, "history": hist,
                "pairs": rows, **extra}, open(runs / f"{a.name}.json", "w"), indent=1)
     print(f"[{a.name}] TEST AP {mt['ap']:.3f} F1 {mt['f1']:.3f} IoU {mt['iou']:.3f} P {mt['precision']:.3f} "
