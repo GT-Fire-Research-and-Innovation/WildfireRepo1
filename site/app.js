@@ -8,6 +8,7 @@
   const ARC = "https://services3.arcgis.com/T4QMspbfLg3qTGWY/arcgis/rest/services";
   const URLS = {
     perimeters: `${ARC}/WFIGS_Interagency_Perimeters_Current/FeatureServer/0/query`,
+    perimetersYTD: `${ARC}/WFIGS_Interagency_Perimeters_YearToDate/FeatureServer/0/query`,
     incidents: `${ARC}/WFIGS_Incident_Locations_Current/FeatureServer/0/query`,
     viirs: "https://services9.arcgis.com/RHVPKKiFTONKtxq3/arcgis/rest/services/Satellite_VIIRS_Thermal_Hotspots_and_Fire_Activity/FeatureServer/0/query",
   };
@@ -86,7 +87,7 @@
   };
   const saved = store.get("layers2", {});
   for (const reg of [OVERLAYS, MODEL]) for (const [k, l] of Object.entries(reg)) if (saved[k] !== undefined) l.on = saved[k];
-  let predOpacity = store.get("predOpacity", 0.85);
+  let predOpacity = store.get("predOpacity2", 0.6);
   const saveLayers = () => store.set("layers2", Object.fromEntries([...Object.entries(OVERLAYS), ...Object.entries(MODEL)].map(([k, l]) => [k, l.on])));
 
   // ------------------------------------------------------------------ base maps (each is a full style; our layers are re-added on every style load)
@@ -141,6 +142,7 @@
     attributionControl: { compact: true }, dragRotate: false, pitchWithRotate: false, touchPitch: false,
   });
   map.touchZoomRotate.disableRotation();
+  map.scrollZoom.setWheelZoomRate(1 / 220);
   map.addControl(new maplibregl.NavigationControl({ showCompass: false }), "bottom-right");
   map.addControl(new maplibregl.ScaleControl({ unit: "imperial" }), "bottom-right");
   map.on("moveend", () => { const c = map.getCenter(); store.set("view", [+c.lat.toFixed(4), +c.lng.toFixed(4), +map.getZoom().toFixed(2)]); });
@@ -257,9 +259,9 @@
   function renderImages(F) {
     const { w, h } = F, n = w * h, out = {};
     const rampRGB = RAMP.map(hex);
-    out.prob = canvasURL(w, h, (d) => { for (let i = 0; i < n; i++) { const p = F.prob[i]; if (!p) continue; const k = Math.min(9, Math.floor(p / 10)), c = rampRGB[k]; d.set([c[0], c[1], c[2], k === 0 ? 150 : 235], i * 4); } });
+    out.prob = canvasURL(w, h, (d) => { for (let i = 0; i < n; i++) { const p = F.prob[i]; if (!p) continue; const k = Math.min(9, Math.floor(p / 10)), c = rampRGB[k]; d.set([c[0], c[1], c[2], k === 0 ? 120 : 200 + k * 5], i * 4); } });
     const sf = hex(START_FILL);
-    out.start = canvasURL(w, h, (d) => { for (let i = 0; i < n; i++) if (F.start[i]) d.set([sf[0], sf[1], sf[2], 190], i * 4); });
+    out.start = canvasURL(w, h, (d) => { for (let i = 0; i < n; i++) if (F.start[i]) d.set([sf[0], sf[1], sf[2], 85], i * 4); });
     if (F.crown) out.crown = canvasURL(w, h, (d) => { for (let i = 0; i < n; i++) { const v = F.crown[i]; if (v >= 20) { const c = CROWN[v >= 50 ? 2 : 1]; d.set([c[0], c[1], c[2], v >= 50 ? 120 : 80], i * 4); } } });
     if (F.ember) out.ember = canvasURL(w, h, (d) => { for (let i = 0; i < n; i++) { const v = F.ember[i]; if (v) { const c = EMBER[v]; d.set([c[0], c[1], c[2], 60 + v * 35], i * 4); } } });
     return out;
@@ -267,13 +269,15 @@
   function fireList() { return state.fires.size ? [...state.fires.values()] : state.example ? [state.example] : []; }
   function addForecastLayers() {
     if (!map.getLayer("perim-fill")) return;
+    const firstSym = map.getStyle().layers.find((l) => l.type === "symbol" && l.source === "openmaptiles");
+    const under = firstSym ? firstSym.id : "perim-fill";
     fireList().forEach((F, j) => {
       const id = `fc${j}`;
       const add = (kind, url, paint, minzoom) => {
         if (!url) return;
         map.addSource(`${id}-${kind}`, { type: "image", url, coordinates: F.coords });
         map.addLayer({ id: `${id}-${kind}`, type: "raster", source: `${id}-${kind}`, minzoom: minzoom || 0,
-          paint: { "raster-resampling": "nearest", "raster-fade-duration": 0, ...paint } }, "perim-fill");
+          paint: { "raster-resampling": "nearest", "raster-fade-duration": 0, ...paint } }, under);
       };
       add("crown", F.images.crown, { "raster-opacity": 1 });
       add("ember", F.images.ember, { "raster-opacity": 1 });
@@ -283,7 +287,7 @@
         paint: { "line-color": "rgba(70,35,15,.38)", "line-width": ["interpolate", ["linear"], ["zoom"], 12, 0.4, 15, 0.9] } }, "perim-fill");
       add("start", F.images.start, { "raster-opacity": 1 });
       map.addSource(`${id}-startline`, { type: "geojson", data: F.startLines });
-      map.addLayer({ id: `${id}-startline`, type: "line", source: `${id}-startline`, paint: { "line-color": START_EDGE, "line-width": ["interpolate", ["linear"], ["zoom"], 8, 1.2, 14, 2.6] } }, "perim-fill");
+      map.addLayer({ id: `${id}-startline`, type: "line", source: `${id}-startline`, paint: { "line-color": START_EDGE, "line-width": ["interpolate", ["linear"], ["zoom"], 8, 1.6, 14, 3.2] } }, "perim-fill");
       map.addSource(`${id}-actual`, { type: "geojson", data: F.actualLines });
       map.addLayer({ id: `${id}-actual`, type: "line", source: `${id}-actual`, paint: { "line-color": ACTUAL_EDGE, "line-width": 2.2 } }, "perim-fill");
     });
@@ -345,14 +349,15 @@
     if (f.layer.id === "inc") {
       html = `<div class="pop"><h5>${esc(p.IncidentName)}</h5><dl><dt>Size</dt><dd>${ac(p.IncidentSize)}</dd><dt>Contained</dt><dd>${p.PercentContained ?? "–"}%</dd>
         <dt>State</dt><dd>${esc(st(p.POOState))}</dd><dt>Discovered</dt><dd>${when(p.FireDiscoveryDateTime)}</dd>
-        ${p.TotalIncidentPersonnel ? `<dt>Personnel</dt><dd>${Number(p.TotalIncidentPersonnel).toLocaleString()}</dd>` : ""}<dt>Updated</dt><dd>${when(p.ModifiedOnDateTime_dt)}</dd></dl></div>`;
-      select(p.UniqueFireIdentifier, false);
+        ${p.TotalIncidentPersonnel ? `<dt>Personnel</dt><dd>${Number(p.TotalIncidentPersonnel).toLocaleString()}</dd>` : ""}<dt>Updated</dt><dd>${when(p.ModifiedOnDateTime_dt)}</dd></dl>${links(p.IncidentName, p.POOState)}</div>`;
+      select(p.UniqueFireIdentifier, true, 700);
     } else if (f.layer.id === "hot") {
       html = `<div class="pop"><h5>Satellite hotspot</h5><dl><dt>Detected</dt><dd>${when(p.esritimeutc)}</dd><dt>Age</dt><dd>${p.hours_old ?? "?"} h</dd>
         <dt>Fire power</dt><dd>${p.frp ?? "–"} MW</dd><dt>Satellite</dt><dd>${esc(p.satellite ?? "–")} · ${p.daynight === "N" ? "night" : "day"}</dd></dl><p>375 m pixel: the fire is somewhere inside it.</p></div>`;
     } else {
+      select(p.attr_UniqueFireIdentifier, true, 700);
       html = `<div class="pop"><h5>${esc(p.attr_IncidentName)}</h5><dl><dt>Size</dt><dd>${ac(p.poly_GISAcres)}</dd><dt>Contained</dt><dd>${p.attr_PercentContained ?? "–"}%</dd>
-        <dt>Perimeter</dt><dd>${when(p.poly_PolygonDateTime)}</dd><dt>Mapped by</dt><dd>${esc(p.poly_MapMethod || "–")}</dd><dt>Type</dt><dd>${p.attr_IncidentTypeCategory === "RX" ? "Prescribed" : "Wildfire"}</dd></dl></div>`;
+        <dt>Perimeter</dt><dd>${when(p.poly_PolygonDateTime)}</dd><dt>Mapped by</dt><dd>${esc(p.poly_MapMethod || "–")}</dd><dt>Type</dt><dd>${p.attr_IncidentTypeCategory === "RX" ? "Prescribed" : "Wildfire"}</dd><dt>Source</dt><dd>NIFC ${esc(p.feed || "current")}</dd></dl>${links(p.attr_IncidentName, p.attr_POOState)}</div>`;
     }
     popup.setLngLat(e.lngLat).setHTML(html).addTo(map);
   });
@@ -362,12 +367,24 @@
   }
 
   // ------------------------------------------------------------------ live data
+  // NIFC's "Current" service drops active fires whose incident record went stale (e.g. Ptarmigan, 26k ac,
+  // Nov 2026); the Year-to-Date service still has them. We merge both, newest perimeter per fire.
   async function loadPerimeters() {
     try {
-      state.perims = await getJSON(URLS.perimeters, {
-        where: "1=1", outSR: 4326, f: "geojson", geometryPrecision: 5, maxAllowableOffset: 0.0002, resultRecordCount: 2000,
-        outFields: "attr_UniqueFireIdentifier,attr_IncidentName,poly_GISAcres,attr_PercentContained,poly_PolygonDateTime,poly_MapMethod,attr_IncidentTypeCategory,attr_POOState",
-      });
+      const common = { outSR: 4326, f: "geojson", geometryPrecision: 5, maxAllowableOffset: 0.0002, resultRecordCount: 2000,
+        outFields: "attr_UniqueFireIdentifier,attr_IncidentName,poly_GISAcres,attr_PercentContained,poly_PolygonDateTime,poly_MapMethod,attr_IncidentTypeCategory,attr_POOState" };
+      const since = new Date(Date.now() - 90 * 86400e3).toISOString().slice(0, 19).replace("T", " ");
+      const [cur, ytd] = await Promise.all([
+        getJSON(URLS.perimeters, { ...common, where: "1=1" }),
+        getJSON(URLS.perimetersYTD, { ...common, where: `attr_IncidentTypeCategory='WF' AND attr_FireOutDateTime IS NULL AND (attr_PercentContained IS NULL OR attr_PercentContained < 100) AND poly_PolygonDateTime >= TIMESTAMP '${since}'` }).catch(() => FC()),
+      ]);
+      const best = new Map();
+      for (const [feed, fc] of [["current", cur], ["year to date", ytd]]) for (const f of fc.features || []) {
+        const id = f.properties.attr_UniqueFireIdentifier, old = best.get(id);
+        f.properties.feed = feed;
+        if (!old || (f.properties.poly_PolygonDateTime || 0) > (old.properties.poly_PolygonDateTime || 0)) best.set(id, f);
+      }
+      state.perims = FC([...best.values()]);
       const s = map.getSource("perims"); if (s) s.setData(state.perims);
       state.liveAt = Date.now(); state.liveCount = state.perims.features.length; freshLive();
     } catch (e) { $("#fresh-live").textContent = "NIFC unreachable, retrying"; $("#fresh-live").classList.add("stale"); console.warn(e); }
@@ -445,7 +462,7 @@
     })));
     $("#model-list").replaceChildren(...Object.entries(MODEL).map(([k, l]) => option("checkbox", "md", k, l.name, l.note, l.on, (e) => setModel(k, e.target.checked))));
     const op = $("#pred-opacity"); op.value = predOpacity;
-    op.oninput = () => { predOpacity = +op.value; store.set("predOpacity", predOpacity); applyModelVisibility(); };
+    op.oninput = () => { predOpacity = +op.value; store.set("predOpacity2", predOpacity); applyModelVisibility(); };
   }
   function setModel(k, on) {
     MODEL[k].on = on; saveLayers();
@@ -514,10 +531,18 @@
       w ? el("p", { class: "wind", text: `Forecast wind: from ${w.from_compass} at ${w.mean_mph} mph, gusts to ${w.peak_gust_mph} mph, humidity down to ${w.min_rh_pct}%` }) : null,
       F ? el("p", { class: "note", text: m.example ? m.note : `Forecast from ${when(m.origin)} to ${when(new Date(+new Date(m.origin) + hrs * 3600e3))}. Weather: HRRR run ${when(m.hrrr_run)}.${m.source === "incident" ? " Starting fire estimated from satellite detections (no perimeter yet)." : ""}` })
         : el("p", { class: "noforecast", text: "No forecast for this fire: fewer than 3 satellite fire detections near it in the last 48 hours, so it does not look actively spreading. Forecasts refresh every 2 hours." }),
+      m?.example ? null : el("p", { class: "links" },
+        el("a", { href: wdURL(name, m?.state || inc?.POOState || per?.properties.attr_POOState), target: "_blank", rel: "noopener", text: "Find on Watch Duty ↗" }), " · ",
+        el("a", { href: iwURL(name, m?.state || inc?.POOState || per?.properties.attr_POOState), target: "_blank", rel: "noopener", text: "InciWeb ↗" })),
     ].filter(Boolean));
     box.hidden = false;
   }
-  function select(id, fly) {
+  function wdURL(name, state) { return `https://www.google.com/search?q=${encodeURIComponent(`site:app.watchduty.org "${String(name || "").replace(/\s*fire$/i, "")} Fire" ${st(state)}`)}`; }
+  function iwURL(name, state) { return `https://www.google.com/search?q=${encodeURIComponent(`site:inciweb.wildfire.gov ${name} ${st(state)}`)}`; }
+  function links(name, state) {
+    return `<p class="links"><a href="${wdURL(name, state)}" target="_blank" rel="noopener">Find on Watch Duty ↗</a> · <a href="${iwURL(name, state)}" target="_blank" rel="noopener">InciWeb ↗</a></p>`;
+  }
+  function select(id, fly, duration = 1200) {
     state.selected = id;
     document.querySelectorAll(".row").forEach((b) => b.classList.toggle("sel", b.dataset.id === id));
     renderDetail(id);
@@ -526,9 +551,9 @@
     const F = id === "__example" ? state.example : state.fires.get(id);
     const per = perimFor(id), inc = state.incidents.find((p) => p.UniqueFireIdentifier === id);
     const padding = { top: 80, left: 40, right: 40, bottom: innerWidth <= 780 ? Math.round(innerHeight * 0.4) : 40 };
-    if (F) map.fitBounds(F.focus, { padding, maxZoom: 14, duration: 1200 });
-    else if (per) map.fitBounds(bbox(per.geometry), { padding, maxZoom: 14, duration: 1200 });
-    else if (inc) map.flyTo({ center: [inc.lon, inc.lat], zoom: 12 });
+    if (F) map.fitBounds(F.focus, { padding, maxZoom: 14, duration });
+    else if (per) map.fitBounds(bbox(per.geometry), { padding, maxZoom: 14, duration });
+    else if (inc) map.flyTo({ center: [inc.lon, inc.lat], zoom: 12, duration });
     if (innerWidth <= 780) setSheet("min");
   }
   function bbox(geom) {

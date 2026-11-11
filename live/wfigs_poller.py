@@ -35,18 +35,45 @@ def ms_to_iso(ms):
     return None if ms is None else datetime.fromtimestamp(ms / 1000, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def fetch():
+YTD = URL.replace("WFIGS_Interagency_Perimeters_Current", "WFIGS_Interagency_Perimeters_YearToDate")
+
+
+def _paged(url, where, fields):
     feats, offset = [], 0
     while True:
-        r = requests.get(URL, params={"where": "1=1", "outFields": ",".join(KEEP), "outSR": 4326,
-                                      "f": "geojson", "resultOffset": offset, "resultRecordCount": 1000},
-                         timeout=120)
+        r = requests.get(url, params={"where": where, "outFields": fields, "outSR": 4326, "f": "geojson",
+                                      "resultOffset": offset, "resultRecordCount": 1000}, timeout=180)
         r.raise_for_status()
         page = r.json().get("features", [])
         feats += page
         if len(page) < 1000:
             return feats
         offset += len(page)
+
+
+def fetch(days=90, fields=None):
+    """Every perimeter of a fire that is still going: NIFC's 'Current' service plus the fires it drops.
+    'Current' only lists incidents whose record NIFC still treats as current, so active fires with a
+    stale record fall out of it (2026-11-11: Ptarmigan 26k ac, Border 2, Luna, Garda Falls, ... were
+    missing while Watch Duty showed them). The Year-to-Date service still has their perimeters: we add
+    every wildfire there that is not declared out, not 100% contained, mapped in the last `days` days.
+    One perimeter per fire (the newest)."""
+    fields = fields or ",".join(KEEP + ["attr_IncidentTypeCategory", "attr_POOState"])
+    since = (datetime.now(timezone.utc) - pd.Timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
+    cur = _paged(URL, "1=1", fields)
+    ytd = _paged(YTD, f"attr_IncidentTypeCategory='WF' AND attr_FireOutDateTime IS NULL AND "
+                      f"(attr_PercentContained IS NULL OR attr_PercentContained < 100) AND "
+                      f"poly_PolygonDateTime >= TIMESTAMP '{since}'", fields)
+    best = {}
+    for src, feats in (("current", cur), ("year_to_date", ytd)):
+        for f in feats:
+            p = f["properties"]
+            fid = p.get("attr_UniqueFireIdentifier") or (p.get("attr_IrwinID") or "").strip("{}")
+            p["feed"] = src
+            old = best.get(fid)
+            if old is None or (p.get("poly_PolygonDateTime") or 0) > (old["properties"].get("poly_PolygonDateTime") or 0):
+                best[fid] = f
+    return list(best.values())
 
 
 def poll(out):

@@ -69,13 +69,13 @@ svg { flex: none; }
 #map { position: absolute; inset: 0; background: #dfe3e0; }
 
 /* ---------- side: detail + list */
-.side { width: var(--side-w); flex: none; display: flex; flex-direction: column; background: var(--panel); border-right: 1px solid var(--rule); z-index: 900; padding-left: env(safe-area-inset-left, 0px); min-height: 0; }
+.side { width: var(--side-w); flex: none; display: flex; flex-direction: column; background: var(--panel); border-right: 1px solid var(--rule); z-index: 900; padding-left: env(safe-area-inset-left, 0px); min-height: 0; overflow-y: auto; overscroll-behavior: contain; scroll-behavior: smooth; }
 .grip { display: none; }
-.side-head { display: flex; align-items: center; gap: 10px; padding: 12px 14px; border-bottom: 1px solid var(--rule); }
+.side-head { display: flex; align-items: center; gap: 10px; padding: 12px 14px; border-bottom: 1px solid var(--rule); position: sticky; top: 0; z-index: 3; background: var(--panel); }
 .side-head h2 { margin: 0; font: 300 15px/1 var(--cond); text-transform: lowercase; letter-spacing: 0; }
 #search { flex: 1; min-width: 0; height: 32px; padding: 0 10px; border: 1px solid var(--rule); border-radius: 4px; background: var(--bg); }
-.list { flex: 1; overflow-y: auto; min-height: 0; }
-.group-label { margin: 0; padding: 10px 14px 6px; font: 600 11.5px/1 var(--cond); text-transform: uppercase; letter-spacing: .08em; color: var(--ink-2); background: var(--panel); position: sticky; top: 0; z-index: 1; border-bottom: 1px solid var(--rule); }
+.list { flex: 1 0 auto; }
+.group-label { margin: 0; padding: 10px 14px 6px; font: 600 11.5px/1 var(--cond); text-transform: uppercase; letter-spacing: .08em; color: var(--ink-2); background: var(--panel); position: sticky; top: 57px; z-index: 2; border-bottom: 1px solid var(--rule); }
 details.contained > summary { cursor: pointer; list-style: none; }
 details.contained > summary::before { content: "▸ "; }
 details.contained[open] > summary::before { content: "▾ "; }
@@ -107,6 +107,8 @@ details.contained[open] > summary::before { content: "▾ "; }
 .detail .note { margin: 8px 0 0; font-size: 12px; color: var(--ink-2); }
 .detail .close { float: right; border: 1px solid var(--rule); background: transparent; border-radius: 4px; padding: 2px 8px; cursor: pointer; font-size: 12px; color: var(--ink-2); }
 .detail .noforecast { margin: 8px 0 0; font-size: 13px; color: var(--ink-2); }
+.links { margin: 8px 0 0; font-size: 12.5px; }
+.links a { color: var(--gold-ink); font-weight: 500; text-decoration: none; border-bottom: 1px solid currentColor; }
 
 /* ---------- prediction switch */
 .predict {

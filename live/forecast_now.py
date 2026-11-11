@@ -41,10 +41,8 @@ def active_fires(min_acres=100, max_age_days=60):
     import requests
     from shapely.geometry import shape
     from live import firms
-    r = requests.get(WFIGS, params=dict(
-        where=f"poly_GISAcres>={min_acres}", returnGeometry="true", outSR=4326, f="geojson", resultRecordCount=2000,
-        outFields="attr_UniqueFireIdentifier,attr_IncidentName,poly_PolygonDateTime,poly_GISAcres,"
-                  "attr_PercentContained,attr_POOState,poly_MapMethod"), timeout=120).json()
+    from live import wfigs_poller as WP
+    r = {"features": [f for f in WP.fetch(days=max_age_days) if (f["properties"].get("poly_GISAcres") or 0) >= min_acres]}
     now = pd.Timestamp.now(tz="UTC")
     det = pd.concat([firms.get("VIIRS_NOAA20_NRT", (-125, 24, -66, 50), 1, (now - pd.Timedelta(days=k)).date().isoformat())
                      for k in (1, 0)], ignore_index=True)
