@@ -182,6 +182,10 @@ def main():
         "by_gap": {n: dict(zip(E.GAP_NAMES, map(float, w[nm + 8 * j: nm + 8 * j + 4] + w[j]))) for j, n in enumerate(a.members)},
         "by_wind": {n: dict(zip(E.WIND_NAMES, map(float, w[nm + 8 * j + 4: nm + 8 * j + 8] + w[j]))) for j, n in enumerate(a.members)},
     }
+    res["router_model"] = {                  # everything the live app needs to apply this router
+        "members": a.members, "features": "clip(z,-12,12); z*onehot(gap: <=12,12-36,36-72,>72 h); z*onehot(wind: <3,3-6,6-9,>=9 m/s)",
+        "temps": {n: [float(res["single"][n + " calibrated"]["temperature"]), float(res["single"][n + " calibrated"]["bias"])] for n in a.members},
+        "coef": [float(c) for c in lr.coef_[0]], "intercept": float(lr.intercept_[0]), "threshold": float(res["router"]["thr"])}
     val_ap["router"] = float(average_precision_score(yv, sv))
     best = max(val_ap, key=val_ap.get)
     res["best_on_validation"] = {"name": best, "val_ap": val_ap[best]}

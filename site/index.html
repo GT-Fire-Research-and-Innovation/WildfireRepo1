@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>SpreadWatch</title>
+<meta name="description" content="Live wildfire perimeters, satellite hotspots and 24-hour spread forecasts from a physics-informed neural network.">
+<meta name="theme-color" content="#1b1d1f">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cpath d='M16 2c2 6 9 9 9 17a9 9 0 0 1-18 0c0-5 3-7 4-11 1 3 3 4 3 4 0-4 1-7 2-10z' fill='%23e8590c'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@500;600;700&family=Barlow:wght@400;500;600&display=swap">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="bar">
+  <div class="brand">
+    <svg viewBox="0 0 32 32" aria-hidden="true"><path d="M16 2c2 6 9 9 9 17a9 9 0 0 1-18 0c0-5 3-7 4-11 1 3 3 4 3 4 0-4 1-7 2-10z"/></svg>
+    <span>SpreadWatch</span>
+  </div>
+  <div class="status" id="status" aria-live="polite">
+    <span class="pill" id="st-live"><i></i>Perimeters: loading</span>
+    <span class="pill" id="st-fc"><i></i>Forecast: loading</span>
+  </div>
+  <div class="bar-actions">
+    <button class="icon-btn" id="btn-locate" title="Show my location" aria-label="Show my location">
+      <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3.5"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3"/><circle cx="12" cy="12" r="7.5" fill="none"/></svg>
+    </button>
+    <button class="icon-btn" id="btn-theme" title="Switch light / dark" aria-label="Switch light or dark theme">
+      <svg viewBox="0 0 24 24"><path d="M20 14.5A8 8 0 0 1 9.5 4a8 8 0 1 0 10.5 10.5z"/></svg>
+    </button>
+    <button class="icon-btn" id="btn-layers" title="Layers" aria-label="Show layers" aria-expanded="false">
+      <svg viewBox="0 0 24 24"><path d="M12 3 2 8l10 5 10-5-10-5zM2 13l10 5 10-5M2 17.5l10 5 10-5" fill="none"/></svg>
+    </button>
+  </div>
+</header>
+
+<main class="shell">
+  <aside class="side" id="side" aria-label="Active fires">
+    <button class="sheet-handle" id="sheet-handle" aria-label="Expand fire list"><span></span></button>
+    <div class="side-head">
+      <h1>Active fires</h1>
+      <input id="search" type="search" placeholder="Search by name or state" autocomplete="off" aria-label="Search fires">
+    </div>
+    <div class="side-body" id="fire-list">
+      <p class="empty">Loading current incidents from NIFC…</p>
+    </div>
+    <footer class="side-foot">
+      <p><strong>Experimental research forecast.</strong> Not an official product. Do not use it for safety or tactical decisions. Follow incident command and official sources (<a href="https://inciweb.wildfire.gov" target="_blank" rel="noopener">InciWeb</a>, <a href="https://www.nifc.gov" target="_blank" rel="noopener">NIFC</a>).</p>
+    </footer>
+  </aside>
+
+  <div class="map-wrap">
+    <div id="map" role="application" aria-label="Wildfire map"></div>
+
+    <section class="panel" id="panel" hidden aria-label="Map layers">
+      <div class="panel-head"><h2>Layers</h2><button class="icon-btn small" id="panel-close" aria-label="Close layers"><svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></svg></button></div>
+      <div class="group">
+        <h3>Basemap</h3>
+        <div class="seg" id="basemaps" role="radiogroup" aria-label="Basemap"></div>
+      </div>
+      <div class="group">
+        <h3>Live (refreshes every 5 min)</h3>
+        <div id="live-layers"></div>
+      </div>
+      <div class="group">
+        <h3>Model forecast <span class="sub" id="fc-horizon"></span></h3>
+        <div id="model-layers"></div>
+      </div>
+      <p class="model-note" id="model-note"></p>
+    </section>
+
+    <div class="legend" id="legend" aria-label="Legend"></div>
+    <div class="toast" id="toast" role="status" hidden></div>
+  </div>
+</main>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

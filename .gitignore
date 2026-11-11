@@ -13,3 +13,10 @@ __pycache__/
 .ipynb_checkpoints/
 logs/*
 !logs/.gitkeep
+
+# map app: generated forecasts are deployed by the workflow, never committed; the replay example is kept
+!site/data/
+site/data/*
+!site/data/example/
+# live model weights are committed on purpose (small, needed by the scheduled forecast)
+!live/models/*.pt

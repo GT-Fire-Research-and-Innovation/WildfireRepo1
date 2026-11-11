@@ -1,0 +1,18 @@
+{
+ "id": "__example",
+ "name": "Dragon Bravo (2025)",
+ "state": "",
+ "acres": 85227,
+ "example": true,
+ "file": "example.geojson",
+ "origin": "2025-07-30 04:43:54+00:00",
+ "hours": 69,
+ "stats": {
+  "expected_new_acres": 106169,
+  "likely_acres": 44206,
+  "possible_acres": 317051,
+  "start_acres": 85227,
+  "actual_new_acres": 30273
+ },
+ "note": "Replay of a past forecast, shown because no fire is actively burning. Forecast made 2025-07-30 for the next 69 h with physics2 (s_phys2.pt); the cyan line is what really burned (39% of it was in the forecast's top area)."
+}

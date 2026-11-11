@@ -1,0 +1,80 @@
+# SpreadWatch: every 2 hours, forecast the actively burning fires and deploy the map app to GitHub Pages.
+# Setup (once): Settings -> Pages -> Source: "GitHub Actions"; Settings -> Secrets and variables -> Actions:
+#   FIRMS_MAP_KEY (NASA FIRMS map key) and LANDFIRE_EMAIL (contact email the LANDFIRE service requires).
+name: Live forecast
+
+on:
+  schedule:
+    - cron: "17 */2 * * *"            # every 2 hours at :17 (off the top of the hour)
+  workflow_dispatch:
+    inputs:
+      max_fires:
+        description: "Most fires to forecast"
+        default: "12"
+  push:
+    branches: [phase1-live-ingest]
+    paths: ["site/**", "live/**", ".github/workflows/live-forecast.yml"]
+
+permissions:
+  contents: write                      # perimeter archive branch
+  pages: write
+  id-token: write
+
+concurrency:
+  group: live-forecast
+  cancel-in-progress: false
+
+jobs:
+  forecast-and-deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 110
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install (CPU-only PyTorch)
+        run: |
+          pip install --index-url https://download.pytorch.org/whl/cpu torch
+          pip install -r requirements.txt affine pyarrow
+
+      - name: Forecast actively burning fires
+        id: forecast
+        continue-on-error: true          # the app still deploys with its live layers
+        env:
+          FIRMS_MAP_KEY: ${{ secrets.FIRMS_MAP_KEY }}
+          LANDFIRE_EMAIL: ${{ secrets.LANDFIRE_EMAIL }}
+        run: |
+          python live/publish.py --site site --work "$RUNNER_TEMP/live" \
+                 --max-fires "${{ inputs.max_fires || '12' }}" --hours 24
+
+      - name: Archive new NIFC perimeters (feeds retraining)
+        continue-on-error: true
+        run: |
+          cd "$RUNNER_TEMP"
+          URL="https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}"
+          if ! git clone --depth 1 --branch perimeter-archive "$URL" arch 2>/dev/null; then
+            mkdir arch && cd arch && git init -q -b perimeter-archive && git remote add origin "$URL" && cd ..
+          fi
+          python "$GITHUB_WORKSPACE/live/wfigs_poller.py" --out arch --once
+          cd arch && git add -A
+          if git -c user.name="spreadwatch-bot" -c user.email="actions@users.noreply.github.com" \
+                 commit -qm "NIFC perimeters $(date -u +%Y-%m-%dT%H:%MZ)"; then
+            git push -q origin perimeter-archive
+          else
+            echo "no new perimeter versions"
+          fi
+
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+      - id: deploy
+        uses: actions/deploy-pages@v4
