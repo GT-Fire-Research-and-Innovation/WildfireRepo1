@@ -484,7 +484,9 @@
     const fc = [...state.fires.values()].map((F) => F.meta).filter((m) => match(m.name, m.state)).sort((a, b) => (b.stats?.expected_new_acres || 0) - (a.stats?.expected_new_acres || 0));
     if (fc.length) {
       box.append(el("p", { class: "group-label", text: `Forecast available (${fc.length})` }));
-      fc.forEach((m) => box.append(row(m.id, m.name, m.state, m.acres, m.contained, m.source === "incident" ? "no perimeter yet" : `perimeter ${ago(m.perimeter_time || m.updated)}`, m.stats)));
+      fc.forEach((m) => box.append(row(m.id, m.no_heat ? `${m.name} *` : m.name, m.state, m.acres, m.contained,
+        [m.source === "incident" ? "no perimeter yet" : `perimeter ${ago(m.perimeter_time || m.updated)}`, m.no_heat ? "no satellite heat" : null].filter(Boolean).join(" · "), m.stats)));
+      if (fc.some((m) => m.no_heat)) box.append(el("p", { class: "footnote", text: NO_HEAT }));
     } else if (state.example && match(state.example.meta.name, "")) {
       const m = state.example.meta;
       box.append(el("p", { class: "group-label", text: "No fire is actively spreading · example" }));
@@ -508,6 +510,7 @@
   }
   $("#search").addEventListener("input", renderList);
 
+  const NO_HEAT = "* No satellite fire detections in the last 48 h (NOAA-20, NOAA-21). The forecast starts from the reported size of a newly reported fire; the fire may be smaller than reported or already out.";
   function perimFor(id) { return state.perims.features.find((f) => f.properties.attr_UniqueFireIdentifier === id); }
   function renderDetail(id) {
     const box = $("#detail");
@@ -525,9 +528,10 @@
     const w = s.wind;
     box.replaceChildren(...[
       el("button", { class: "close", onclick: () => { state.selected = null; box.hidden = true; renderList(); }, text: "Close" }),
-      el("h3", { text: name }),
+      el("h3", { text: m?.no_heat ? `${name} *` : name }),
       el("p", { class: "where", text: [st(m?.state || inc?.POOState), m?.example ? "example replay" : null, m?.source === "incident" ? "no NIFC perimeter yet" : null, inc ? `updated ${ago(inc.ModifiedOnDateTime_dt)}` : null].filter(Boolean).join(" · ") }),
       figs,
+      m?.no_heat ? el("p", { class: "footnote", text: NO_HEAT }) : null,
       w ? el("p", { class: "wind", text: `Forecast wind: from ${w.from_compass} at ${w.mean_mph} mph, gusts to ${w.peak_gust_mph} mph, humidity down to ${w.min_rh_pct}%` }) : null,
       F ? el("p", { class: "note", text: m.example ? m.note : `Forecast from ${when(m.origin)} to ${when(new Date(+new Date(m.origin) + hrs * 3600e3))}. Weather: HRRR run ${when(m.hrrr_run)}.${m.source === "incident" ? " Starting fire estimated from satellite detections (no perimeter yet)." : ""}` })
         : el("p", { class: "noforecast", text: "No forecast for this fire: fewer than 3 satellite fire detections near it in the last 48 hours, so it does not look actively spreading. Forecasts refresh every 2 hours." }),

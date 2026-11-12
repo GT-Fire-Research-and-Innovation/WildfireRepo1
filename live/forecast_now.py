@@ -44,8 +44,7 @@ def active_fires(min_acres=100, max_age_days=60):
     from live import wfigs_poller as WP
     r = {"features": [f for f in WP.fetch(days=max_age_days) if (f["properties"].get("poly_GISAcres") or 0) >= min_acres]}
     now = pd.Timestamp.now(tz="UTC")
-    det = pd.concat([firms.get("VIIRS_NOAA20_NRT", (-125, 24, -66, 50), 1, (now - pd.Timedelta(days=k)).date().isoformat())
-                     for k in (1, 0)], ignore_index=True)
+    det = firms.recent(now)
     rows = []
     for f in r.get("features", []):
         p = f["properties"]
@@ -61,7 +60,8 @@ def active_fires(min_acres=100, max_age_days=60):
         rows.append(dict(id=p["attr_UniqueFireIdentifier"], name=p["attr_IncidentName"], state=p.get("attr_POOState"),
                          acres=round(p["poly_GISAcres"] or 0), contained=p.get("attr_PercentContained"),
                          updated=t.isoformat(), lon=round(geom.centroid.x, 4), lat=round(geom.centroid.y, 4),
-                         detections_48h=int(len(near)), feature=f))
+                         detections_48h=int(len(near)), feature=f,
+                         discovered=pd.to_datetime(p["attr_FireDiscoveryDateTime"], unit="ms", utc=True).isoformat() if p.get("attr_FireDiscoveryDateTime") else None))
     rows.sort(key=lambda r: r["updated"], reverse=True)
     rows.sort(key=lambda r: -r["detections_48h"])            # most active first, then most recently mapped
     return rows

@@ -113,3 +113,24 @@ def main():
 
 if __name__ == "__main__":
     sys.exit(main())
+
+
+SATELLITES = ("VIIRS_NOAA20_NRT", "VIIRS_NOAA21_NRT", "VIIRS_SNPP_NRT")
+
+
+def recent(now, bbox=(-125, 24, -66, 50), days=2):
+    """VIIRS detections from every satellite that has data (NOAA-20, NOAA-21, S-NPP) for the last `days`
+    days: more passes means small fires are more likely to be caught. A satellite whose feed fails or is
+    empty is skipped."""
+    import pandas as pd
+    parts = []
+    for src in SATELLITES:
+        for k in range(days):
+            try:
+                d = get(src, bbox, 1, (now - pd.Timedelta(days=k)).date().isoformat())
+            except Exception as ex:                     # one feed down must not stop the others
+                print(f"  FIRMS {src}: {type(ex).__name__}", flush=True)
+                continue
+            if len(d):
+                parts.append(d.assign(source=src))
+    return pd.concat(parts, ignore_index=True) if parts else pd.DataFrame(columns=["latitude", "longitude"])
