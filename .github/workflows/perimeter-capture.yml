@@ -1,0 +1,56 @@
+# Saves every new or changed NIFC perimeter version to the perimeter-archive branch, every 15 minutes.
+# Incident GIS teams edit perimeters in place, and public archives keep roughly one per day, so
+# sub-daily versions are lost unless someone saves them while they are visible. This job does that.
+# Sources: WFIGS Current + Year-to-Date (active fires) + every Year-to-Date perimeter edited in the
+# last 6 hours (any fire type or status). Duplicates are skipped by geometry + perimeter time.
+name: Perimeter capture
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: perimeter-archive
+  cancel-in-progress: false
+
+jobs:
+  capture:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4          # only the poller (the repo also holds ~180 MB of model weights)
+        with:
+          sparse-checkout: live/wfigs_poller.py
+          sparse-checkout-cone-mode: false
+          filter: blob:none
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install
+        run: pip install -q requests pandas
+
+      - name: Save new perimeter versions
+        run: |
+          cd "$RUNNER_TEMP"
+          URL="https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}"
+          # only index.csv is checked out: the archive grows all season and we just add files to it
+          if git clone -q --depth 1 --filter=blob:none --sparse --branch perimeter-archive "$URL" arch 2>/dev/null; then
+            git -C arch sparse-checkout set --no-cone /perimeters/index.csv
+          else
+            mkdir arch && git -C arch init -q -b perimeter-archive && git -C arch remote add origin "$URL"
+          fi
+          python "$GITHUB_WORKSPACE/live/wfigs_poller.py" --out arch --once
+          cd arch
+          git add --sparse -A
+          if git -c user.name="gt-fire-bot" -c user.email="actions@users.noreply.github.com" \
+                 commit -qm "NIFC perimeters $(date -u +%Y-%m-%dT%H:%MZ)"; then
+            for i in 1 2 3; do git push -q origin perimeter-archive && break; git pull -q --rebase origin perimeter-archive; done
+          else
+            echo "no new perimeter versions"
+          fi

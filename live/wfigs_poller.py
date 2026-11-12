@@ -51,21 +51,30 @@ def _paged(url, where, fields):
         offset += len(page)
 
 
-def fetch(days=90, fields=None):
+def fetch(days=90, fields=None, edited_hours=0):
     """Every perimeter of a fire that is still going: NIFC's 'Current' service plus the fires it drops.
     'Current' only lists incidents whose record NIFC still treats as current, so active fires with a
     stale record fall out of it (2026-11-11: Ptarmigan 26k ac, Border 2, Luna, Garda Falls, ... were
     missing while Watch Duty showed them). The Year-to-Date service still has their perimeters: we add
     every wildfire there that is not declared out, not 100% contained, mapped in the last `days` days.
-    One perimeter per fire (the newest)."""
+    One perimeter per fire (the newest), unless edited_hours > 0 (archive mode): then every perimeter from
+    all three lists, plus everything edited in the last edited_hours hours, is returned as is, so the
+    archive keeps every version, not just the newest."""
     fields = fields or ",".join(KEEP + ["attr_IncidentTypeCategory", "attr_POOState"])
     since = (datetime.now(timezone.utc) - pd.Timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
     cur = _paged(URL, "1=1", fields)
     ytd = _paged(YTD, f"attr_IncidentTypeCategory='WF' AND attr_FireOutDateTime IS NULL AND "
                       f"(attr_PercentContained IS NULL OR attr_PercentContained < 100) AND "
                       f"poly_PolygonDateTime >= TIMESTAMP '{since}'", fields)
+    if not edited_hours:
+        lists = (("current", cur), ("year_to_date", ytd))
+    else:                                   # archive mode: also every perimeter edited recently, any fire type or status
+        recent = (datetime.now(timezone.utc) - pd.Timedelta(hours=edited_hours)).strftime("%Y-%m-%d %H:%M:%S")
+        edits = _paged(YTD, f"poly_DateCurrent >= TIMESTAMP '{recent}' OR poly_PolygonDateTime >= TIMESTAMP '{recent}'", fields)
+        lists = (("current", cur), ("year_to_date", ytd), ("recent_edit", edits))
+        return [f for _, fs in lists for f in fs if not f["properties"].update(feed=_) and f.get("geometry")]
     best = {}
-    for src, feats in (("current", cur), ("year_to_date", ytd)):
+    for src, feats in lists:
         for f in feats:
             p = f["properties"]
             fid = p.get("attr_UniqueFireIdentifier") or (p.get("attr_IrwinID") or "").strip("{}")
@@ -84,13 +93,14 @@ def poll(out):
     seen = set(zip(idx["fire_id"].astype(str), idx["hash"].astype(str)))
     now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     rows, n_new = [], 0
-    for f in fetch():
+    for f in fetch(edited_hours=6):
         p = f["properties"]
         fid = p.get("attr_UniqueFireIdentifier") or (p.get("attr_IrwinID") or "unknown").strip("{}")
         geom = json.dumps(f.get("geometry"), sort_keys=True)
         h = hashlib.sha1((geom + str(p.get("poly_PolygonDateTime"))).encode()).hexdigest()[:8]
         if (fid, h) in seen:
             continue
+        seen.add((fid, h))                       # the same perimeter can come from two feeds in one poll
         t = ms_to_iso(p.get("poly_PolygonDateTime")) or now
         d = arch / fid
         d.mkdir(exist_ok=True)
@@ -101,6 +111,7 @@ def poll(out):
                      "discovered": ms_to_iso(p.get("attr_FireDiscoveryDateTime")), "acres": p.get("poly_GISAcres"),
                      "map_method": p.get("poly_MapMethod"), "category": p.get("poly_FeatureCategory"),
                      "pct_contained": p.get("attr_PercentContained"), "file": str(fn.relative_to(arch)),
+                     "type": p.get("attr_IncidentTypeCategory"), "state": p.get("attr_POOState"), "feed": p.get("feed"),
                      "hash": h, "first_seen": now})
         n_new += 1
     if rows:

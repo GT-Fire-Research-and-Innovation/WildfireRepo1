@@ -16,7 +16,7 @@ on:
     paths: ["site/**", "live/**", ".github/workflows/live-forecast.yml"]
 
 permissions:
-  contents: write                      # perimeter archive branch
+  contents: read
   pages: write
   id-token: write
 
@@ -55,22 +55,7 @@ jobs:
           python live/publish.py --site site --work "$RUNNER_TEMP/live" \
                  --max-fires "${{ inputs.max_fires || '12' }}" --hours 24
 
-      - name: Archive new NIFC perimeters (feeds retraining)
-        continue-on-error: true
-        run: |
-          cd "$RUNNER_TEMP"
-          URL="https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}"
-          if ! git clone --depth 1 --branch perimeter-archive "$URL" arch 2>/dev/null; then
-            mkdir arch && cd arch && git init -q -b perimeter-archive && git remote add origin "$URL" && cd ..
-          fi
-          python "$GITHUB_WORKSPACE/live/wfigs_poller.py" --out arch --once
-          cd arch && git add -A
-          if git -c user.name="spreadwatch-bot" -c user.email="actions@users.noreply.github.com" \
-                 commit -qm "NIFC perimeters $(date -u +%Y-%m-%dT%H:%MZ)"; then
-            git push -q origin perimeter-archive
-          else
-            echo "no new perimeter versions"
-          fi
+      # (perimeter archiving runs in its own 15-minute workflow: perimeter-capture.yml)
 
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3
