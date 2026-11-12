@@ -139,6 +139,14 @@ def build_live(fire, out, hours=24, now=None):
     (d / "grid.json").write_text(json.dumps(g))
     t0 = time.time()
     _, done = BM.build_one(out, cat, g, LIVE_STAGES)
+    for attempt in (1, 2):                                # live sources drop connections now and then: retry failed stages
+        failed = [s.split(":")[0] for s in done if "ERROR" in s]
+        if not failed:
+            break
+        print(f"  retrying {failed} (attempt {attempt + 1})", flush=True)
+        time.sleep(10 * attempt)
+        _, again = BM.build_one(out, cat, g, failed)
+        done = [s for s in done if s.split(":")[0] not in failed] + again
     print(f"  stages: {done} ({time.time() - t0:.0f}s)", flush=True)
     if not (d / "landfire.npz").exists():                  # newest LANDFIRE version may not exist yet: one older
         g2 = dict(g, year=g["year"] - 1)
