@@ -179,9 +179,12 @@ def st_viirs(g, ctx):
             if len(df):
                 frames.append(df)
             d += pd.Timedelta(days=k)
-    if not frames and g["year"] >= 2024:      # standard product not processed yet -> near real time
+    # the standard product lags by months: near-real-time data fills every day after its last processed day
+    sp_last = max((pd.Timestamp(f["acq_date"].max()) for f in frames), default=None)
+    recent = (pd.Timestamp.now(tz="UTC").tz_localize(None) - pd.Timestamp(d1).tz_localize(None)).days < 120
+    if g["year"] >= 2024 and (sp_last is None or (recent and sp_last < d1)):   # old fires: unchanged rule
         for src in firms.NRT:
-            d = d0
+            d = d0 if sp_last is None else sp_last + pd.Timedelta(days=1)
             while d <= d1:
                 k = min(5, (d1 - d).days + 1)            # FIRMS archive requests: at most 5 days
                 ctx["firms_limiter"]()

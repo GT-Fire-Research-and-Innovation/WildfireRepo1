@@ -114,6 +114,82 @@ def _hrrr_live(d, g, now, hours):
     return dict(analyses=len(ana_t), forecast_steps=len(fc_t), forecast_run=issued.isoformat() if issued else None)
 
 
+def _points(d, g, now, hours_back=48):
+    """VIIRS detections (NOAA-20, NOAA-21, S-NPP near real time) in the fire's grid over the last `hours_back`
+    hours, with exact pass times. Falls back to the build's points.csv.gz if the live feed fails."""
+    from live import firms
+    pts = None
+    try:
+        pts = firms.recent(now, tuple(g["bounds_lonlat"]), days=int(np.ceil(hours_back / 24)) + 1)
+    except Exception as ex:
+        print(f"  FIRMS recent failed ({type(ex).__name__}); using the build's points", flush=True)
+    if (pts is None or not len(pts)) and (Path(d) / "points.csv.gz").exists():
+        pts = pd.read_csv(Path(d) / "points.csv.gz")
+    if pts is None or not len(pts) or "acq_time" not in pts:
+        return None
+    hhmm = pts["acq_time"].astype(int).astype(str).str.zfill(4)
+    pts = pts.assign(t=(pd.to_datetime(pts["acq_date"]) + pd.to_timedelta(hhmm.str[:2].astype(int), unit="h")
+                        + pd.to_timedelta(hhmm.str[2:].astype(int), unit="m")).dt.tz_localize("UTC"))
+    pts = pts.drop_duplicates(["latitude", "longitude", "t"])
+    return pts[(pts["t"] <= now) & (pts["t"] >= now - pd.Timedelta(hours=hours_back))]
+
+
+def start_fire(d, g, fire, lab, now, t_per):
+    """The fire at forecast start, as accurately as the sources allow.
+    With a perimeter: the perimeter, plus each satellite detection made AFTER it within NEAR_KM (the fire
+    grew since it was mapped), one 150 m cell per detection at its exact location (not a 375 m pixel).
+    Without one: a compact shape of the reported size, grown outward from the incident point and the exact
+    detection points; if the detections cover more ground than the reported size (a stale report), they win.
+    Returns (arrival raster, description, detection cells used)."""
+    from scipy.ndimage import binary_dilation, distance_transform_edt
+    H, W = g["height"], g["width"]
+    dx, _, x0, _, ndy, y0 = g["transform"]
+    cell_ac = g["res_m"] ** 2 / 4046.856
+    arrival = lab["arrival"].copy()
+    other = lab["other"].astype(bool)
+    pts = _points(d, g, now)
+
+    def cells(lon, lat):
+        c = np.floor((np.asarray(lon) - x0) / dx).astype(int)
+        r = np.floor((np.asarray(lat) - y0) / ndy).astype(int)
+        ok = (r >= 0) & (r < H) & (c >= 0) & (c < W)
+        return r[ok], c[ok]
+    near_it = max(1, int(round(NEAR_KM * 1000 / g["res_m"])))
+    if fire.get("source") == "incident":
+        seed = np.zeros((H, W), bool)
+        ri, ci = cells([fire["lon"]], [fire["lat"]])
+        if not len(ri):
+            ri, ci = np.array([H // 2]), np.array([W // 2])
+        seed[ri, ci] = True
+        reach = binary_dilation(seed, iterations=int(round(3000 / g["res_m"])))   # same 3 km search as the fire list
+        nd = 0
+        if pts is not None and len(pts):
+            rr, cc = cells(pts["longitude"], pts["latitude"])
+            keep = reach[rr, cc]
+            seed[rr[keep], cc[keep]] = True
+            nd = int(keep.sum())
+        target = max(int(round((fire.get("acres") or 0) / cell_ac)), int(seed.sum()), 1)
+        dist = distance_transform_edt(~seed)
+        dist[other] = np.inf
+        order = np.argsort(dist, axis=None, kind="stable")[:target]
+        start = np.zeros(H * W, bool)
+        start[order] = True
+        arrival = np.where(start.reshape(H, W), 0, -1).astype(arrival.dtype)
+        how = (f"reported size ({fire.get('acres') or 0:g} ac) around the incident and {nd} detections"
+               + (" (detections cover more than the report)" if seed.sum() > round((fire.get("acres") or 0) / cell_ac) else ""))
+        return arrival, how, nd
+    core = arrival >= 0
+    near = binary_dilation(core, iterations=near_it) if core.any() else np.ones((H, W), bool)
+    added = 0
+    if pts is not None and len(pts):
+        newer = pts[pts["t"] > t_per]
+        rr, cc = cells(newer["longitude"], newer["latitude"])
+        ok = near[rr, cc] & ~other[rr, cc] & (arrival[rr, cc] < 0)
+        arrival[rr[ok], cc[ok]] = 0
+        added = int(ok.sum())
+    return arrival, f"perimeter + {added} newer detections", added
+
+
 def build_live(fire, out, hours=24, now=None):
     """Layers for one active fire (a row from active_fires) with the dataset's own stage code."""
     import geopandas as gpd
@@ -154,33 +230,17 @@ def build_live(fire, out, hours=24, now=None):
         BM.build_one(out, cat, g2, ["landfire"])
     info = _hrrr_live(d, g, now, hours)
     print(f"  HRRR: {info}", flush=True)
-    # the current fire = latest perimeter + VIIRS detections of the last 48 h (dilated to the 375 m footprint)
+    # the fire at forecast start (see start_fire): perimeter + newer satellite detections, or for a fire with no
+    # perimeter, a compact shape of its reported size around the incident and its detections
     lab = dict(np.load(d / "labels.npz"))
-    v = np.load(d / "viirs.npz")
-    dates = pd.to_datetime(v["dates"])
-    recent = dates >= (now.tz_convert(None) - pd.Timedelta(days=2)).normalize()
-    det = ((v["af_day"][recent].astype(int) + v["af_night"][recent]) > 0).any(0) if recent.any() else np.zeros(lab["arrival"].shape, bool)
-    arrival = lab["arrival"].copy()
-    # only detections near this fire count as part of it: hot pixels elsewhere in the box are other fires or
-    # field burns (Jefferson 359, AR, 2026-11-11: farm burns 10 km away were painted in and cut the forecast off
-    # at the grid edge). "Near" = within NEAR_KM of the perimeter, or of the incident point when it has none.
-    from scipy.ndimage import binary_dilation
-    core = arrival >= 0
-    if not core.any():
-        gy, gx = (np.array(core.shape) // 2)
-        core[gy, gx] = True
-    near = binary_dilation(core, iterations=max(1, int(round(NEAR_KM * 1000 / g["res_m"]))))
-    dropped = int((det & ~near).sum())
-    det &= near
-    if dropped:
-        print(f"  ignored {dropped} satellite-detection cells more than {NEAR_KM:g} km from the fire", flush=True)
-    arrival[det & (arrival < 0) & ~lab["other"]] = 0
+    arrival, how, det_cells = start_fire(d, g, fire, lab, now, t_per)
+    print(f"  start fire: {int((arrival >= 0).sum() * (g['res_m'] ** 2) / 4046.856)} ac ({how})", flush=True)
     lab.update(arrival=arrival, times=np.array([now.value, (now + pd.Timedelta(hours=hours)).value], np.int64),
-               burn_days=np.array([str(now.date())] * 2), map_methods=np.array(["perimeter + VIIRS 48 h"] * 2),
+               burn_days=np.array([str(now.date())] * 2), map_methods=np.array([how] * 2),
                sources=np.array(["live"] * 2))
     np.savez_compressed(d / "labels.npz", **lab)
     meta = dict(fire_id=fid, name=fire["name"], state=fire.get("state"), acres=fire.get("acres"), contained=fire.get("contained"),
-                perimeter_time=str(t_per), origin=str(now), hours=hours, hrrr=info, viirs_cells_48h=int(det.sum()),
+                perimeter_time=str(t_per), origin=str(now), hours=hours, hrrr=info, viirs_cells_48h=det_cells, start_method=how,
                 mode="live")
     (d / "live_meta.json").write_text(json.dumps(meta, indent=1))
     return d
