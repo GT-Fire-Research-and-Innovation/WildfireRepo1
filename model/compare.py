@@ -53,6 +53,11 @@ def main():
     if len(set(versions.values())) > 1:
         out.append("WARNING: evaluations use different label versions (not the same cells): "
                    + ", ".join(f"{n} v{v}" for n, v in versions.items()) + "\n")
+    leaky = [name for name, e in evals if e.get("input_version", 1) < 2]
+    if leaky:
+        out.append("WARNING: these evaluations used models or inputs from before the time-leak fix (satellite passes "
+                   "after the forecast start were visible); their scores are optimistic and not comparable: "
+                   + ", ".join(leaky) + "\n")
     out.append(f"## Test years, {n_pairs} perimeter pairs (all models scored on the same cells)\n")
     out.append(table(["model"] + [c for c, _, _ in COLS], rows))
     for key, title in BREAKDOWNS:

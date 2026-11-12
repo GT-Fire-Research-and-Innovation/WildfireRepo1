@@ -20,6 +20,8 @@ MIN_GAP_H, MAX_GAP_H = 3.0, 168.0          # pairs up to 7 days apart (98 % of k
 CLEAN_FAR_KM = 3.0                 # new burn farther than this with no satellite fire nearby -> unknown
 DATA_VERSION = 2                   # 2: per-pair satellite-support check on labels + isolated GOES pixels removed
                                    # 1: original behaviour (kept for checkpoints trained before the change)
+INPUT_VERSION = 2                  # 2: satellite inputs exclude passes after the forecast start (time-leak fix, 2026-11-11)
+                                   # 1: whole local day of the forecast start included (leaked up to ~22 h of the future)
 SUPPORT_MIN_CELLS = 20             # v2: new-burn patches at least this big (0.45 km² at 150 m) ...
 SUPPORT_KM, SUPPORT_FRAC = 1.0, 0.2    # ... with under 20 % of cells within 1 km of VIIRS/GOES fire -> unknown
 GOES_ISOLATED_KM, GOES_ISOLATED_H = 4.0, 3.0   # v2: a GOES pixel with no other within 4 km and 3 h is dropped
@@ -137,9 +139,13 @@ class Fire:
             local_j = (t_j.tz_convert(None) + pd.Timedelta(hours=lon_c / 15)).normalize()
             for k, dday in enumerate(days):
                 if local_i - pd.Timedelta(days=1) <= dday <= local_i:
-                    af24 += v["af_day"][k][sl]
-                    afn += v["af_night"][k][sl]
-                    frp = np.maximum(frp, v["frp_max"][k][sl].astype(np.float32))
+                    use_d, use_n = self.passes_before(dday, t_i)       # no satellite pass after t_i (time leak fix)
+                    if use_d:
+                        af24 += v["af_day"][k][sl]
+                    if use_n:
+                        afn += v["af_night"][k][sl]
+                    if use_d and use_n:                                # frp_max mixes both passes of the day
+                        frp = np.maximum(frp, v["frp_max"][k][sl].astype(np.float32))
                 if local_i - pd.Timedelta(days=1) <= dday <= local_j + pd.Timedelta(days=1):
                     evidence |= (v["af_day"][k] + v["af_night"][k]) > 0
         f["viirs"] = np.stack([np.minimum(af24, 4) / 4, np.minimum(afn, 4) / 4, np.log1p(frp) / 6]).astype(np.float32)
@@ -348,6 +354,38 @@ class Fire:
             mask &= ~self.unsupported(target & ~B0 & ~oth, evidence[sl])
         return f, phys, target, mask, B0
 
+    def passes_before(self, dday, t_i):
+        """Which satellite passes of local solar day `dday` ended before t_i: (day pass, night pass).
+        The daily VIIRS rasters hold a whole local day; a forecast starting at 02:00 must not see that day's
+        13:30 pass (it falls inside the forecast window). Pass times come from the fire's detection points
+        (points.csv.gz, the same local-day rule the rasters were built with). A pass with no detections has
+        nothing to leak. Without the points file, the day of t_i is left out entirely (safe)."""
+        ends = self.pass_ends()
+        if ends is None:
+            ok = dday.normalize() < (t_i.tz_convert(None) + pd.Timedelta(hours=self.g["transform"][2] / 15)).normalize()
+            return ok, ok
+        key = dday.strftime("%Y-%m-%d")
+        tu = t_i.tz_convert(None)
+        return (ends.get((key, "D"), tu) < tu or (key, "D") not in ends,
+                ends.get((key, "N"), tu) < tu or (key, "N") not in ends)
+
+    def pass_ends(self):
+        if not hasattr(self, "_pass_ends"):
+            self._pass_ends = None
+            p = self.d / "points.csv.gz"
+            if p.exists():
+                try:
+                    pts = pd.read_csv(p, usecols=["longitude", "acq_date", "acq_time", "daynight"])
+                    hhmm = pts["acq_time"].astype(int).astype(str).str.zfill(4)
+                    t = (pd.to_datetime(pts["acq_date"]) + pd.to_timedelta(hhmm.str[:2].astype(int), unit="h")
+                         + pd.to_timedelta(hhmm.str[2:].astype(int), unit="m"))
+                    local = (t + pd.to_timedelta(pts["longitude"] / 15.0, unit="h")).dt.strftime("%Y-%m-%d")
+                    kind = np.where(pts["daynight"].astype(str) == "N", "N", "D")
+                    self._pass_ends = {k: v for k, v in pd.Series(t.values, index=pd.MultiIndex.from_arrays([local, kind])).groupby(level=[0, 1]).max().items()}
+                except (ValueError, KeyError, OSError):
+                    self._pass_ends = None
+        return self._pass_ends
+
     def history(self, i, sl, v, h, w):
         """Day-by-day look back from t_i (unet3): for k = 0..5 days before t_i, the burned area at the
         latest observation not after t_i - k days, that local day's VIIRS detections (day + night),
@@ -370,7 +408,8 @@ class Fire:
                 hit = np.nonzero(days == local_i - pd.Timedelta(days=k))[0]
                 if len(hit):
                     q = int(hit[0])
-                    af = (v["af_day"][q][sl] + v["af_night"][q][sl]).astype(np.float32)
+                    use_d, use_n = self.passes_before(days[q], t_i)
+                    af = (v["af_day"][q][sl] * use_d + v["af_night"][q][sl] * use_n).astype(np.float32)
                     out[k, 1] = np.minimum(np.log1p(af) / np.log(5), 1.0)
         return out.reshape(SEQ_DAYS * SEQ_CH, h, w)
 

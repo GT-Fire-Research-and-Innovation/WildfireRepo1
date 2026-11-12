@@ -463,7 +463,7 @@ def main():
               f"burning {extra['effective_minutes_per_day']:.0f} min/day", flush=True)
     if arch:
         extra.update(arch=arch, width=a.width, params=sum(p.numel() for p in model.parameters()))
-    json.dump({"name": a.name, "mode": a.mode, "drop": a.drop, "data_version": D.DATA_VERSION, "weather": D.WEATHER_MODE, "val": best[2], "test": mt, "history": hist,
+    json.dump({"name": a.name, "mode": a.mode, "drop": a.drop, "data_version": D.DATA_VERSION, "input_version": D.INPUT_VERSION, "weather": D.WEATHER_MODE, "val": best[2], "test": mt, "history": hist,
                "pairs": rows, **extra}, open(runs / f"{a.name}.json", "w"), indent=1)
     print(f"[{a.name}] TEST AP {mt['ap']:.3f} F1 {mt['f1']:.3f} IoU {mt['iou']:.3f} P {mt['precision']:.3f} "
           f"R {mt['recall']:.3f} area {mt['area_ratio']:.2f}  edge {mt.get('edge_km_mean', float('nan')):.2f} km "
