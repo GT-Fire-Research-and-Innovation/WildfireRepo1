@@ -41,3 +41,15 @@ def test_without_detection_times_the_start_day_is_left_out():
     f.pass_ends = lambda: None
     assert f.passes_before(pd.Timestamp("2025-08-10"), t_i) == (False, False)
     assert f.passes_before(pd.Timestamp("2025-08-09"), t_i) == (True, True)
+
+
+def test_goes_pixel_waits_for_its_companion():
+    import numpy as np
+    t = pd.to_datetime(["2025-08-10 09:00", "2025-08-10 11:00", "2025-08-10 09:00"], utc=True)
+    gz = {"t": np.array(t.as_unit("ns").asi8), "lon": np.array([-120.0, -120.01, -121.0]), "lat": np.array([40.0, 40.0, 40.0])}
+    f = object.__new__(D.Fire)
+    comp = f.goes_companion_t(gz)
+    t_i = pd.Timestamp("2025-08-10 10:00", tz="UTC").value
+    assert comp[0] > t_i                 # its only companion (1 km away) appears at 11:00, after the forecast start
+    assert comp[0] == t[1].value and comp[1] == t[1].value
+    assert comp[2] == np.iinfo(np.int64).max     # isolated forever

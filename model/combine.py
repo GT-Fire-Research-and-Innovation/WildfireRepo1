@@ -1,6 +1,9 @@
 """
 Combine models from their saved per-cell forecasts (runs/preds_<eval>.npz, written by evaluate.py).
 No GPU and no retraining: everything is fitted on the validation year and scored on the test years.
+The 2023 validation fires are split in half: calibration and the router are FITTED on one half; the
+decision threshold and the choice of the best combination are made on the OTHER half, so the pick is not
+graded on the data it was fitted to.
 
   1. global calibration: one temperature + bias per model, fitted on validation (fixes the U-Net's
      inflated percentages; AP is unchanged because the ranking is unchanged)
@@ -133,10 +136,23 @@ def main():
     cv = {k: z0[f"val_{k}"] for k in ("y", "fuel", "wind", "gap", "grow", "size")}
     ct = {k: z0[f"test_{k}"] for k in ("y", "fuel", "wind", "gap", "grow", "size")}
     rows = data[a.members[0]][1]["pairs"]
-    idx = rng.choice(len(yv), min(FIT_CELLS, len(yv)), replace=False)
+    # split validation by fire: fit on half A, threshold + model choice on half B
+    vfire = np.repeat(z0["val_pair_fire"], z0["val_pair_cells"])
+    ufires = np.unique(z0["val_pair_fire"])
+    half_a = set(rng.permutation(ufires)[: len(ufires) // 2])
+    fit_a = np.isin(vfire, list(half_a))
+    sel_b = ~fit_a
+    print(f"validation: {len(ufires)} fires -> {len(half_a)} to fit ({int(fit_a.sum()):,} cells), "
+          f"{len(ufires) - len(half_a)} to choose ({int(sel_b.sum()):,} cells)", flush=True)
+    res["validation_split"] = dict(fit_fires=sorted(map(str, half_a)), fit_cells=int(fit_a.sum()), select_cells=int(sel_b.sum()))
+    pool = np.flatnonzero(fit_a)
+    idx = rng.choice(pool, min(FIT_CELLS, len(pool)), replace=False)
 
     def thr_on_val(sv):
-        return best_f1_threshold(sv, yv)
+        return best_f1_threshold(sv[sel_b], yv[sel_b])
+
+    def ap_sel(sv):
+        return float(average_precision_score(yv[sel_b], sv[sel_b]))
 
     print(f"\ntest: {len(yt):,} cells, {int(yt.sum()):,} burned, {len(rows)} windows")
     res["single"], cal_v, cal_t, val_ap = {}, {}, {}, {}
@@ -150,7 +166,7 @@ def main():
         m = score(n + " calibrated", cal_t[n], yt, ct, rows, thr_on_val(cal_v[n]))
         m["temperature"], m["bias"] = A, B
         res["single"][n + " calibrated"] = m
-        val_ap[n + " calibrated"] = float(average_precision_score(yv, cal_v[n]))
+        val_ap[n + " calibrated"] = ap_sel(cal_v[n])
 
     print("\naverages of calibrated probabilities")
     res["average"] = {}
@@ -161,9 +177,9 @@ def main():
             pt = np.mean([1 / (1 + np.exp(-cal_t[n])) for n in combo], 0)
             sv, st = np.log(pv + 1e-7) - np.log1p(-pv + 1e-7), np.log(pt + 1e-7) - np.log1p(-pt + 1e-7)
             res["average"][" + ".join(combo)] = score(" + ".join(combo), st, yt, ct, rows, thr_on_val(sv))
-            val_ap[" + ".join(combo)] = float(average_precision_score(yv, sv))
+            val_ap[" + ".join(combo)] = ap_sel(sv)
 
-    print("\nrouter (weights each model by gap, wind and fuel; fitted on validation)")
+    print("\nrouter (weights each model by gap and wind; fitted on validation half A)")
     sub = {k: v[idx] for k, v in cv.items()}
     lr = LogisticRegression(C=1.0, max_iter=3000).fit(router_features([cal_v[n][idx] for n in a.members], sub), yv[idx])
 
@@ -186,10 +202,10 @@ def main():
         "members": a.members, "features": "clip(z,-12,12); z*onehot(gap: <=12,12-36,36-72,>72 h); z*onehot(wind: <3,3-6,6-9,>=9 m/s)",
         "temps": {n: [float(res["single"][n + " calibrated"]["temperature"]), float(res["single"][n + " calibrated"]["bias"])] for n in a.members},
         "coef": [float(c) for c in lr.coef_[0]], "intercept": float(lr.intercept_[0]), "threshold": float(res["router"]["thr"])}
-    val_ap["router"] = float(average_precision_score(yv, sv))
+    val_ap["router"] = ap_sel(sv)
     best = max(val_ap, key=val_ap.get)
     res["best_on_validation"] = {"name": best, "val_ap": val_ap[best]}
-    print(f"\nbest on validation (the honest pick): {best} (val AP {val_ap[best]:.3f})")
+    print(f"\nbest on validation half B (the honest pick): {best} (val AP {val_ap[best]:.3f})")
 
     json.dump(res, open(runs / f"{a.out}.json", "w"), indent=1, default=float)
     write_md(res, runs / f"{a.out}.md")
@@ -197,7 +213,7 @@ def main():
 
 
 def write_md(res, path):
-    L = ["# Model combination (fitted on validation, scored on the test years)", ""]
+    L = ["# Model combination (fitted on half the 2023 fires, chosen on the other half, scored on the test years)", ""]
     if "h2h" in res:
         L += ["## Head-to-head windows by gap (TS-SatFire per-window metric)", "",
               "| windows | n | fires | F1 win | no-growth F1 win | skill over no growth |", "|---|---|---|---|---|---|"]
@@ -217,7 +233,7 @@ def write_md(res, path):
             d = {b["group"]: b for b in m[key]}
             L.append(f"| {k} | " + " | ".join(f"{d[n]['ap']:.2f} / {d[n]['f1']:.2f}" if n in d else "-" for n in names) + " |")
     b = res["best_on_validation"]
-    L += ["", f"Best on validation (pick this one, its test score is honest): **{b['name']}** (val AP {b['val_ap']:.3f})"]
+    L += ["", f"Best on validation half B (pick this one, its test score is honest): **{b['name']}** (val AP {b['val_ap']:.3f})"]
     w = res["router"]["weights"]
     L += ["", "## Router weights (how much each model's logit counts, by condition)", "",
           "| model | " + " | ".join(E.GAP_NAMES + E.WIND_NAMES) + " |", "|---|" + "---|" * 8]

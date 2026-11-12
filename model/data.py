@@ -20,7 +20,8 @@ MIN_GAP_H, MAX_GAP_H = 3.0, 168.0          # pairs up to 7 days apart (98 % of k
 CLEAN_FAR_KM = 3.0                 # new burn farther than this with no satellite fire nearby -> unknown
 DATA_VERSION = 2                   # 2: per-pair satellite-support check on labels + isolated GOES pixels removed
                                    # 1: original behaviour (kept for checkpoints trained before the change)
-INPUT_VERSION = 2                  # 2: satellite inputs exclude passes after the forecast start (time-leak fix, 2026-11-11)
+INPUT_VERSION = 3                  # 3: GOES input filter is causal (the isolated-pixel check looked up to 3 h ahead)
+                                   # 2: satellite inputs exclude passes after the forecast start (time-leak fix, 2026-11-11)
                                    # 1: whole local day of the forecast start included (leaked up to ~22 h of the future)
 SUPPORT_MIN_CELLS = 20             # v2: new-burn patches at least this big (0.45 km² at 150 m) ...
 SUPPORT_KM, SUPPORT_FRAC = 1.0, 0.2    # ... with under 20 % of cells within 1 km of VIIRS/GOES fire -> unknown
@@ -153,12 +154,17 @@ class Fire:
             f["seq"] = self.history(i, sl, v, h, w)
 
         # GOES: hours since a fire pixel was seen here (before t_i), detections and power in the last 6 h
-        gz = self.z("goes")
+        gz_raw = gz = self.z("goes")
         if gz is not None and DATA_VERSION >= 2 and len(gz["t"]):
             keep = self.goes_keep(gz)
             gz = {k: (v[keep] if getattr(v, "ndim", 0) == 1 and len(v) == len(keep) else v) for k, v in gz.items()}
         goes = np.zeros((4, h, w), np.float32)
         if gz is not None and "goes" not in hide and len(gz["t"]):
+            if INPUT_VERSION >= 3 and DATA_VERSION >= 2:
+                # input side: a pixel counts once a companion detection (4 km, 3 h) has been seen BY t_i;
+                # the label-side filter also looks up to 3 h past each pixel, which would leak into inputs
+                ok = self.goes_companion_t(gz_raw) <= pd.Timestamp(t_i).value
+                gz = {k: (v[ok] if getattr(v, "ndim", 0) == 1 and len(v) == len(ok) else v) for k, v in gz_raw.items()}
             t = pd.to_datetime(gz["t"], utc=True)
             before = (t <= t_i) & (t >= t_i - pd.Timedelta(hours=72))
             if before.any():
@@ -184,6 +190,9 @@ class Fire:
                 goes[3] = 1.0
         # GOES pixels during (t_i, t_j] count as label evidence too: v2 adds them even when the GOES
         # input is hidden, so labels never depend on which inputs were hidden (v1 kept the old coupling)
+        if gz_raw is not None and DATA_VERSION >= 2 and len(gz_raw["t"]):      # labels: the full (two-sided) filter
+            keep = self.goes_keep(gz_raw)
+            gz = {k: (v[keep] if getattr(v, "ndim", 0) == 1 and len(v) == len(keep) else v) for k, v in gz_raw.items()}
         if gz is not None and len(gz["t"]) and ("goes" not in hide or DATA_VERSION >= 2):
             t = pd.to_datetime(gz["t"], utc=True)
             dur = (t > t_i - pd.Timedelta(hours=24)) & (t <= t_j + pd.Timedelta(hours=24))
@@ -456,11 +465,35 @@ class Fire:
         lat0 = math.radians(float(np.mean(gz["lat"])))
         x = gz["lon"].astype(np.float64) * 111.32 * math.cos(lat0)
         y = gz["lat"].astype(np.float64) * 110.57
-        t = pd.to_datetime(gz["t"], utc=True).view("int64") / 3.6e12 * (GOES_ISOLATED_KM / GOES_ISOLATED_H)
+        ti = pd.to_datetime(gz["t"], utc=True)
+        t = np.asarray((ti.as_unit("ns") if hasattr(ti, "as_unit") else ti).asi8, np.float64) / 3.6e12 * (GOES_ISOLATED_KM / GOES_ISOLATED_H)
         tree = cKDTree(np.c_[x, y, t])
         counts = np.array([len(c) for c in tree.query_ball_point(np.c_[x, y, t], r=GOES_ISOLATED_KM)])
         self._goes_keep = counts > 1
         return self._goes_keep
+
+    def goes_companion_t(self, gz):
+        """For each GOES pixel, the time (ns) at which it stops looking isolated: the later of its own time and
+        the earliest OTHER detection within GOES_ISOLATED_KM / GOES_ISOLATED_H (int64 max if none). Used
+        for inputs, so a pixel is only trusted once its companion has actually been observed."""
+        if getattr(self, "_goes_comp", None) is not None and len(self._goes_comp) == len(gz["t"]):
+            return self._goes_comp
+        from scipy.spatial import cKDTree
+        lat0 = math.radians(float(np.mean(gz["lat"])))
+        x = gz["lon"].astype(np.float64) * 111.32 * math.cos(lat0)
+        y = gz["lat"].astype(np.float64) * 110.57
+        ti = pd.to_datetime(gz["t"], utc=True)
+        tn = np.asarray((ti.as_unit("ns") if hasattr(ti, "as_unit") else ti).asi8, np.int64)   # ns whatever the stored unit
+        t = tn / 3.6e12 * (GOES_ISOLATED_KM / GOES_ISOLATED_H)
+        tree = cKDTree(np.c_[x, y, t])
+        big = np.iinfo(np.int64).max
+        comp = np.full(len(tn), big, np.int64)
+        for k, nb in enumerate(tree.query_ball_point(np.c_[x, y, t], r=GOES_ISOLATED_KM)):
+            others = [j for j in nb if j != k]
+            if others:
+                comp[k] = max(tn[k], tn[others].min())
+        self._goes_comp = comp
+        return comp
 
     def rothermel(self, fb, gmv, u, v, slope_deg, aspect_deg, h, w):
         import torch
