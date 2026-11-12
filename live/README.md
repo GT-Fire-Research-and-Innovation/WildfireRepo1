@@ -1,18 +1,22 @@
-# SpreadWatch: live wildfire map
+# GT Fire Prediction: live wildfire map
 
 A public map for crews and planners: live NIFC perimeters, incident locations and VIIRS satellite
 hotspots, plus the project's 24-hour spread forecast for every actively burning fire.
 
-- **Map app:** `site/` (static: Leaflet, no build step). The browser pulls perimeters, incidents and
+- **Map app:** `site/` (static: MapLibre GL, no build step). The browser pulls perimeters, incidents and
   hotspots straight from the NIFC/Esri services every 5 minutes.
 - **Forecasts:** `.github/workflows/live-forecast.yml` runs every 2 hours on GitHub Actions:
   `live/publish.py` lists active fires, builds each one's inputs from live sources (DEM, LANDFIRE,
   GRIDMET, FIRMS VIIRS, latest HRRR forecast) with the training pipeline's own code, runs the model,
   and writes `site/data/index.json` + `site/data/forecast/<fire>.json` (the forecast on the model's own 150 m cells). The workflow then deploys
   `site/` to GitHub Pages.
-- **Retraining feed:** each run also archives every new NIFC perimeter version to the
-  `perimeter-archive` branch (`live/wfigs_poller.py`), the raw material for adding new fires to the
-  training set.
+- **Retraining feed:** `.github/workflows/perimeter-capture.yml` saves every new NIFC perimeter version
+  to the `perimeter-archive` branch every 15 minutes (`live/wfigs_poller.py`), the raw material for adding
+  new fires to the training set.
+- **Starting fire:** a fire with a perimeter starts from it plus any satellite detection made after it
+  (within 2 km, one 150 m cell each). A fire with no perimeter starts as a compact shape of its reported
+  size around the incident point and its detections; forecasts for fires with no recent satellite heat
+  are marked with an asterisk.
 - **Off season:** when no fire is actively burning, the app shows a labelled replay example
   (`site/data/example/`, made with `live/make_example.py`).
 
@@ -26,7 +30,8 @@ hotspots, plus the project's 24-hour spread forecast for every actively burning 
    `https://<owner>.github.io/<repo>/` (the run's deploy step prints the link).
 
 Until trained weights are added, forecasts use the physics-only model (Rothermel + crown fire +
-embers, test AP 0.093). Add the router for the real forecasts (test AP 0.336):
+embers). Add the router for the real forecasts. Model scores before the v3 retrain (Nov 2026) came from
+inputs that could see satellite passes after the forecast start and are optimistic; use the v3 numbers.
 
 ## Publishing the trained models (on PACE-ICE)
 
@@ -36,7 +41,7 @@ python live/export_models.py --runs ~/scratch/wildfire/my/runs --combine combine
 git add -f live/models && git commit -m "live models" && git push
 ```
 
-`combine_unet3` is tonight's router refit; use `--combine combine` for the first router. `git push`
+Use the newest router refit for `--combine` (after `scripts/ice_v3.sh`: `combine_v3`). `git push`
 from ICE needs a GitHub personal access token (fine-grained, this repository, Contents: read and
 write), typed when git asks for a password. The next scheduled run picks the models up.
 
@@ -53,7 +58,7 @@ Experimental research forecast, not an official product. The app says so on ever
 
 The model keeps learning from fires as they happen:
 
-1. **Collect** (every 2 h, GitHub Actions): every new NIFC perimeter version is saved to the
+1. **Collect** (every 15 min, GitHub Actions): every new NIFC perimeter version is saved to the
    `perimeter-archive` branch. Perimeters come from NIFC's Current service *and* the Year-to-Date
    service, because Current drops active fires whose incident record went stale.
 2. **Catalog** (weekly, ICE): `pipeline/archive_catalog.py` turns the archive into training fires with
