@@ -53,11 +53,17 @@ class Model:
             print("  !! router.json found but some weights are missing: using the physics-only model", flush=True)
             self.router = None
         if self.router:
-            self.members = [E.Member(md, f"{m['name']}:{m['mode']}", None, TH.groups_used(set()), "cpu", 150.0, 32)
-                            for m in self.router["members"]]
+            try:
+                self.members = [E.Member(md, f"{m['name']}:{m['mode']}", None, TH.groups_used(set()), "cpu", 150.0, 32)
+                                for m in self.router["members"]]
+            except Exception as ex:                # a bad or mismatched weights file must not stop the forecasts
+                print(f"  !! could not load the router models ({type(ex).__name__}: {ex}); using the physics-only model", flush=True)
+                self.router = None
+                D.TEMPORAL = False
+        if self.router:
             names = ", ".join(m["name"] for m in self.router["members"])
-            self.label = dict(kind="router", name=f"Router ({names})",
-                              note="Calibrated U-Net + physics-guided hybrids, weighted by forecast length and wind",
+            self.label = dict(kind="router", name=f"Router of {len(self.router['members'])} models ({names})",
+                              note="Calibrated U-Nets (with 6-day fire history) and physics-guided hybrids, weighted by forecast length and wind.",
                               test_ap=(self.router.get("test_scores") or {}).get("router"))
         else:
             self.members = [E.Member(md / "_none", "_default:physics2", None, TH.groups_used(set()), "cpu", 150.0, 32)]
