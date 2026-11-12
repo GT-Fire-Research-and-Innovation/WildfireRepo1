@@ -20,7 +20,10 @@ MIN_GAP_H, MAX_GAP_H = 3.0, 168.0          # pairs up to 7 days apart (98 % of k
 CLEAN_FAR_KM = 3.0                 # new burn farther than this with no satellite fire nearby -> unknown
 DATA_VERSION = 2                   # 2: per-pair satellite-support check on labels + isolated GOES pixels removed
                                    # 1: original behaviour (kept for checkpoints trained before the change)
-INPUT_VERSION = 3                  # 3: GOES input filter is causal (the isolated-pixel check looked up to 3 h ahead)
+INPUT_VERSION = 4                  # 4: suppression layers of the PREVIOUS burn day (the day's own layers are the map at 06:00
+                                   #    the next morning, up to 24 h after the forecast start, incl. the new uncontrolled edge);
+                                   #    fire size, distance to fire and relative elevation no longer depend on the crop window
+                                   # 3: GOES input filter is causal (the isolated-pixel check looked up to 3 h ahead)
                                    # 2: satellite inputs exclude passes after the forecast start (time-leak fix, 2026-11-11)
                                    # 1: whole local day of the forecast start included (leaked up to ~22 h of the future)
 SUPPORT_MIN_CELLS = 20             # v2: new-burn patches at least this big (0.45 km² at 150 m) ...
@@ -120,11 +123,11 @@ class Fire:
         age1 = ((t_i - self.times[i - 1]).total_seconds() / 3600 if i >= 1 else 0.0) / 48
         age2 = ((t_i - self.times[i - 2]).total_seconds() / 3600 if i >= 2 else 0.0) / 48
         ck = self.cell_km
-        dist = distance_transform_edt(~B0) * ck if B0.any() else np.full((h, w), 30.0)
+        dist = self.fire_distance(i)[sl]                      # from the whole fire, not just the part inside the window
         oth = self.other[sl]
         full = lambda v: np.full((h, w), v, np.float32)  # noqa: E731
         f["fire"] = np.stack([B0, B1, B2, full(age1), full(age2), full(gap_h / 48), np.clip(dist, 0, 15) / 15,
-                              np.exp(-dist / 2), oth, full(math.log1p(B0.sum() * ck * ck) / 8),
+                              np.exp(-dist / 2), oth, full(math.log1p(self.burned(i).sum() * ck * ck) / 8),
                               full(math.sin(2 * math.pi * (t_i.hour + self.g["transform"][2] / 15) / 24))]).astype(np.float32)
 
         # VIIRS (FIRMS) over the 24 h before t_i (local solar days)
@@ -209,7 +212,8 @@ class Fire:
         slope = ter["slope"][sl].astype(np.float32)
         asp = np.radians(ter["aspect"][sl].astype(np.float32))
         elev = ter["elev"][sl].astype(np.float32)
-        f["terrain"] = np.stack([(elev - elev.mean()) / 500, slope / 45, np.sin(asp) * slope / 45, np.cos(asp) * slope / 45,
+        f["terrain"] = np.stack([(elev - self.fire_elev(i, ter)) / 500,   # relative to the fire's own mean elevation
+ slope / 45, np.sin(asp) * slope / 45, np.cos(asp) * slope / 45,
                                  ter["tpi_500m"][sl].astype(np.float32) / 100, ter["tpi_2km"][sl].astype(np.float32) / 300,
                                  ter["rough"][sl].astype(np.float32) / 50])
 
@@ -327,7 +331,9 @@ class Fire:
         sup = np.zeros((12, h, w), np.float32)
         if sz is not None and "suppression" not in hide:
             dates = list(sz["dates"])
-            local_i = str((t_i.tz_convert(None) + pd.Timedelta(hours=self.g["transform"][2] / 15 - 6)).date())
+            # day d's layers = the map at 06:00 local on d+1, so the newest map that exists at t_i is the
+            # PREVIOUS burn day's (as of 06:00 on the burn day containing t_i)
+            local_i = str((t_i.tz_convert(None) + pd.Timedelta(hours=self.g["transform"][2] / 15 - 6 - 24)).date())
             if local_i in dates:
                 k = dates.index(local_i)
                 n_ch = int(sz["n_channels"])
@@ -362,6 +368,25 @@ class Fire:
         if DATA_VERSION >= 2:
             mask &= ~self.unsupported(target & ~B0 & ~oth, evidence[sl])
         return f, phys, target, mask, B0
+
+    def fire_distance(self, i):
+        """Distance (km) of every cell of the grid to the fire at perimeter i (30 when nothing has burned)."""
+        if getattr(self, "_dist_i", None) != i:
+            from scipy.ndimage import distance_transform_edt
+            b = self.burned(i)
+            self._dist = (distance_transform_edt(~b) * self.cell_km).astype(np.float32) if b.any() \
+                else np.full((self.H, self.W), 30.0, np.float32)
+            self._dist_i = i
+        return self._dist
+
+    def fire_elev(self, i, ter):
+        """Mean elevation of the burned area at perimeter i (the whole grid's mean if nothing has burned)."""
+        if getattr(self, "_elev_i", None) != i:
+            b = self.burned(i)
+            e = ter["elev"]
+            self._elev = float(e[b].mean()) if b.any() else float(e.mean())
+            self._elev_i = i
+        return self._elev
 
     def passes_before(self, dday, t_i):
         """Which satellite passes of local solar day `dday` ended before t_i: (day pass, night pass).

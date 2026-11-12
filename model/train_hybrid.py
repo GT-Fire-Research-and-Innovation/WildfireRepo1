@@ -163,6 +163,14 @@ class Crops(torch.utils.data.Dataset):
             for g, chans in flip_x_channels(self.groups).items():
                 for ch in chans:
                     x[ch] *= -1
+        if rng.random() < 0.5:   # north-south flips too (rows run north to south)
+            x, y, m, b0 = x[..., ::-1, :], y[::-1], m[::-1], b0[::-1]
+            phys = {k: v[::-1] for k, v in phys.items()}
+            phys["head_y"] = -phys["head_y"]
+            x = x.copy()
+            for g, chans in flip_y_channels(self.groups).items():
+                for ch in chans:
+                    x[ch] *= -1
         P = phys_stack(phys)
         return (torch.from_numpy(pad8(x, CROP).astype(np.float32)), torch.from_numpy(pad8(P, CROP).astype(np.float32)),
                 torch.from_numpy(pad8(y[None], CROP)[0].copy()), torch.from_numpy(pad8(m[None], CROP)[0].copy()),
@@ -172,10 +180,22 @@ class Crops(torch.utils.data.Dataset):
 def flip_x_channels(groups):
     """Channel indices whose sign flips under an east-west mirror."""
     out, base = {}, 0
-    xs = {"terrain": [2], "hrrr": [0], "physics": [2], "weather": [], "hrrr_seq": [0, 4, 8, 12]}
+    xs = {"terrain": [2], "hrrr": [0], "physics": [2], "weather": [7], "hrrr_seq": [0, 4, 8, 12]}   # weather 7 = sin(wind dir)
     for g in groups:
         if g in xs:
             out[g] = [base + j for j in xs[g]]
+        base += D.GROUPS[g]
+    return out
+
+
+def flip_y_channels(groups):
+    """Channel indices whose sign flips under a north-south mirror (GRIDMET wind direction enters only as
+    its sine, the east-west part, so it is unchanged)."""
+    out, base = {}, 0
+    ys = {"terrain": [3], "hrrr": [1], "physics": [3], "hrrr_seq": [1, 5, 9, 13]}
+    for g in groups:
+        if g in ys:
+            out[g] = [base + j for j in ys[g]]
         base += D.GROUPS[g]
     return out
 

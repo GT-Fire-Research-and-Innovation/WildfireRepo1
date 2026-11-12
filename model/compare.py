@@ -53,7 +53,7 @@ def main():
     if len(set(versions.values())) > 1:
         out.append("WARNING: evaluations use different label versions (not the same cells): "
                    + ", ".join(f"{n} v{v}" for n, v in versions.items()) + "\n")
-    leaky = [name for name, e in evals if e.get("input_version", 1) < 3]
+    leaky = [name for name, e in evals if e.get("input_version", 1) < 4]
     if leaky:
         out.append("WARNING: these evaluations used inputs from before the time-leak fixes (satellite passes or GOES checks "
                    "after the forecast start were visible); their scores are optimistic and not comparable: "

@@ -105,8 +105,12 @@ def _hrrr_live(d, g, now, hours):
     cs = math.cos(math.radians(float(glat.mean())))
     _, idx = cKDTree(np.c_[hlat.ravel(), hlon.ravel() * cs]).query(np.c_[glat.ravel(), glon.ravel() * cs])
     shape4 = (0, 4, r1 - r0, c1 - c0)
-    np.savez_compressed(d / "hrrr.npz", times=np.array([t.value for t in ana_t], np.int64),
-                        fields=np.array(ana, np.float16).reshape(-1, *shape4[1:]) if ana else np.zeros(shape4, np.float16),
+    # The models were trained on the weather DURING the forecast window (HRRR analyses). Live, the HRRR
+    # forecast for the window stands in for it: forecast steps go into `fields` after the analyses, so the
+    # loader (WEATHER_MODE "observed") reads the window's weather from the forecast, not from yesterday.
+    all_t, all_f = ana_t + fc_t, ana + fc
+    np.savez_compressed(d / "hrrr.npz", times=np.array([t.value for t in all_t], np.int64),
+                        fields=np.array(all_f, np.float16).reshape(-1, *shape4[1:]) if all_f else np.zeros(shape4, np.float16),
                         fc_times=np.array([t.value for t in fc_t], np.int64),
                         fc=np.array(fc, np.float16).reshape(-1, *shape4[1:]) if fc else np.zeros(shape4, np.float16),
                         fc_issued=np.array([issued.value] * len(fc_t), np.int64) if fc else np.zeros(0, np.int64),
@@ -253,7 +257,7 @@ def forecast(d, weights=None, mode="physics2", pair=0, hours=None, out=None):
     import data as D
     import evaluate as E
     import train_hybrid as TH
-    D.WEATHER_MODE = "forecast"
+    D.WEATHER_MODE = "observed"      # live hrrr.npz carries the forecast as the window's weather (see _hrrr_live)
     D.PHYSICS_V2 = True
     pca = None
     f = D.Fire(d, pca)
@@ -279,7 +283,7 @@ def forecast(d, weights=None, mode="physics2", pair=0, hours=None, out=None):
     meta = dict(fire_id=f.fid, name=f.g["name"], year=f.year, origin=str(t_i), hours=gap, pair=pair,
                 transform=f.g["transform"], height=f.H, width=f.W, res_m=f.res_m,
                 model=f"{mode}" + (f" ({Path(weights).name})" if weights else " (default physics settings)"),
-                weather="forecast-only (HRRR analyses up to the origin + forecasts issued before it)")
+                weather="HRRR forecast for the window (live) or analyses (replay)")
     if (Path(d) / "live_meta.json").exists():
         meta.update(json.loads((Path(d) / "live_meta.json").read_text()))
     meta["mode"] = "live" if (Path(d) / "live_meta.json").exists() else "replay"

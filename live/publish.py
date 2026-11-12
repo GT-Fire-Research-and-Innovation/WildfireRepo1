@@ -43,7 +43,7 @@ class Model:
         import evaluate as E
         import train_hybrid as TH
         import data as D
-        D.WEATHER_MODE = "forecast"
+        D.WEATHER_MODE = "observed"      # the live hrrr.npz carries the HRRR forecast as the window's weather
         D.PHYSICS_V2 = True
         self.E, self.TH, self.D = E, TH, D
         md = Path(models_dir)
@@ -204,7 +204,9 @@ def layers(f, feats, phys, b0, p):
 
 def summary(f, feats, b0, p):
     cell_ac = (f.res_m ** 2) / ACRE_M2
-    out = dict(expected_new_acres=int(round(float(p[~b0].sum()) * cell_ac)),
+    # expected growth counts only cells with at least a 5% chance: thousands of cells at a fraction of a
+    # percent each otherwise add up to hundreds of acres around small fires
+    out = dict(expected_new_acres=int(round(float(p[(~b0) & (p >= 0.05)].sum()) * cell_ac)),
                likely_acres=int(round(float(((p >= 0.5) & ~b0).sum()) * cell_ac)),
                possible_acres=int(round(float(((p >= 0.1) & ~b0).sum()) * cell_ac)),
                start_acres=int(round(float(b0.sum()) * cell_ac)))
