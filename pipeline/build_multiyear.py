@@ -407,13 +407,25 @@ def st_green(g, ctx):
         url, body = (nxt[0]["href"], nxt[0].get("body", body)) if nxt else (None, None)
     if not items:
         return dict(missing=np.array(True))
-    tok = sess.get(f"{api}/sas/v1/token/modis-13Q1-061", timeout=60).json()["token"]
     H, W = g["height"], g["width"]
     tr = Affine(*g["transform"])
+    tokens = {}
+
+    def signed(href):
+        """The read token belongs to the storage container the file sits in (the image files are in a
+        different container from the one the collection names), so ask for it by account and container."""
+        from urllib.parse import urlparse
+        u = urlparse(href)
+        key = (u.netloc.split(".")[0], u.path.lstrip("/").split("/")[0])
+        if key not in tokens:
+            r = sess.get(f"{api}/sas/v1/token/{key[0]}/{key[1]}", timeout=60)
+            r.raise_for_status()
+            tokens[key] = r.json()["token"]
+        return f"{href}?{tokens[key]}"
 
     def read(href, resampling):
         with rasterio.Env(GDAL_DISABLE_READDIR_ON_OPEN="EMPTY_DIR"):
-            with rasterio.open(f"{href}?{tok}") as src:
+            with rasterio.open(signed(href)) as src:
                 with WarpedVRT(src, crs="EPSG:4326", transform=tr, width=W, height=H, resampling=resampling) as vrt:
                     return vrt.read(1)
 
@@ -422,7 +434,7 @@ def st_green(g, ctx):
         p = it["properties"]
         end = pd.Timestamp(p.get("end_datetime") or p.get("datetime")).tz_convert("UTC").floor("D")
         by_end.setdefault(end, []).append(it)
-    ends, ndvi, evi, rel = [], [], [], []
+    ends, ndvi, evi, rel, failed = [], [], [], [], 0
     for end in sorted(by_end):
         nd = np.full((H, W), -32768, np.int16)
         ev = np.full((H, W), -32768, np.int16)
@@ -434,7 +446,9 @@ def st_green(g, ctx):
                 y = read(a["250m_16_days_EVI"]["href"], Resampling.bilinear)
                 q = read(a["250m_16_days_pixel_reliability"]["href"], Resampling.nearest)
             except Exception as ex:  # noqa: BLE001
-                print(f"    {g['fire_id']}: greenness tile failed ({str(ex)[:80]})", flush=True)
+                failed += 1
+                if failed <= 2:
+                    print(f"    {g['fire_id']}: greenness tile failed ({str(ex)[:80]})", flush=True)
                 continue
             ok = (x > -3000) & (nd == -32768)
             nd[ok], ev[ok], rl[ok] = x[ok], y[ok], q[ok]
@@ -444,6 +458,8 @@ def st_green(g, ctx):
             evi.append(ev)
             rel.append(rl)
     if not ends:
+        if failed:                                           # a download problem, not a gap in the data: leave no
+            raise RuntimeError(f"all {failed} greenness tiles failed")   # file behind, so the next run tries again
         return dict(missing=np.array(True))
     return dict(ends=np.array(ends, np.int64), ndvi=np.stack(ndvi), evi=np.stack(evi), reliability=np.stack(rel),
                 scale=np.array(1e-4), missing=np.array(False))
