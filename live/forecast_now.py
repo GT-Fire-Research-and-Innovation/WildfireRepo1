@@ -59,6 +59,13 @@ def active_fires(min_acres=100, max_age_days=60):
         w, s, e, n = geom.bounds
         pad = 0.05
         near = det[(det.longitude.between(w - pad, e + pad)) & (det.latitude.between(s - pad, n + pad))] if len(det) else det
+        if len(near):
+            # only heat within NEAR_KM of the perimeter itself counts as this fire's: the box above also catches
+            # field and prescribed burns a few km away (2026-11-12: a month-old 140 ac Mississippi perimeter
+            # was forecast to grow 900 ac because of 9 detections nearby)
+            import shapely
+            zone = geom.buffer(NEAR_KM / 111.0)
+            near = near[shapely.contains_xy(zone, near.longitude.values, near.latitude.values)]
         rows.append(dict(id=p["attr_UniqueFireIdentifier"], name=p["attr_IncidentName"], state=p.get("attr_POOState"),
                          acres=round(p["poly_GISAcres"] or 0), contained=p.get("attr_PercentContained"),
                          updated=t.isoformat(), lon=round(geom.centroid.x, 4), lat=round(geom.centroid.y, 4),
