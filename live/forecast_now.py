@@ -49,9 +49,10 @@ def active_fires(min_acres=100, max_age_days=60):
     rows = []
     for f in r.get("features", []):
         p = f["properties"]
-        if not f.get("geometry") or not p.get("poly_PolygonDateTime"):
+        stamp = p.get("poly_PolygonDateTime") or p.get("poly_DateCurrent")     # no mapping time: the edit time (about 1 % live)
+        if not f.get("geometry") or not stamp:
             continue
-        t = pd.to_datetime(p["poly_PolygonDateTime"], unit="ms", utc=True)
+        t = pd.to_datetime(stamp, unit="ms", utc=True)
         if (now - t).days > max_age_days:
             continue
         geom = shape(f["geometry"])

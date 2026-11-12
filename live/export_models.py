@@ -23,7 +23,7 @@ def main():
     rm = res.get("router_model")
     if not rm:
         raise SystemExit(f"{a.combine}.json has no router_model: rerun combine.py with the current code")
-    members = []
+    members, versions = [], []
     for ev in rm["members"]:
         spec = json.loads((runs / f"eval_{ev}.json").read_text())["models"][0]
         name, _, mode = spec.partition(":")
@@ -31,12 +31,19 @@ def main():
             mode = next(m for m in ("physics2", "hybrid2", "unet3", "unet2", "physics", "unet", "hybrid") if name.startswith(m))
         src = runs / f"{name}.pt"
         shutil.copy2(src, out / src.name)
-        members.append(dict(eval=ev, name=name, mode=mode, file=src.name))
+        meta = runs / f"{name}.json"            # the run record: which input groups the model dropped, input version
+        iv = 1
+        if meta.exists():
+            shutil.copy2(meta, out / meta.name)
+            iv = int(json.loads(meta.read_text()).get("input_version", 1))
+        versions.append(iv)
+        members.append(dict(eval=ev, name=name, mode=mode, file=src.name, input_version=iv))
         print(f"  {ev}: {src.name} ({mode}, {src.stat().st_size / 1e6:.1f} MB)")
     router = dict(members=members, temps=rm["temps"], coef=rm["coef"], intercept=rm["intercept"],
                   threshold=rm.get("threshold"), features=rm["features"], source=f"{a.combine}.json",
                   test_scores={k: round(v["ap"], 3) for k, v in [("router", res["router"])]},
-                  best_on_validation=res.get("best_on_validation"))
+                  best_on_validation=res.get("best_on_validation"),
+                  input_version=min(versions) if versions else 1)
     (out / "router.json").write_text(json.dumps(router, indent=1))
     print(f"wrote {out / 'router.json'} ({len(members)} models)")
 

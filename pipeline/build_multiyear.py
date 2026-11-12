@@ -121,8 +121,11 @@ def st_labels(g, ctx):
     cand = cand[(cand.fire_id != g["fire_id"]) & (cand.perim_time >= t0) & (cand.perim_time <= t1 + pd.Timedelta(days=30))]
     other = rasterize(list(cand.geometry.values), g) & (arrival < 0)
     txt = lambda c: np.array([str(v) for v in p[c]], dtype="U")  # noqa: E731  (plain unicode: loads without pickle)
-    return dict(arrival=arrival, other=other, times=p.perim_time.astype("int64").values,
-                burn_days=txt("burn_day"), map_methods=txt("map_method"), sources=txt("source"))
+    out = dict(arrival=arrival, other=other, times=p.perim_time.astype("datetime64[ns, UTC]").astype("int64").values,
+               burn_days=txt("burn_day"), map_methods=txt("map_method"), sources=txt("source"))
+    if "time_source" in p:                   # catalogs built after 2026-11: times are true UTC, each with its source
+        out.update(time_sources=txt("time_source"), times_utc=np.array(True))
+    return out
 
 
 def st_history(g, ctx):

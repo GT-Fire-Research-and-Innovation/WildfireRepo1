@@ -543,6 +543,22 @@ def clean(gdf, keep_methods=None):
     if before - len(gdf):
         drops["older archive version"] = before - len(gdf)
 
+    # A perimeter saved as several records with the same time (separate pieces of the fire, or a
+    # complex's member fires) is ONE perimeter: join the pieces. Keeping only the largest record used
+    # to lose more than 10 % of the area of about 1 % of perimeters (68 fires, 30 of them > 50 %).
+    same = gdf.groupby(["incident", "perim_time"])["geometry"].transform("size") > 1
+    if same.any():
+        joined = []
+        for _, grp in gdf[same].groupby(["incident", "perim_time"], sort=False):
+            best = grp.sort_values(["method_rank", "acres_calc"], ascending=[True, False]).iloc[[0]].copy()
+            u = _safe_valid(shapely.union_all(list(grp.geometry.values)))
+            if u is not None and not u.is_empty:
+                best["geometry"] = [u]
+            joined.append(best)
+        drops["pieces joined into one perimeter"] = int(same.sum()) - len(joined)
+        gdf = pd.concat([gdf[~same]] + joined)
+        gdf["acres_calc"] = gdf.to_crs(5070).area / 4046.8564224
+
     # One perimeter per incident per burn day: the latest, then best map method, then largest.
     gdf = gdf.sort_values(["incident", "burn_day", "perim_time", "method_rank", "acres_calc"],
                           ascending=[True, True, False, True, False])

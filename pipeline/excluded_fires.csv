@@ -1,0 +1,163 @@
+fire_id,name,year,why,kept,kept_name
+F05e5e0dece,Paradise_KNP Complex,2021,duplicate,Ff3bb327da3,Paradise_KNP Complex
+F6b29feedb3,Drumming,2020,duplicate,F7e83d7e47c,Drumming
+F1cf90f4067,Springs,2019,duplicate,F85c5e5c690,SPRINGS
+Fb602d594af,Frying Pan Faulkstein,2014,duplicate,Fb58146e016,Happy Camp Complex
+Faf65427aae,Reach,2015,duplicate,F892be9de0e,Chelan Complex
+F926614fdfe,Cronan (River Complex),2021,duplicate,F328f88bc94,Cronan (River Complex)
+F7725822cb8,Oregon Gulch,2014,duplicate,F4f6c3993c5,Beaver Creek Complex
+Fa4372488c2,Surprise Creek,2018,duplicate,Fff86354cb2,Surprise Creek
+F022d59609c,Eaton,2025,duplicate,F31670c74f3,Eaton
+F47cf641979,Northeast Kootenai Complex,2015,duplicate,F5475930b26,Marston
+F989f4f10db,Slater,2020,duplicate,Fa7db4fd7e8,Slater
+F5611005858,August Complex South Zone,2020,duplicate,F5ae5f08c4e,August Complex South Zone
+Fab009d55e7,Kaniksu Complex,2015,duplicate,F8765566386,Tower
+F1a8510acf0,Johnson,2015,duplicate,F7013be37b2,Route Complex
+F8ff5575075,Whiskey Complex,2014,duplicate,F825e3b032a,Wash
+F1e174f9ff2,Summer (River Complex),2021,duplicate,F12358c4417,Summer (River Complex)
+F3a5632ff41,Johnson,2021,duplicate,F7559aadcee,Johnson
+F72d68767c6,Thorne Creek,2021,duplicate,F89b55f61a5,Thorne Creek
+F5ae5f08c4e,August Complex South Zone,2020,duplicate,F2617f65528,August Complex
+F9c61d59814,Thompson Divide Complex,2015,duplicate,Fcb52ddf3b5,Thompson
+F4a1c58b208,Tumbledown (Stateline Complex),2021,duplicate,Fac6b7ba960,Stateline Complex
+F513fbf2456,Upper Skagit Complex,2015,duplicate,F93aacec83b,Goodell
+Fb0013f9bcc,Twin,2015,duplicate,F5de35b3487,Grizzly Bear Complex
+F362f577e36,Bailey Butte,2014,duplicate,F98f0b8ca1e,Waterman Complex
+F7f10aa12ba,Table Rock,2025,duplicate,F56032e5f44,Table Rock
+Fe08be3ef9a,Potter,2024,duplicate,F2e58e82692,Potter
+Ffbc0716e76,Middle Fork Complex,2015,duplicate,F4668748433,Waterfall
+Fc8f063d056,Napoleon 3,2015,duplicate,F84a9c55765,Star Gulch
+F11d8c5403d,Coffee,2014,duplicate,F6fec3ae8c0,Coffee Complex
+F6783959303,South Steens Complex,2014,duplicate,F82ca1f3ebb,Bone Creek Basin
+F92590ae2a1,Kettle North Complex,2015,duplicate,Fa42076032c,Stickpin
+Fae88d5f237,July Complex,2014,duplicate,F6a1ef1b7eb,White
+Fb9b9b9a22c,Stoner Mesa,2025,duplicate,F5e759082aa,Stoner Mesa
+Fbe054626aa,Nash,2017,duplicate,F9111bd4eb3,MR Separation
+F39034983fd,Thorne Creek,2021,duplicate,F89b55f61a5,Thorne Creek
+F57f392bdf9,Backbone,2025,duplicate,F90211a655d,PINNACLE
+Ff3591cac2d,North Grizzly,2015,duplicate,Fef88fc9d30,Grizzly Complex
+Fc44fd65b18,Slide,2015,duplicate,F0e9067be15,Wash
+Fd9cccdcc6d,Lawyer 2,2015,duplicate,Fb0543a9100,Clearwater Complex
+Fbe7efe90d6,Crescent,2015,duplicate,F801a65b35e,National Creek Complex
+F2845b6ce0d,Murderers South,2014,duplicate,F4200616acc,South Fork Complex
+Fe0dbd0267e,Jar Complex,2015,duplicate,F3a1a4a4ee7,Mason Jar CX
+F84a9c55765,Star Gulch,2015,duplicate,Fc091fbac46,Clark Fork Complex
+F533a66daec,Brogan Hill,2014,duplicate,Fcbb2805dc4,Kitten Complex
+F5e8e16b798,Avery Complex,2015,duplicate,F3c9de85ffb,Marble Creek
+Fdb51ff9bcf,Trestle Creek Complex,2021,duplicate,F896f5effd6,Trestle Creek Complex
+F6a4e8c4f54,SPUR,2021,duplicate,F92bd55838e,Walker Creek
+F0a3699543a,South Complex,2015,duplicate,F7013be37b2,Route Complex
+Ffa90234f05,Shiell,2015,duplicate,F2c7398a67d,Fork Complex
+F0a1df40767,Camas Prairie,2014,duplicate,F071a9b2e48,Logging Unit Complex
+Ff61cac90be,Adam Mountain,2024,nested,F62a6dae285,Lane 1
+F37eefddab5,Lassics,2015,nested,Fb9894b931d,Mad River Complex
+F9512aabfec,Green Ridge,2021,nested,F98c7fd6815,Green Ridge
+F3a4af7f790,0318 BEAR BUTTE 2 CS,2014,nested,F9091b43218,Bridge 99 Complex
+F520ada2506,Peak,2015,nested,F6cc66dfc80,Gasquet Complex
+F6c3a31c96c,North Star,2015,nested,F2a160f64d6,Okanogan Complex
+F2f6e98385d,Bear,2015,nested,F6cc66dfc80,Gasquet Complex
+F6f17b43ba6,McFarland Creek,2015,nested,F4b2cc61db9,Black Canyon
+F780c8cc613,Big Knife,2023,nested,F00211621df,Big Knife
+Fe0a8dfe9b6,Haypress (River Complex),2021,nested,Fd2d7bc4b0a,Haypress (River Complex)
+Fc68ecd80b2,Blue Creek 2,2023,nested,F36cb11ad88,Mosquito
+F2c90903e43,Lower Flat,2015,nested,Fef88fc9d30,Grizzly Complex
+Ffe9a3bf90b,South Bobtail,2015,nested,Fef88fc9d30,Grizzly Complex
+Fa66c586e7b,Christensen,2021,nested,Ff79f61bd76,Alder Creek
+F221f72bad2,Myers,2014,nested,F20353c33ad,Rain
+Fe420b429d4,Arrastra Creek,2017,nested,F2d40d3569a,Park Creek
+F135109a8de,Irving Peak,2022,nested,Fec04146364,White River
+Fe0475750b9,Tunk Block,2015,nested,F2a160f64d6,Okanogan Complex
+F1b0355b8c3,Devil Mountain,2025,nested,Ff7ad8deaca,Windy Rock
+F4a49ec77b5,Boneyard,2024,nested,Fa89d4a3226,Monkey Creek
+F7c3cd1d673,Pickett,2015,nested,Fb9894b931d,Mad River Complex
+Fda0b317117,Snowstorm,2025,nested,F341ba648ee,Jakes
+Fbc0eb54fb9,Taylor Creek,2018,nested,Fd9952f67a1,Klondike
+Ff300a5e194,Lime Belt,2015,nested,F2a160f64d6,Okanogan Complex
+F737febac5e,Duncan,2014,nested,F500eae1462,Chiwaukum Complex
+F68dc7942e9,Lone Park,2015,nested,F9432517982,Crown
+Ffa3aec7723,Rail,2015,nested,F2c7398a67d,Fork Complex
+Fbb19d6fc93,FOURMILE,2017,nested,Fa22379a893,CEDAR
+Ff4866b3be5,Sugar Pine,2018,nested,F3e944fe48b,MILES
+F42a68787bb,Gobbler,2015,nested,Fb9894b931d,Mad River Complex
+Ffe09f99f3f,FEREBEE MEMORIAL,2016,nested,Ffa8450f1af,TELLICO
+F214cd13d13,Stemler,2014,nested,Fcbb2805dc4,Kitten Complex
+F54aeeef9df,Klatawa,2015,nested,F407d2b862d,Goat Rock Complex
+F2c65481ef4,Oak,2022,nested,Feba77fe26c,Ammon
+F89ee6f848f,PRESCOTT,2017,nested,F430cd35f7a,OAK
+Fc0f1e5acb8,Frying Pan,2014,nested,Fb58146e016,Happy Camp Complex
+F12358c4417,Summer (River Complex),2021,nested,Fd2d7bc4b0a,Haypress (River Complex)
+F990c86a3f9,Kitten Canyon,2014,nested,Fcbb2805dc4,Kitten Complex
+Ff1aa4141e2,Coon,2015,nested,F6cc66dfc80,Gasquet Complex
+F7dfe40501f,Whetstone Ridge,2017,nested,F5ac975e684,Meyers
+Feba2e40a0e,Circle,2015,nested,F10c0990ad1,Square
+F6ec9e64a95,Berray Mountain,2015,nested,F407d2b862d,Goat Rock Complex
+Feb313f1335,Peak,2015,nested,F2c7398a67d,Fork Complex
+F4277c95677,Lost Lake_Willow_1,2021,nested,F64a96db30f,Horton
+Fdcba1071e0,Sawtooth,2015,nested,Fc091fbac46,Clark Fork Complex
+F04712a7a58,SWILLUP,2023,nested,F300108df42,ELLIOT
+Fda198c62e5,HD,2018,nested,F655ac409ef,Columbus
+Fd98d6eab5d,FORK,2017,nested,Fceb891dc5e,HELENA
+Fe9e7bd9fe9,South Breaks,2017,nested,F3a3f44b9ff,Bridge Coulee
+F2854b34d2e,Mosquito,2023,nested,F36cb11ad88,Mosquito
+F4b2cc61db9,Black Canyon,2015,nested,F892be9de0e,Chelan Complex
+F483290f53f,Pelletreau,2015,nested,F7013be37b2,Route Complex
+Fb24736fda4,Whitetail,2015,nested,Fc091fbac46,Clark Fork Complex
+F78265c2b49,CANYON,2023,nested,F300108df42,ELLIOT
+F227cce022a,Man,2014,nested,Fb58146e016,Happy Camp Complex
+Fac112096d6,Barker,2015,nested,F2c7398a67d,Fork Complex
+F32fe30258a,Scarface,2021,nested,F20dad78744,Boundary
+F41475bdd03,NU Twin #1,2017,nested,F7407a998ed,NU Happy Dog
+Ffec1730b98,Blue,2015,nested,F2c7398a67d,Fork Complex
+F772bae24f0,NU Ragged Ridge,2017,nested,F7407a998ed,NU Happy Dog
+F0438e61d2e,Snake,2024,nested,Fa89d4a3226,Monkey Creek
+F165d63b974,Blackhawk Mountain,2025,nested,F50a9d67f6d,Crown Creek
+F897ffc5edf,Bobtail,2015,nested,Fef88fc9d30,Grizzly Complex
+F2115b8744a,Reef,2017,nested,F067a73ee08,Rice Ridge
+Fd91804f222,Copper,2023,nested,F36cb11ad88,Mosquito
+Ff4a440c18f,Seattle,2017,nested,F2a8d3946eb,Abney
+Fb5e1137476,Beaver Creek,2014,nested,F797907e586,Buzzard Complex
+F3446535a6a,TL PARADISE 287,2017,nested,Fb7af2ead01,Broken Lookout
+F67a16dcf6b,Clark 900,2024,nested,F62a6dae285,Lane 1
+F4e6e1a1e43,Juniper,2014,nested,Fcbb2805dc4,Kitten Complex
+Ffe20fc98d1,Beaver Lake,2015,nested,F2a160f64d6,Okanogan Complex
+F76bcb9693d,Jack Saddle,2024,nested,F62a6dae285,Lane 1
+F9c908b5ad0,MP 22,2025,nested,F341ba648ee,Jakes
+F44ab82e4d7,Goodview,2018,nested,F3e944fe48b,MILES
+F31c4f64ef2,Little Green,2015,nested,F9432517982,Crown
+F3f95ad10a6,GLADE,2020,nested,F2617f65528,August Complex
+Fa9bb37266a,Cook,2017,nested,F2a8d3946eb,Abney
+Fa3e12ff5b4,Young,2017,nested,F430cd35f7a,OAK
+F328f88bc94,Cronan (River Complex),2021,nested,Fd2d7bc4b0a,Haypress (River Complex)
+Fc2043ab692,Buck Fork,2014,nested,F4200616acc,South Fork Complex
+F11a727c2bf,Twisp River,2015,nested,F2a160f64d6,Okanogan Complex
+F48b518cf84,Coon,2023,nested,Fda70b8a1b2,Kelly
+F3d238ebd0d,HULL,2020,nested,F2617f65528,August Complex
+Fd019beb4ec,Fly,2021,nested,F1df87a4ce9,Dixie
+F04a860fa68,Suiattle River,2022,missing_pieces,,
+F114aa1169c,Gwen,2024,missing_pieces,,
+F1ed9fd3e23,Snider,2020,missing_pieces,,
+F247ab31eab,Deadman,2024,missing_pieces,,
+F2617f65528,August Complex,2020,missing_pieces,,
+F2d40d3569a,Park Creek,2017,missing_pieces,,
+F387db59f26,Badger,2020,missing_pieces,,
+F44a7ce3a48,Elk,2019,missing_pieces,,
+F4c17318db6,Nethker,2019,missing_pieces,,
+F4efc12d5b9,Cedar Mountain One,2018,missing_pieces,,
+F62a6dae285,Lane 1,2024,missing_pieces,,
+F706f7b0f34,Patton Meadow,2021,missing_pieces,,
+F7b908e33f9,Black Canyon,2024,missing_pieces,,
+F7ea388dc5a,Burnt Peak,2017,missing_pieces,,
+F8afc85fad2,Game Preserve,2023,missing_pieces,,
+F8c0013e02f,Brush Creek 2,2022,missing_pieces,,
+Fa7f4835b4c,Summit Trail,2021,missing_pieces,,
+Fac6b7ba960,Stateline Complex,2021,missing_pieces,,
+Fb4284ee0c0,Tohakum 2,2017,missing_pieces,,
+Fc5519a76ea,Sand Mountain,2021,missing_pieces,,
+Fcbe307c00c,Great Lakes,2023,missing_pieces,,
+Fcd60d43246,LNU Lightning Complex,2020,missing_pieces,,
+Fcf26d7f3da,Peavine Canyon,2019,missing_pieces,,
+Fd5c1ab2527,Rum Creek,2022,missing_pieces,,
+Fd95439af41,Whitmore,2021,missing_pieces,,
+Fe38dc94c5f,Prichard (Character Complex),2021,missing_pieces,,
+Ff79f61bd76,Alder Creek,2021,missing_pieces,,
+Ffa4e5b8266,MONUMENT,2021,missing_pieces,,

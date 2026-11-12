@@ -59,6 +59,8 @@ GROW_EDGES = [0.5, 5, 50]        # km² of new burn in the pair
 GROW_NAMES = ["growth <0.5 km²", "0.5-5 km²", "5-50 km²", ">50 km²"]
 SIZE_EDGES = [40, 400]           # km² burned by the end of the fire (~10k and ~100k acres)
 SIZE_NAMES = ["fire <40 km²", "40-400 km²", ">400 km²"]
+SEEN_NAMES = ["not yet detected by satellite", "already detected before the start"]
+TQ_NAMES = ["both perimeters have a mapping time", "an edit time or bare date"]
 
 
 # ---------------------------------------------------------------------------- models
@@ -238,7 +240,7 @@ def run_split(members, fires, calibrate, max_pairs=None, log_every=200):
     from scipy.ndimage import distance_transform_edt
     variants = ["raw"] + (["calibrated"] if calibrate else []) + ["distance"]
     out = {v: [] for v in variants}
-    Y, FUEL, WIND, GAP, GROW, SIZE, rows = [], [], [], [], [], [], []
+    Y, FUEL, WIND, GAP, GROW, SIZE, SEEN, TQ, rows = [], [], [], [], [], [], [], [], []
     cursor, n, t0 = 0, 0, time.time()
     for f in fires:
         final_km2 = float((f.arrival >= 0).sum() * f.cell_km ** 2)
@@ -273,6 +275,12 @@ def run_split(members, fires, calibrate, max_pairs=None, log_every=200):
             GAP.append(np.full(int(m.sum()), np.digitize(gap, GAP_EDGES), np.int8))
             GROW.append(np.full(int(m.sum()), np.digitize(y[m].sum() * f.cell_km ** 2, GROW_EDGES), np.int8))
             SIZE.append(np.full(int(m.sum()), np.digitize(final_km2, SIZE_EDGES), np.int8))
+            # cells where a satellite had ALREADY detected fire before the start (outside the perimeter): burn
+            # there is the perimeter catching up, not a forecast. Scores are also reported without them.
+            SEEN.append(((feats["viirs"][0] + feats["viirs"][1]) > 0)[m])
+            good = getattr(f, "time_src", None) and f.time_src[i] == "mapped" and f.time_src[i + 1] == "mapped"
+            TQ.append(np.full(int(m.sum()), 0 if good else 1, np.int8))
+            rec["time_sources"] = [f.time_src[i], f.time_src[i + 1]] if getattr(f, "time_src", None) else None
             rec["final_km2"] = round(final_km2, 2)
             rec["_b0"] = b0                               # kept only until edge errors are computed
             rec["_y"], rec["_m"] = y, m
@@ -288,7 +296,8 @@ def run_split(members, fires, calibrate, max_pairs=None, log_every=200):
             break
     arrays = {v: np.concatenate(out[v]) for v in variants}
     cells = dict(y=np.concatenate(Y).astype(bool), fuel=np.concatenate(FUEL), wind=np.concatenate(WIND),
-                 gap=np.concatenate(GAP), grow=np.concatenate(GROW), size=np.concatenate(SIZE))
+                 gap=np.concatenate(GAP), grow=np.concatenate(GROW), size=np.concatenate(SIZE),
+                 seen=np.concatenate(SEEN).astype(np.int8), tq=np.concatenate(TQ))
     return arrays, cells, rows
 
 
@@ -437,6 +446,9 @@ def main():
         mt["by_gap"] = breakdown(st[v], ct, thr[v], "gap", GAP_NAMES)
         mt["by_growth"] = breakdown(st[v], ct, thr[v], "grow", GROW_NAMES)
         mt["by_fire_size"] = breakdown(st[v], ct, thr[v], "size", SIZE_NAMES)
+        mt["by_seen"] = breakdown(st[v], ct, thr[v], "seen", SEEN_NAMES)
+        mt["by_time_quality"] = breakdown(st[v], ct, thr[v], "tq", TQ_NAMES)
+        mt["burned_already_detected"] = float(ct["seen"][y].mean()) if y.any() else float("nan")
         res[v] = mt
     res["no_growth"] = no_growth(rows, y)
     cal = [r["cal"] for r in rows if r.get("cal")]
@@ -479,7 +491,9 @@ def main():
             else:
                 print(f"    {mb.name}: logit bias median {q['logit_bias_median']:+.2f}")
     best = "calibrated" if "calibrated" in res else "raw"
-    for key in ("by_growth", "by_fire_size", "by_fuel", "by_wind", "by_gap"):
+    print(f"  {res[best]['burned_already_detected']:.0%} of the cells that burned already had a satellite detection before the start; "
+          f"the 'not yet detected' row below is the forecast-only score")
+    for key in ("by_seen", "by_time_quality", "by_growth", "by_fire_size", "by_fuel", "by_wind", "by_gap"):
         print(f"  {best} {key[3:]}: " + "  ".join(f"{b['group']} AP {b['ap']:.2f} F1 {b['f1']:.2f} (area {b['area_ratio']:.1f})" for b in res[best][key]))
     print(f"  saved {path}")
 

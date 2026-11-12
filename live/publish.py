@@ -49,6 +49,8 @@ class Model:
         md = Path(models_dir)
         cfg = md / "router.json"
         self.router = json.loads(cfg.read_text()) if cfg.exists() else None
+        # models trained before input version 5 saw HRRR winds on the HRRR grid's own axes (not rotated to north)
+        D.HRRR_ROTATE = bool(self.router is None or self.router.get("input_version", 1) >= 5)
         if self.router and not all((md / m["file"]).exists() for m in self.router["members"]):
             print("  !! router.json found but some weights are missing: using the physics-only model", flush=True)
             self.router = None

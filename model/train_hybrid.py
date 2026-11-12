@@ -57,6 +57,14 @@ def excluded_fires(catalog):
     if (cat / "overrides.csv").exists():
         o = pd.read_csv(cat / "overrides.csv")
         bad = (bad - set(o.loc[o.verdict == "keep", "fire_id"])) | set(o.loc[o.verdict == "drop", "fire_id"])
+    if (cat / "duplicates.csv").exists():       # the same burn under two records (pipeline/dedupe_fires.py)
+        bad |= set(pd.read_csv(cat / "duplicates.csv")["fire_id"])
+    # shipped with the code: fires in the catalog twice (the same fire under two records, or a member fire
+    # that is also inside its complex), and fires whose perimeters lost more than half their area on some
+    # day because the perimeter was stored in pieces. Remove this list once the catalog is rebuilt.
+    shipped = Path(__file__).resolve().parent.parent / "pipeline" / "excluded_fires.csv"
+    if shipped.exists():
+        bad |= set(pd.read_csv(shipped)["fire_id"])
     return bad
 
 
@@ -68,7 +76,7 @@ def load_fires(root, pca, max_fires=None, catalog=None):
     if bad:
         n0 = len(dirs)
         dirs = [d for d in dirs if d.name not in bad]
-        print(f"  QC: left out {n0 - len(dirs)} fires rated bad or dropped by the team", flush=True)
+        print(f"  QC: left out {n0 - len(dirs)} fires rated bad, dropped by the team, or duplicates of another fire", flush=True)
     if max_fires:
         dirs = dirs[:max_fires]
     fires = [D.Fire(d, pca) for d in dirs]

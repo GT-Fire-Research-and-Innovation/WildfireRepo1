@@ -71,10 +71,43 @@ def router_features(zs, cells):
     return np.concatenate([Z] + inter, 1)
 
 
+BOOT = 200
+
+
+def boot_ci(s, y, rows, n=None, seed=0, max_neg=1_500_000):
+    """95 % interval of the pooled AP from resampling whole FIRES (cells of one fire are not independent).
+    All burned cells and a weighted random sample of the unburned ones are used, so it stays fast."""
+    n = BOOT if n is None else n
+    if not n:
+        return None
+    rng = np.random.default_rng(seed)
+    neg = np.flatnonzero(~y)
+    q = min(1.0, max_neg / max(len(neg), 1))
+    keep = np.sort(np.concatenate([np.flatnonzero(y), neg[rng.random(len(neg)) < q]]))
+    w = np.where(y[keep], 1.0, 1.0 / q)
+    fire_of = np.empty(len(y), np.int32)
+    names = sorted({r["fire"] for r in rows})
+    code = {f: k for k, f in enumerate(names)}
+    for r in rows:
+        fire_of[r["start"]:r["stop"]] = code[r["fire"]]
+    fk, sk, yk = fire_of[keep], s[keep].astype(np.float32), y[keep]
+    aps = []
+    for _ in range(n):
+        mult = np.bincount(rng.integers(0, len(names), len(names)), minlength=len(names))[fk]
+        sel = mult > 0
+        if yk[sel].any():
+            aps.append(average_precision_score(yk[sel], sk[sel], sample_weight=(w * mult)[sel]))
+    return [float(np.percentile(aps, 2.5)), float(np.percentile(aps, 97.5))] if aps else None
+
+
 def score(name, s, y, cells, rows, thr):
     m = TH.metrics(s, y, thr)
     m.update(E.window_scores(s, y, rows, m["thr"]))
     m["edge_km_mean"] = None
+    m["ap_ci95"] = boot_ci(s, y, rows)
+    for key, names in (("seen", E.SEEN_NAMES), ("tq", E.TQ_NAMES)):
+        if key in cells:
+            m["by_" + key] = E.breakdown(s, cells, m["thr"], key, names)
     m["by_gap"] = E.breakdown(s, cells, m["thr"], "gap", E.GAP_NAMES)
     m["by_wind"] = E.breakdown(s, cells, m["thr"], "wind", E.WIND_NAMES)
     m["by_growth"] = E.breakdown(s, cells, m["thr"], "grow", E.GROW_NAMES)
@@ -110,7 +143,10 @@ def main():
     ap.add_argument("--members", nargs="+", default=["unet2_eval", "hybrid_v1_eval", "hybrid2_eval"])
     ap.add_argument("--h2h", help="evaluation name to split by gap, e.g. unet_h21_vs_tssatfire")
     ap.add_argument("--out", default="combine", help="writes runs/<out>.md and runs/<out>.json")
+    ap.add_argument("--boot", type=int, default=200, help="fire-level bootstrap rounds for the AP range (0 = off)")
     a = ap.parse_args()
+    global BOOT
+    BOOT = a.boot
     runs = Path(a.data) / "runs"
     rng = np.random.default_rng(0)
     res = {"members": a.members}
@@ -133,8 +169,9 @@ def main():
             if not np.array_equal(z[k], z0[k]):
                 raise SystemExit(f"{n} and {a.members[0]} were not scored on the same cells ({k} differs)")
     yv, yt = z0["val_y"], z0["test_y"]
-    cv = {k: z0[f"val_{k}"] for k in ("y", "fuel", "wind", "gap", "grow", "size")}
-    ct = {k: z0[f"test_{k}"] for k in ("y", "fuel", "wind", "gap", "grow", "size")}
+    keys = ["y", "fuel", "wind", "gap", "grow", "size"] + [k for k in ("seen", "tq") if f"test_{k}" in z0.files]
+    cv = {k: z0[f"val_{k}"] for k in keys}
+    ct = {k: z0[f"test_{k}"] for k in keys}
     rows = data[a.members[0]][1]["pairs"]
     # split validation by fire: fit on half A, threshold + model choice on half B
     vfire = np.repeat(z0["val_pair_fire"], z0["val_pair_cells"])
@@ -221,12 +258,15 @@ def write_md(res, path):
             L.append(f"| {k} | {v['windows']} | {v['fires']} | {v['f1_window']:.3f} | {v['no_growth_f1_window']:.3f} | "
                      f"{v['skill_over_no_growth']:.3f} |")
         L.append("")
-    L += ["## Test scores", "", "| model | AP | F1 | IoU | F1 win | area | Brier | ECE |", "|---|---|---|---|---|---|---|---|"]
+    L += ["## Test scores", "", "AP range = 95 % interval from resampling whole fires.", "",
+          "| model | AP | AP range | F1 | IoU | F1 win | area | Brier | ECE |", "|---|---|---|---|---|---|---|---|---|"]
     allm = {**res["single"], **res["average"], "router": res["router"]}
     for k, m in allm.items():
-        L.append(f"| {k} | {m['ap']:.3f} | {m['f1']:.3f} | {m['iou']:.3f} | {m['f1_window']:.3f} | {m['area_ratio']:.2f} | "
-                 f"{m.get('brier', float('nan')):.4f} | {m.get('ece', float('nan')):.3f} |")
-    for key, names in (("by_gap", E.GAP_NAMES), ("by_wind", E.WIND_NAMES), ("by_growth", E.GROW_NAMES)):
+        ci = m.get("ap_ci95")
+        L.append(f"| {k} | {m['ap']:.3f} | {f'{ci[0]:.3f}-{ci[1]:.3f}' if ci else '-'} | {m['f1']:.3f} | {m['iou']:.3f} | {m['f1_window']:.3f} | "
+                 f"{m['area_ratio']:.2f} | {m.get('brier', float('nan')):.4f} | {m.get('ece', float('nan')):.3f} |")
+    extra = [(k, n) for k, n in (("by_seen", E.SEEN_NAMES), ("by_tq", E.TQ_NAMES)) if all(k in m for m in allm.values())]
+    for key, names in extra + [("by_gap", E.GAP_NAMES), ("by_wind", E.WIND_NAMES), ("by_growth", E.GROW_NAMES)]:
         L += ["", f"## {key.replace('_', ' ')} (AP / F1)", "", "| model | " + " | ".join(names) + " |",
               "|---|" + "---|" * len(names)]
         for k, m in allm.items():

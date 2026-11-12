@@ -39,8 +39,12 @@ def load_archive(arch):
         if g is None or g.is_empty:
             continue
         p = f.get("properties", {})
+        # WFIGS times are true UTC. A perimeter with no mapping time was archived under the time it was first
+        # seen (within 15 min of its upload): an edit time.
+        tsrc = "edit" if str(r.polygon_time) == str(getattr(r, "first_seen", "")) else "mapped"
         rows.append(dict(incident=str(r.fire_id), incident_name=r.name, category=str(r.category or ""),
                          map_method=str(r.map_method or ""), perim_time=pd.Timestamp(r.polygon_time),
+                         time_source=tsrc, times_utc=True,
                          type=p.get("attr_IncidentTypeCategory") or ("RX" if "prescribed" in str(r.category).lower() else "WF"),
                          irwin_id=str(r.irwin_id or "").strip("{}"), source="wfigs_archive", geometry=g.buffer(0)))
     return gpd.GeoDataFrame(rows, geometry="geometry", crs=4326) if rows else gpd.GeoDataFrame(columns=["geometry"], crs=4326)
@@ -85,7 +89,7 @@ def clean(gdf, min_days, min_acres, settle_days, now):
                               west=bb[0], south=bb[1], east=bb[2], north=bb[3], sources="wfigs_archive",
                               methods=",".join(sorted(grp["map_method"].str.lower().unique()))))
         out_per.append(grp[["incident", "incident_name", "source", "category", "map_method", "perim_time", "burn_day",
-                            "acres_calc", "irwin_id", "geometry"]].assign(fire_id=fid))
+                            "acres_calc", "irwin_id", "time_source", "times_utc", "geometry"]].assign(fire_id=fid))
     return out_fires, out_per, why
 
 

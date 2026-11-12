@@ -159,8 +159,29 @@ def scan_fgdb(out, y, url):
     return df.drop(columns="wkb")
 
 
-def _time(df):
+def geomac_zone(lon, lat, year):
+    """Clock a GeoMAC perimeter time was written in (same rule as model/data.py geomac_zone). GeoMAC kept
+    local clock times with no zone and the archive serves them as UTC: 2019 records are Denver time
+    for every fire (250 perimeters also in NIFS differ by exactly 6 h); earlier years are the fire's
+    own local time (NIROPS comments like '2338hrs' equal the stored time)."""
+    if year >= 2019:
+        return "America/Denver"
+    if lon < -130:
+        return "America/Anchorage"
+    if lon > -85.5:
+        return "America/New_York"
+    if lon > -101.5:
+        return "America/Chicago"
+    if lat < 37.0 and -114.8 < lon < -109.05:
+        return "America/Phoenix"
+    if lon > -114.05 or (lon > -117.03 and 42.0 <= lat <= 45.6):
+        return "America/Denver"
+    return "America/Los_Angeles"
+
+
+def _time(df, with_field=False):
     out = pd.Series(pd.NaT, index=df.index, dtype="datetime64[ns, UTC]")
+    field = pd.Series(None, index=df.index, dtype="object")
     for c in ("perimeterdatetime", "polygondatetime", "datecurrent", "gdb_from_date"):
         if c in df:
             v = df[c]
@@ -173,8 +194,9 @@ def _time(df):
             s = s.where(yr.between(2000, 2030))
             t2 = pd.to_datetime(s, utc=True, errors="coerce", format="mixed")
             t = t.fillna(t2.astype("datetime64[ns, UTC]"))
+            field = field.where(out.notna() | t.isna(), c)
             out = out.fillna(t.astype("datetime64[ns, UTC]"))
-    return out
+    return (out, field) if with_field else out
 
 
 def incident_keys(df):
@@ -268,7 +290,17 @@ def norm_frame(g, geom, year):
     col = lambda c: g[c] if c in g else pd.Series(None, index=g.index, dtype="object")  # noqa: E731
     src = col("source").astype("string").fillna("nifs")
     is_g = src == "geomac"
-    t = _time(g)
+    t, field = _time(g, with_field=True)
+    # where the time came from: the mapping time, a database edit time (hours after the flight), or a bare date
+    date_only = (t.dt.hour == 0) & (t.dt.minute == 0) & (t.dt.second == 0)
+    tsrc = np.where(field.isin(["perimeterdatetime", "polygondatetime"]), np.where(date_only, "date_only", "mapped"), "edit")
+    if is_g.any():                           # GeoMAC: local clock time stored as UTC -> true UTC
+        import shapely
+        pt = shapely.point_on_surface(np.asarray(list(geom), dtype=object))
+        gx, gy = shapely.get_x(pt), shapely.get_y(pt)
+        fixed = [ti.tz_localize(None).tz_localize(geomac_zone(x, y, year), ambiguous=True, nonexistent="shift_forward").tz_convert("UTC")
+                 if (gm and pd.notna(ti)) else ti for ti, gm, x, y in zip(t, is_g, gx, gy)]
+        t = pd.Series(pd.DatetimeIndex(fixed), index=g.index).astype("datetime64[ns, UTC]")
     vt = _time(pd.DataFrame({"gdb_from_date": col("gdb_from_date")}))
     vt = vt.where(~is_g, _time(pd.DataFrame({"datecurrent": col("datecurrent")})))
     cat = col("featurecategory").astype("string").where(~is_g, "Wildfire Daily Fire Perimeter")
@@ -285,7 +317,8 @@ def norm_frame(g, geom, year):
                        "unique_fire_id": uid.astype(object), "complex_name": None, "category": cat.astype(object),
                        "map_method": col("mapmethod").astype("string").fillna("Unknown").str.strip().astype(object),
                        "comments": col("comments").astype("string").fillna("").astype(object), "acres": pd.to_numeric(col("gisacres"), errors="coerce"),
-                       "perim_time": t, "version_time": vt, "geometry_id": gid.astype(object), "deleted": deleted.values})
+                       "perim_time": t, "time_source": tsrc, "times_utc": True,
+                       "version_time": vt, "geometry_id": gid.astype(object), "deleted": deleted.values})
     return gpd.GeoDataFrame(df, geometry=list(geom), crs=4326)
 
 
@@ -384,7 +417,7 @@ def clean_all(out, years, min_acres, min_days):
                              west=bb[0], south=bb[1], east=bb[2], north=bb[3], sources=",".join(sorted(grp["source"].unique())),
                              methods=",".join(sorted(grp["map_method"].str.lower().unique()))))
             keep = ["incident", "incident_name", "source", "category", "map_method", "perim_time", "burn_day",
-                    "acres_calc", "irwin_id", "geometry"]
+                    "acres_calc", "irwin_id", "geometry"] + [c for c in ("time_source", "times_utc") if c in grp]
             parts.append(grp[keep].assign(fire_id=fid))
         print(f"  bucket {b + 1}/{N_BUCKETS}: {len(rows)} fires so far", flush=True)
         del gdf

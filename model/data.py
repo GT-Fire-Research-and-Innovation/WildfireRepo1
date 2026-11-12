@@ -20,7 +20,10 @@ MIN_GAP_H, MAX_GAP_H = 3.0, 168.0          # pairs up to 7 days apart (98 % of k
 CLEAN_FAR_KM = 3.0                 # new burn farther than this with no satellite fire nearby -> unknown
 DATA_VERSION = 2                   # 2: per-pair satellite-support check on labels + isolated GOES pixels removed
                                    # 1: original behaviour (kept for checkpoints trained before the change)
-INPUT_VERSION = 4                  # 4: suppression layers of the PREVIOUS burn day (the day's own layers are the map at 06:00
+INPUT_VERSION = 5                  # 5: perimeter times corrected (GeoMAC local clock time -> UTC, about +6 h for 2014-2019);
+                                   #    HRRR winds rotated to true north; hours with no HRRR file no longer count as calm, 0 % RH air;
+                                   #    perimeters stamped with a database edit time: satellite inputs stop EDIT_LAG_H earlier
+                                   # 4: suppression layers of the PREVIOUS burn day (the day's own layers are the map at 06:00
                                    #    the next morning, up to 24 h after the forecast start, incl. the new uncontrolled edge);
                                    #    fire size, distance to fire and relative elevation no longer depend on the crop window
                                    # 3: GOES input filter is causal (the isolated-pixel check looked up to 3 h ahead)
@@ -29,6 +32,7 @@ INPUT_VERSION = 4                  # 4: suppression layers of the PREVIOUS burn 
 SUPPORT_MIN_CELLS = 20             # v2: new-burn patches at least this big (0.45 km² at 150 m) ...
 SUPPORT_KM, SUPPORT_FRAC = 1.0, 0.2    # ... with under 20 % of cells within 1 km of VIIRS/GOES fire -> unknown
 GOES_ISOLATED_KM, GOES_ISOLATED_H = 4.0, 3.0   # v2: a GOES pixel with no other within 4 km and 3 h is dropped
+EDIT_LAG_H = 8.0                   # an edit-time stamp is typically the 04-06 upload of a 21-23 flight
 HERB, WOODY = 0.6, 0.9             # live fuel moisture defaults (fraction)
 GM = ["vpd", "fm100", "fm1000", "bi", "erc", "rmin", "vs", "th", "tmmx"]
 GM_SCALE = {"vpd": (1.5, 1.0), "fm100": (12, 5), "fm1000": (14, 5), "bi": (50, 25), "erc": (50, 25),
@@ -49,6 +53,11 @@ T3_GROUPS = ["hrrr_seq", "seq"]  # left out unless TEMPORAL (unet3 with its time
 TEMPORAL = False             # set for unet3 runs that use the day-by-day history
 SEQ_DAYS, SEQ_CH, SEQ_SEG = 6, 4, 4
 PHYSICS_V2 = False           # set by the hybrid2 / physics2 modes: compute crown fire and spotting
+HRRR_ROTATE = True           # rotate HRRR winds from the HRRR grid's axes to true north (up to 17 degrees in the West)
+HRRR_CONE, HRRR_LON0 = 0.622515, -97.5     # HRRR Lambert conformal: sin(38.5 deg), central meridian
+ROTH_WIND = "vector"         # wind speed given to Rothermel: "vector" (speed of the mean wind vector), "mean", "p90"
+CANOPY_WAF = False           # shelter the midflame wind under forest canopy (LANDFIRE cover and height)
+GM_DAY = "start"             # GRIDMET day: "start" (local day of t_i) or "window" (days whose afternoon is in the window)
 WEATHER_MODE = "observed"    # "observed": HRRR analyses over the gap (oracle weather, best case)
                              # "forecast": only what a forecaster has at t_i: HRRR analyses of the last 24 h
                              #   plus the HRRR 12z+9h forecasts issued at least 2 h before t_i that are valid
@@ -56,6 +65,59 @@ WEATHER_MODE = "observed"    # "observed": HRRR analyses over the gap (oracle we
 
 
 from collections import OrderedDict
+
+_TSRC = None
+
+
+def time_sources():
+    """{fire_id: {perimeter time (s, as stored in the catalog): 'mapped' | 'edit' | 'date_only'}} from
+    pipeline/perimeter_time_source.csv.gz. 'mapped' = the time the perimeter was flown or mapped;
+    'edit' = only a database edit time exists (NIFS, 28-59 % of perimeters depending on the year);
+    'date_only' = a date with no time of day."""
+    global _TSRC
+    if _TSRC is None:
+        _TSRC = {}
+        p = Path(__file__).resolve().parent.parent / "pipeline" / "perimeter_time_source.csv.gz"
+        if p.exists():
+            t = pd.read_csv(p)
+            for fid, g in t.groupby("fire_id"):
+                _TSRC[fid] = dict(zip(g["t_s"].astype(np.int64), g["time_source"]))
+    return _TSRC
+
+
+def geomac_zone(lon, lat, year):
+    """Time zone of the clock a GeoMAC perimeter time was written in. GeoMAC stored local clock times
+    with no zone (the archive serves them as if UTC): 2019 records were converted to Denver time for
+    every fire (250 perimeters also in NIFS differ by exactly 6 h); earlier years carry the fire's own
+    local time (NIROPS comments such as '2338hrs' equal the stored time; infrared flights would
+    otherwise cluster at 13-17 local instead of 20-24)."""
+    if year >= 2019:
+        return "America/Denver"
+    if lon < -130:
+        return "America/Anchorage"
+    if lon > -85.5:
+        return "America/New_York"
+    if lon > -101.5:
+        return "America/Chicago"
+    if lat < 37.0 and -114.8 < lon < -109.05:
+        return "America/Phoenix"
+    if lon > -114.05 or (lon > -117.03 and 42.0 <= lat <= 45.6):
+        return "America/Denver"
+    return "America/Los_Angeles"
+
+
+def fix_times(times_ns, sources, lon, lat, year):
+    """Catalog times (ns, stored as UTC) -> true UTC: GeoMAC entries are local clock times."""
+    t = pd.to_datetime(np.asarray(times_ns, np.int64), utc=True)
+    if sources is None:
+        return t
+    zone = geomac_zone(lon, lat, year)
+    out = []
+    for ti, src in zip(t, sources):
+        if str(src) == "geomac":
+            ti = ti.tz_localize(None).tz_localize(zone, ambiguous=True, nonexistent="shift_forward").tz_convert("UTC")
+        out.append(ti)
+    return pd.DatetimeIndex(out)
 
 LAYER_CACHE = 24            # layers kept in memory per process (a fire has ~11)
 _CACHE = OrderedDict()
@@ -73,7 +135,17 @@ class Fire:
         self.cell_km = self.res_m / 1000
         lab = np.load(d / "labels.npz")
         self.arrival, self.other = lab["arrival"], lab["other"]
-        self.times = pd.to_datetime(lab["times"], utc=True)
+        stored = np.asarray(lab["times"], np.int64)
+        tr = self.g["transform"]
+        lon_c, lat_c = tr[2] + tr[0] * self.W / 2, tr[5] + tr[4] * self.H / 2
+        fixed = "times_utc" in lab.files                     # labels built after the catalog fix carry true UTC
+        self.times = pd.to_datetime(stored, utc=True) if fixed or INPUT_VERSION < 5 or "sources" not in lab.files \
+            else fix_times(stored, lab["sources"], lon_c, lat_c, self.year)
+        if "time_sources" in lab.files:
+            self.time_src = [str(v) for v in lab["time_sources"]]
+        else:
+            src = time_sources().get(self.fid, {})
+            self.time_src = [src.get(int(t // 10 ** 9), "unknown") for t in stored]
         self.pca = pca
         self.pairs = []
         for i in range(len(self.times) - 1):
@@ -116,6 +188,7 @@ class Fire:
         sl = (slice(r0, r1), slice(c0, c1))
         h, w = r1 - r0, c1 - c0
         t_i, t_j = self.times[i], self.times[i + 1]
+        t_sat = self.sat_time(i)                              # newest satellite observation the inputs may use
         f = {}
         B0 = self.burned(i)[sl]
         B1 = self.burned(i - 1)[sl] if i >= 1 else B0
@@ -143,7 +216,7 @@ class Fire:
             local_j = (t_j.tz_convert(None) + pd.Timedelta(hours=lon_c / 15)).normalize()
             for k, dday in enumerate(days):
                 if local_i - pd.Timedelta(days=1) <= dday <= local_i:
-                    use_d, use_n = self.passes_before(dday, t_i)       # no satellite pass after t_i (time leak fix)
+                    use_d, use_n = self.passes_before(dday, t_sat)     # no satellite pass after the start (time leak fix)
                     if use_d:
                         af24 += v["af_day"][k][sl]
                     if use_n:
@@ -166,10 +239,10 @@ class Fire:
             if INPUT_VERSION >= 3 and DATA_VERSION >= 2:
                 # input side: a pixel counts once a companion detection (4 km, 3 h) has been seen BY t_i;
                 # the label-side filter also looks up to 3 h past each pixel, which would leak into inputs
-                ok = self.goes_companion_t(gz_raw) <= pd.Timestamp(t_i).value
+                ok = self.goes_companion_t(gz_raw) <= pd.Timestamp(t_sat).value
                 gz = {k: (v[ok] if getattr(v, "ndim", 0) == 1 and len(v) == len(ok) else v) for k, v in gz_raw.items()}
             t = pd.to_datetime(gz["t"], utc=True)
-            before = (t <= t_i) & (t >= t_i - pd.Timedelta(hours=72))
+            before = (t <= t_sat) & (t >= t_i - pd.Timedelta(hours=72))
             if before.any():
                 dx, _, x0, _, ey, y0 = self.g["transform"]
                 cc = np.floor((gz["lon"][before] - x0) / dx).astype(int) - c0
@@ -266,6 +339,15 @@ class Fire:
             dates = pd.to_datetime(wz["dates"])
             local_i = (t_i.tz_convert(None) + pd.Timedelta(hours=self.g["transform"][2] / 15)).normalize()
             k = int(np.clip(np.searchsorted(dates, local_i), 0, len(dates) - 1))
+            ks = [k]
+            if GM_DAY == "window" and WEATHER_MODE != "forecast":
+                off = pd.Timedelta(hours=self.g["transform"][2] / 15)
+                li, lj = t_i.tz_convert(None) + off, t_j.tz_convert(None) + off
+                dd = [d for d in pd.date_range(li.normalize(), lj.normalize()) if li <= d + pd.Timedelta(hours=15) <= lj]
+                if not dd:
+                    dd = [(li + (lj - li) / 2).normalize()]
+                ks = sorted({int(np.clip(np.searchsorted(dates, d), 0, len(dates) - 1)) for d in dd})
+                k = ks[-1]
             if WEATHER_MODE == "forecast":
                 local_hour = (t_i.tz_convert(None) + pd.Timedelta(hours=self.g["transform"][2] / 15)).hour
                 if local_hour < 18:                           # the day's weather is not observed yet
@@ -274,7 +356,12 @@ class Fire:
             names = [str(x) for x in wz["gm_vars"]]
             gm = wz["gm"]
             for n in GM:
-                a = gm[k, names.index(n)][np.ix_(gr, gc)]
+                if len(ks) > 1 and WEATHER_MODE != "forecast" and n != "th":      # a direction cannot be averaged in degrees
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore", RuntimeWarning)
+                        a = np.nanmean(gm[ks, names.index(n)], axis=0)[np.ix_(gr, gc)]
+                else:
+                    a = gm[k, names.index(n)][np.ix_(gr, gc)]
                 gmv[n] = np.nan_to_num(a, nan=GM_SCALE[n][0])
             for c, n in enumerate(GM):
                 mu, sd = GM_SCALE[n]
@@ -292,6 +379,7 @@ class Fire:
         hr = np.zeros((7, h, w), np.float32)
         u_mean = v_mean = None
         hseq = None
+        self._spd_stats = None
         if rz is not None and "hrrr" not in hide:
             ts = pd.to_datetime(rz["times"], utc=True)
             if WEATHER_MODE == "forecast":
@@ -314,12 +402,34 @@ class Fire:
                     tF = tF.append(vt[use])
             idx = rz["idx"][sl]
             flat = F.reshape(F.shape[0], 4, -1)[:, :, idx]   # (T, 4, h, w)
-            if np.isfinite(flat).any():
-                gust, u, vv, rh = (np.nan_to_num(flat[:, j]) for j in range(4))
+            has_wind = np.isfinite(flat[:, 1]).any((1, 2)) & np.isfinite(flat[:, 2]).any((1, 2))
+            if has_wind.any():
+                # Hours whose file is missing are left out (they used to count as calm, 0 % humidity air).
+                # HRRR had no 2 m humidity before Aug 2016 and has gaps later: missing humidity is filled
+                # from the hours that have it, else from GRIDMET's daily minimum; never with zero.
+                flat, tF = flat[has_wind], tF[has_wind]
+                u, vv = np.nan_to_num(flat[:, 1]), np.nan_to_num(flat[:, 2])
+                if HRRR_ROTATE:
+                    # HRRR stores winds relative to its Lambert grid, not to true north: up to 17 degrees off in
+                    # the West (checked against GRIDMET wind direction). Rotate to earth-relative east / north.
+                    dxg, _, x0g = self.g["transform"][:3]
+                    ang = math.radians(HRRR_CONE * (x0g + dxg * (c0 + c1) / 2 - HRRR_LON0))
+                    u, vv = u * math.cos(ang) + vv * math.sin(ang), -u * math.sin(ang) + vv * math.cos(ang)
                 spd = np.hypot(u, vv)
+                gust = np.where(np.isfinite(flat[:, 0]), flat[:, 0], spd)
+                rh = flat[:, 3]
+                rh_ok = np.isfinite(rh)
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", RuntimeWarning)
+                    rh_fill = np.nanmean(rh, 0) if rh_ok.any() else None
+                if rh_fill is None or not np.isfinite(rh_fill).all():
+                    alt = gmv["rmin"] if gmv else full(25.0)
+                    rh_fill = alt if rh_fill is None else np.where(np.isfinite(rh_fill), rh_fill, alt)
+                rh = np.where(rh_ok, rh, rh_fill[None])
                 u_mean, v_mean = u.mean(0), vv.mean(0)
                 hr = np.stack([u_mean / 8, v_mean / 8, spd.mean(0) / 8, spd.max(0) / 12, gust.max(0) / 20,
                                rh.min(0) / 100, full(1.0)])
+                self._spd_stats = (spd.mean(0), np.quantile(spd, 0.9, axis=0) if len(spd) > 1 else spd[0])
                 if TEMPORAL:
                     hseq = self.hrrr_segments(tF, u, vv, spd, rh, t_i, t_j, hr)
         f["hrrr"] = hr
@@ -353,6 +463,7 @@ class Fire:
         f["suppression"] = sup
 
         # Rothermel fields (physics backbone)
+        self._canopy = (np.clip(lf["cc"][sl], 0, 100) / 100.0, np.clip(lf["ch"][sl], 0, 1000) / 10.0) if fb is not None else None
         phys = self.rothermel(fb, gmv, u_mean, v_mean, slope, ter["aspect"][sl].astype(np.float32), h, w)
         f["physics"] = np.stack([np.log1p(phys["r_head"]) / 3, phys["ecc"], phys["head_x"], phys["head_y"]]).astype(np.float32)
         if PHYSICS_V2:
@@ -368,6 +479,16 @@ class Fire:
         if DATA_VERSION >= 2:
             mask &= ~self.unsupported(target & ~B0 & ~oth, evidence[sl])
         return f, phys, target, mask, B0
+
+    def sat_time(self, i):
+        """Newest satellite observation the inputs of pair i may use. Normally the perimeter time. A perimeter
+        stamped with a database edit time was really mapped hours earlier (typically flown 21-23 local,
+        uploaded 04-06), so satellite passes just before the stamp show fire that the perimeter does not
+        hold yet: growth the pair is asked to predict. Those inputs stop EDIT_LAG_H earlier."""
+        t = self.times[i]
+        if INPUT_VERSION >= 5 and getattr(self, "time_src", None) and self.time_src[i] == "edit":
+            return t - pd.Timedelta(hours=EDIT_LAG_H)
+        return t
 
     def fire_distance(self, i):
         """Distance (km) of every cell of the grid to the fire at perimeter i (30 when nothing has burned)."""
@@ -442,7 +563,7 @@ class Fire:
                 hit = np.nonzero(days == local_i - pd.Timedelta(days=k))[0]
                 if len(hit):
                     q = int(hit[0])
-                    use_d, use_n = self.passes_before(days[q], t_i)
+                    use_d, use_n = self.passes_before(days[q], self.sat_time(i))
                     af = (v["af_day"][q][sl] * use_d + v["af_night"][q][sl] * use_n).astype(np.float32)
                     out[k, 1] = np.minimum(np.log1p(af) / np.log(5), 1.0)
         return out.reshape(SEQ_DAYS * SEQ_CH, h, w)
@@ -537,12 +658,17 @@ class Fire:
                                 21.0606 + 0.005565 * rh ** 2 - 0.00035 * rh * tf - 0.483199 * rh))
         if u is not None:
             ws, wd = np.hypot(u, v), (np.degrees(np.arctan2(-u, -v)) + 360) % 360
+            if ROTH_WIND != "vector" and getattr(self, "_spd_stats", None) is not None:
+                ws = self._spd_stats[0] if ROTH_WIND == "mean" else self._spd_stats[1]
         else:
             ws, wd = gmv["vs"], gmv["th"]
         idx = R.fuel_index(torch.from_numpy(fb.astype(np.int64)))
+        canopy = {}
+        if CANOPY_WAF and getattr(self, "_canopy", None) is not None:
+            canopy = dict(canopy_cover=t(self._canopy[0]), canopy_height_m=t(self._canopy[1]))
         out = R.spread(idx, t(1.03 * emc / 100), t(1.28 * emc / 100),
                        t(gmv["fm100"] / 100), torch.full((h, w), HERB), torch.full((h, w), WOODY), t(ws), t(wd),
-                       t(np.tan(np.radians(slope_deg))), t(aspect_deg))
+                       t(np.tan(np.radians(slope_deg))), t(aspect_deg), **canopy)
         res = {k: out[k].numpy().astype(np.float32) for k in ("r_head", "ecc", "head_x", "head_y", "i_r", "sigma")}
         res["burnable"] = out["burnable"].numpy()
         res["effm"] = (1.03 * emc).astype(np.float32)          # fine dead fuel moisture, %
