@@ -347,16 +347,16 @@
     const f = hits[0], p = f.properties;
     let html;
     if (f.layer.id === "inc") {
-      html = `<div class="pop"><h5>${esc(p.IncidentName)}</h5><dl><dt>Size</dt><dd>${ac(p.IncidentSize)}</dd><dt>Contained</dt><dd>${p.PercentContained ?? "–"}%</dd>
+      html = `<div class="pop"><h5>${esc(p.IncidentName)}</h5><dl><dt>Size</dt><dd>${ac(p.IncidentSize)}</dd><dt>Contained</dt><dd>${esc(p.PercentContained ?? "–")}%</dd>
         <dt>State</dt><dd>${esc(st(p.POOState))}</dd><dt>Discovered</dt><dd>${when(p.FireDiscoveryDateTime)}</dd>
         ${p.TotalIncidentPersonnel ? `<dt>Personnel</dt><dd>${Number(p.TotalIncidentPersonnel).toLocaleString()}</dd>` : ""}<dt>Updated</dt><dd>${when(p.ModifiedOnDateTime_dt)}</dd></dl>${links(p.IncidentName, p.POOState)}</div>`;
       select(p.UniqueFireIdentifier, true, 700);
     } else if (f.layer.id === "hot") {
-      html = `<div class="pop"><h5>Satellite hotspot</h5><dl><dt>Detected</dt><dd>${when(p.esritimeutc)}</dd><dt>Age</dt><dd>${p.hours_old ?? "?"} h</dd>
-        <dt>Fire power</dt><dd>${p.frp ?? "–"} MW</dd><dt>Satellite</dt><dd>${esc(p.satellite ?? "–")} · ${p.daynight === "N" ? "night" : "day"}</dd></dl><p>375 m pixel: the fire is somewhere inside it.</p></div>`;
+      html = `<div class="pop"><h5>Satellite hotspot</h5><dl><dt>Detected</dt><dd>${when(p.esritimeutc)}</dd><dt>Age</dt><dd>${esc(p.hours_old ?? "?")} h</dd>
+        <dt>Fire power</dt><dd>${esc(p.frp ?? "–")} MW</dd><dt>Satellite</dt><dd>${esc(p.satellite ?? "–")} · ${p.daynight === "N" ? "night" : "day"}</dd></dl><p>375 m pixel: the fire is somewhere inside it.</p></div>`;
     } else {
       select(p.attr_UniqueFireIdentifier, true, 700);
-      html = `<div class="pop"><h5>${esc(p.attr_IncidentName)}</h5><dl><dt>Size</dt><dd>${ac(p.poly_GISAcres)}</dd><dt>Contained</dt><dd>${p.attr_PercentContained ?? "–"}%</dd>
+      html = `<div class="pop"><h5>${esc(p.attr_IncidentName)}</h5><dl><dt>Size</dt><dd>${ac(p.poly_GISAcres)}</dd><dt>Contained</dt><dd>${esc(p.attr_PercentContained ?? "–")}%</dd>
         <dt>Perimeter</dt><dd>${when(p.poly_PolygonDateTime)}</dd><dt>Mapped by</dt><dd>${esc(p.poly_MapMethod || "–")}</dd><dt>Type</dt><dd>${p.attr_IncidentTypeCategory === "RX" ? "Prescribed" : "Wildfire"}</dd><dt>Source</dt><dd>NIFC ${esc(p.feed || "current")}</dd></dl>${links(p.attr_IncidentName, p.attr_POOState)}</div>`;
     }
     popup.setLngLat(e.lngLat).setHTML(html).addTo(map);
