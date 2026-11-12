@@ -59,6 +59,7 @@ GROW_EDGES = [0.5, 5, 50]        # km² of new burn in the pair
 GROW_NAMES = ["growth <0.5 km²", "0.5-5 km²", "5-50 km²", ">50 km²"]
 SIZE_EDGES = [40, 400]           # km² burned by the end of the fire (~10k and ~100k acres)
 SIZE_NAMES = ["fire <40 km²", "40-400 km²", ">400 km²"]
+LAG_H = 0.0          # --lag-h: every forecast starts this many hours after its perimeter was mapped
 SEEN_NAMES = ["not yet detected by satellite", "already detected before the start"]
 TQ_NAMES = ["both perimeters have a mapping time", "an edit time or bare date"]
 
@@ -72,11 +73,12 @@ class Member:
         name, _, rest = spec.partition(":")
         mode = rest.split(":")[0] if rest else None
         meta = runs / f"{name}.json"
-        drop = []
+        drop, origin = [], False
         if meta.exists():
             j = json.loads(meta.read_text())
             mode = mode or j.get("mode")
             drop = j.get("drop", []) or []
+            origin = bool(j.get("origin", False))
         if ":" in rest:
             drop = [g for g in rest.split(":")[1].split("+") if g]
         if mode is None:
@@ -95,7 +97,7 @@ class Member:
             arch = {"time": any(k.startswith("temporal.") for k in sd), "attn": any(k.startswith("bottleneck.") for k in sd)}
             if arch["time"]:
                 D.TEMPORAL = True                         # the loader now also builds the day-by-day history
-            self.groups = TH.groups_used(set(drop), v2=True, t3=arch["time"])
+            self.groups = TH.groups_used(set(drop), v2=True, t3=arch["time"], origin=origin)
             n_in = sum(D.GROUPS[g] for g in self.groups)
             self.model = TH.build_model(mode, n_in, int(sd["head.weight"].shape[1]), device, dx=dx, arch=arch)
             self.model.load_state_dict(sd)
@@ -103,7 +105,7 @@ class Member:
             print(f"  {name}: unet3 (time {'on' if arch['time'] else 'off'}, attention {'on' if arch['attn'] else 'off'}), {src}", flush=True)
             return
         v2 = mode in TH.V2_MODES
-        self.groups = [g for g in TH.groups_used(set(drop), v2=v2)]
+        self.groups = [g for g in TH.groups_used(set(drop), v2=v2, origin=origin)]
         n_in = sum(D.GROUPS[g] for g in self.groups)
         if mode == "physics":
             self.model = TH.build_model(mode, n_in, width, device, dx=dx)
@@ -246,7 +248,11 @@ def run_split(members, fires, calibrate, max_pairs=None, log_every=200):
         final_km2 = float((f.arrival >= 0).sum() * f.cell_km ** 2)
         hist = []                         # earlier pairs of this fire: (per-member states, y, mask)
         for i, gap in f.pairs:
-            feats, phys, y, m, b0 = f.sample(i, gap, window(f, i))
+            if LAG_H:                                     # forecast from a perimeter that is LAG_H hours old
+                if gap - LAG_H < D.MIN_GAP_H:
+                    continue
+                gap = gap - LAG_H
+            feats, phys, y, m, b0 = f.sample(i, gap, window(f, i), lag_h=LAG_H)
             states = [mb.state(feats, phys, b0, gap) for mb in members]
             raw = ens_logit([mb.logits(st) for mb, st in zip(members, states)])
             out["raw"].append(raw.cpu().numpy()[m])
@@ -399,7 +405,12 @@ def main():
     ap.add_argument("--test-years", default="2024,2025")
     ap.add_argument("--weather", default="observed", choices=["observed", "forecast"],
                     help="weather inputs; use what the model was trained with (forecast = only weather known at t_i)")
+    ap.add_argument("--lag-h", type=float, default=0.0,
+                    help="start every forecast this many hours after its perimeter was mapped (the live situation); "
+                         "windows with less than 3 h left are skipped")
     a = ap.parse_args()
+    global LAG_H
+    LAG_H = a.lag_h
     if a.device.startswith("cuda") and not torch.cuda.is_available():
         print("  !! no usable GPU on this node (driver problem): running on the CPU instead, slower", flush=True)
         a.device = "cpu"
@@ -427,7 +438,7 @@ def main():
     print(f"[{a.out}] {len(members)} model(s); val/test fires {len(split['val'])}/{len(split['test'])}; "
           f"calibration {'on' if calibrate else 'off'}", flush=True)
 
-    res = {"name": a.out, "models": a.model, "resolution_m": res_m, "data_version": D.DATA_VERSION, "input_version": D.INPUT_VERSION, "weather": D.WEATHER_MODE}
+    res = {"name": a.out, "models": a.model, "resolution_m": res_m, "data_version": D.DATA_VERSION, "input_version": D.INPUT_VERSION, "weather": D.WEATHER_MODE, "lag_h": LAG_H}
     print("  validation pass (thresholds)", flush=True)
     sv, cv, rows_v = run_split(members, split["val"], calibrate, a.max_pairs)
     thr = {v: TH.metrics(sv[v], cv["y"])["thr"] for v in sv}

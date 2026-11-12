@@ -57,3 +57,25 @@ def test_suppression_is_the_map_at_the_forecast_start(tmp_path):
     sup = f.sample(0, 24.0, (0, H, 0, W))[0]["suppression"]
     assert sup[0, 30].all()                    # yesterday's line is visible
     assert sup[6].sum() == 0                   # the edge mapped the next morning is not
+
+
+def test_late_start_uses_inputs_up_to_the_start(tmp_path):
+    """Forecast starting 12 h after the perimeter (the live situation): same fire shape, later inputs."""
+    import train_hybrid as TH
+    f = make_fire(tmp_path)
+    # a satellite pass 6 h after the perimeter: hidden for a start at the perimeter time, visible 12 h later
+    days = [str(x.date()) for x in pd.date_range("2019-08-01", "2019-08-13")]
+    v = dict(np.load(f.d / "viirs.npz"))
+    v["af_night"][days.index("2019-08-10"), 60, 60] = 1          # local day of the perimeter (10:00 local)
+    np.savez(f.d / "viirs.npz", **v)
+    pd.DataFrame(dict(latitude=[39.9], longitude=[-119.9], acq_date=["2019-08-11"], acq_time=[0], daynight=["N"])
+                 ).to_csv(f.d / "points.csv.gz", index=False)    # that pass ended 2019-08-11 00:00 UTC, 6 h after
+    D._CACHE.clear()
+    f = D.Fire(f.d)
+    at0 = f.sample(0, 24.0, (0, H, 0, W))[0]
+    late = f.sample(0, 12.0, (0, H, 0, W), lag_h=12.0)[0]
+    assert at0["viirs"][1, 60, 60] == 0 and late["viirs"][1, 60, 60] > 0
+    assert at0["origin"].max() == 0 and np.allclose(late["origin"], 0.25)
+    assert np.allclose(late["fire"][5], 12 / 48) and np.array_equal(at0["fire"][0], late["fire"][0])
+    g = TH.groups_used(set(), v2=True, t3=True, origin=True)
+    assert g.index("origin") < g.index("hrrr_seq") and "origin" not in TH.groups_used(set(), v2=True, t3=True)

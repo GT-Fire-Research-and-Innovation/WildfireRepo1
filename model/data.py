@@ -45,11 +45,14 @@ GROUPS = {  # name -> number of channels (including its mask channel where optio
     "fire": 11, "viirs": 3, "goes": 4, "terrain": 7, "fuels": 12, "tessera": 17, "human": 10, "history": 3,
     "weather": 14, "hrrr": 7, "suppression": 12, "physics": 4,
     "crownspot": 4,          # physics v2 only: crown probability, crown-adjusted spread, embers, intensity
+    "origin": 1,             # stale-perimeter models only: age of the perimeter at the forecast start (h / 48)
     "hrrr_seq": 16,          # unet3 (time) only: HRRR over the gap in 4 equal segments x (u, v, speed, RH)
     "seq": 24,               # unet3 (time) only: last 6 days x (burned, VIIRS detections, snapshot age, valid); kept LAST
 }
 V2_GROUPS = ["crownspot"]    # left out unless PHYSICS_V2 (keeps v1 models and checkpoints unchanged)
 T3_GROUPS = ["hrrr_seq", "seq"]  # left out unless TEMPORAL (unet3 with its time dimension)
+O_GROUPS = ["origin"]        # left out unless the model was trained with --origin-lag (forecasts from an ageing perimeter)
+ORIGIN_MAX_H = 36.0          # training draws the perimeter's age from 0..this (and 0 half the time)
 TEMPORAL = False             # set for unet3 runs that use the day-by-day history
 SEQ_DAYS, SEQ_CH, SEQ_SEG = 6, 4, 4
 PHYSICS_V2 = False           # set by the hybrid2 / physics2 modes: compute crown fire and spotting
@@ -181,14 +184,19 @@ class Fire:
         return np.argwhere(binary_dilation(b, iterations=2) & ~b)
 
     # ------------------------------------------------------------------ features
-    def sample(self, i, gap_h, win, hide=()):
-        """Inputs (dict of group -> (C, h, w) float32), physics fields, target, mask, burning."""
+    def sample(self, i, gap_h, win, hide=(), lag_h=0.0):
+        """Inputs (dict of group -> (C, h, w) float32), physics fields, target, mask, burning.
+        lag_h > 0: the forecast starts lag_h hours AFTER perimeter i was mapped, as it does on the live site:
+        the fire shape is still perimeter i, but satellite and weather inputs run up to the later start,
+        gap_h is the time left to perimeter i+1, and the target is everything that burns by then (what
+        burned during the lag included: the model has to work that out from the satellite inputs)."""
         from scipy.ndimage import binary_dilation, distance_transform_edt
         r0, r1, c0, c1 = win
         sl = (slice(r0, r1), slice(c0, c1))
         h, w = r1 - r0, c1 - c0
-        t_i, t_j = self.times[i], self.times[i + 1]
-        t_sat = self.sat_time(i)                              # newest satellite observation the inputs may use
+        lag = pd.Timedelta(hours=float(lag_h))
+        t_i, t_j = self.times[i] + lag, self.times[i + 1]    # t_i = the forecast start
+        t_sat = self.sat_time(i) + lag                        # newest satellite observation the inputs may use
         f = {}
         B0 = self.burned(i)[sl]
         B1 = self.burned(i - 1)[sl] if i >= 1 else B0
@@ -199,6 +207,7 @@ class Fire:
         dist = self.fire_distance(i)[sl]                      # from the whole fire, not just the part inside the window
         oth = self.other[sl]
         full = lambda v: np.full((h, w), v, np.float32)  # noqa: E731
+        f["origin"] = full(min(float(lag_h), 96.0) / 48)[None]
         f["fire"] = np.stack([B0, B1, B2, full(age1), full(age2), full(gap_h / 48), np.clip(dist, 0, 15) / 15,
                               np.exp(-dist / 2), oth, full(math.log1p(self.burned(i).sum() * ck * ck) / 8),
                               full(math.sin(2 * math.pi * (t_i.hour + self.g["transform"][2] / 15) / 24))]).astype(np.float32)
@@ -227,7 +236,7 @@ class Fire:
                     evidence |= (v["af_day"][k] + v["af_night"][k]) > 0
         f["viirs"] = np.stack([np.minimum(af24, 4) / 4, np.minimum(afn, 4) / 4, np.log1p(frp) / 6]).astype(np.float32)
         if TEMPORAL:
-            f["seq"] = self.history(i, sl, v, h, w)
+            f["seq"] = self.history(i, sl, v, h, w, lag_h)
 
         # GOES: hours since a fire pixel was seen here (before t_i), detections and power in the last 6 h
         gz_raw = gz = self.z("goes")
@@ -541,12 +550,13 @@ class Fire:
                     self._pass_ends = None
         return self._pass_ends
 
-    def history(self, i, sl, v, h, w):
+    def history(self, i, sl, v, h, w, lag_h=0.0):
         """Day-by-day look back from t_i (unet3): for k = 0..5 days before t_i, the burned area at the
         latest observation not after t_i - k days, that local day's VIIRS detections (day + night),
         the snapshot's age and a valid flag. Uses nothing after t_i (the k = 0 VIIRS day is the same
-        local day the 'viirs' group already uses)."""
-        t_i = self.times[i]
+        local day the 'viirs' group already uses). t_i is the forecast start (perimeter time + lag_h)."""
+        lag = pd.Timedelta(hours=float(lag_h))
+        t_i = self.times[i] + lag
         out = np.zeros((SEQ_DAYS, SEQ_CH, h, w), np.float32)
         days = pd.to_datetime(v["dates"]) if v is not None else None
         lon_c = self.g["transform"][2]
@@ -563,7 +573,7 @@ class Fire:
                 hit = np.nonzero(days == local_i - pd.Timedelta(days=k))[0]
                 if len(hit):
                     q = int(hit[0])
-                    use_d, use_n = self.passes_before(days[q], self.sat_time(i))
+                    use_d, use_n = self.passes_before(days[q], self.sat_time(i) + lag)
                     af = (v["af_day"][q][sl] * use_d + v["af_night"][q][sl] * use_n).astype(np.float32)
                     out[k, 1] = np.minimum(np.log1p(af) / np.log(5), 1.0)
         return out.reshape(SEQ_DAYS * SEQ_CH, h, w)

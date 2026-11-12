@@ -119,10 +119,12 @@ HYBRID_V2 = ("hybrid2", "physics2")               # have the crown weight and em
 UNET_MODES = ("unet", "unet2", "unet3")
 
 
-def groups_used(drop, v2=False, t3=False):
+def groups_used(drop, v2=False, t3=False, origin=False):
     """Input groups in channel order; the physics-v2 group only for the v2 modes, the day-by-day
-    history groups only for unet3 with its time dimension (they stay last: the history is the tail)."""
-    return [g for g in D.GROUPS if g not in drop and (v2 or g not in D.V2_GROUPS) and (t3 or g not in D.T3_GROUPS)]
+    history groups only for unet3 with its time dimension (they stay last: the history is the tail),
+    the perimeter-age group only for models trained with --origin-lag."""
+    return [g for g in D.GROUPS if g not in drop and (v2 or g not in D.V2_GROUPS) and (t3 or g not in D.T3_GROUPS)
+            and (origin or g not in D.O_GROUPS)]
 
 
 def phys_stack(phys):
@@ -158,7 +160,11 @@ class Crops(torch.utils.data.Dataset):
         c0 = int(np.clip(c - CROP // 2 + rng.integers(-jit, jit + 1), 0, max(f.W - CROP, 0)))
         win = (r0, min(r0 + CROP, f.H), c0, min(c0 + CROP, f.W))
         hide = tuple(g for g in D.OPTIONAL if rng.random() < HIDE_P)
-        feats, phys, y, m, b0 = f.sample(i, gap, win, hide)
+        lag = 0.0
+        if "origin" in self.groups and gap - D.MIN_GAP_H > 1 and rng.random() < 0.5:
+            # the live site forecasts from a perimeter that is hours old: start part-way through the window
+            lag = float(rng.uniform(0, min(gap - D.MIN_GAP_H, D.ORIGIN_MAX_H)))
+        feats, phys, y, m, b0 = f.sample(i, gap - lag, win, hide, lag_h=lag)
         m = m.copy()
         m[:EDGE] = m[-EDGE:] = False
         m[:, :EDGE] = m[:, -EDGE:] = False
@@ -371,6 +377,9 @@ def main():
                     help="training crop size; 12 at 75 m keeps the cost per crop the same as 24 km at 150 m")
     ap.add_argument("--u3-time", type=int, default=1, help="unet3: day-by-day history + temporal attention (1/0)")
     ap.add_argument("--u3-attn", type=int, default=1, help="unet3: transformer bottleneck (1/0)")
+    ap.add_argument("--origin-lag", type=int, default=0,
+                    help="1: train for forecasts that start hours after the perimeter was mapped, as on the live site "
+                         "(half the samples start 0-36 h into the window; adds the perimeter's age as an input)")
     ap.add_argument("--weather", default="observed", choices=["observed", "forecast"],
                     help="forecast: only weather a forecaster has at forecast time (see data.WEATHER_MODE)")
     a = ap.parse_args()
@@ -401,7 +410,7 @@ def main():
     CROP_KM = a.crop_km
     D.TEMPORAL = a.mode == "unet3" and bool(a.u3_time)
     arch = {"time": D.TEMPORAL, "attn": bool(a.u3_attn)} if a.mode == "unet3" else None
-    groups = groups_used(set(a.drop), v2=D.PHYSICS_V2, t3=D.TEMPORAL)
+    groups = groups_used(set(a.drop), v2=D.PHYSICS_V2, t3=D.TEMPORAL, origin=bool(a.origin_lag))
     n_in = sum(D.GROUPS[g] for g in groups)
     print(f"[{a.name}] mode={a.mode} inputs={n_in} ch  fires train/val/test = "
           f"{len(split['train'])}/{len(split['val'])}/{len(split['test'])}  pairs = "
@@ -491,7 +500,7 @@ def main():
               f"burning {extra['effective_minutes_per_day']:.0f} min/day", flush=True)
     if arch:
         extra.update(arch=arch, width=a.width, params=sum(p.numel() for p in model.parameters()))
-    json.dump({"name": a.name, "mode": a.mode, "drop": a.drop, "data_version": D.DATA_VERSION, "input_version": D.INPUT_VERSION, "weather": D.WEATHER_MODE, "val": best[2], "test": mt, "history": hist,
+    json.dump({"name": a.name, "mode": a.mode, "drop": a.drop, "origin": bool(a.origin_lag), "data_version": D.DATA_VERSION, "input_version": D.INPUT_VERSION, "weather": D.WEATHER_MODE, "val": best[2], "test": mt, "history": hist,
                "pairs": rows, **extra}, open(runs / f"{a.name}.json", "w"), indent=1)
     print(f"[{a.name}] TEST AP {mt['ap']:.3f} F1 {mt['f1']:.3f} IoU {mt['iou']:.3f} P {mt['precision']:.3f} "
           f"R {mt['recall']:.3f} area {mt['area_ratio']:.2f}  edge {mt.get('edge_km_mean', float('nan')):.2f} km "
