@@ -95,7 +95,7 @@ def ember_field(burning, intensity_kw_m, p_crown, wind_ms, u_mean, v_mean, cell_
     out = np.zeros(burning.shape, np.float32)
     if not burning.any():
         return out
-    front = burning & ~binary_erosion(burning, iterations=1, border_value=0)
+    front = burning & ~binary_erosion(burning, iterations=1, border_value=1)   # the window's edge is not a fire front
     strength = (p_crown + SURFACE_EMBERS * (1 - np.exp(-intensity_kw_m / 4000.0))) * front
     if strength.max() <= 0:
         return out
