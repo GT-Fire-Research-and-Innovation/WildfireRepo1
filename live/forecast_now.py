@@ -33,6 +33,7 @@ for p in (ROOT, ROOT / "pipeline", ROOT / "model"):
 WFIGS = ("https://services3.arcgis.com/T4QMspbfLg3qTGWY/arcgis/rest/services/"
          "WFIGS_Interagency_Perimeters_Current/FeatureServer/0/query")
 LIVE_STAGES = ["labels", "viirs", "terrain", "weather", "landfire", "history"]
+NEAR_KM = 2.0          # satellite detections within this distance of the fire join its starting shape
 
 
 # ------------------------------------------------------------------------------ active fires
@@ -160,6 +161,19 @@ def build_live(fire, out, hours=24, now=None):
     recent = dates >= (now.tz_convert(None) - pd.Timedelta(days=2)).normalize()
     det = ((v["af_day"][recent].astype(int) + v["af_night"][recent]) > 0).any(0) if recent.any() else np.zeros(lab["arrival"].shape, bool)
     arrival = lab["arrival"].copy()
+    # only detections near this fire count as part of it: hot pixels elsewhere in the box are other fires or
+    # field burns (Jefferson 359, AR, 2026-11-11: farm burns 10 km away were painted in and cut the forecast off
+    # at the grid edge). "Near" = within NEAR_KM of the perimeter, or of the incident point when it has none.
+    from scipy.ndimage import binary_dilation
+    core = arrival >= 0
+    if not core.any():
+        gy, gx = (np.array(core.shape) // 2)
+        core[gy, gx] = True
+    near = binary_dilation(core, iterations=max(1, int(round(NEAR_KM * 1000 / g["res_m"]))))
+    dropped = int((det & ~near).sum())
+    det &= near
+    if dropped:
+        print(f"  ignored {dropped} satellite-detection cells more than {NEAR_KM:g} km from the fire", flush=True)
     arrival[det & (arrival < 0) & ~lab["other"]] = 0
     lab.update(arrival=arrival, times=np.array([now.value, (now + pd.Timedelta(hours=hours)).value], np.int64),
                burn_days=np.array([str(now.date())] * 2), map_methods=np.array(["perimeter + VIIRS 48 h"] * 2),
