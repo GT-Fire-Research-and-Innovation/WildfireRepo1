@@ -79,3 +79,51 @@ def test_late_start_uses_inputs_up_to_the_start(tmp_path):
     assert np.allclose(late["fire"][5], 12 / 48) and np.array_equal(at0["fire"][0], late["fire"][0])
     g = TH.groups_used(set(), v2=True, t3=True, origin=True)
     assert g.index("origin") < g.index("hrrr_seq") and "origin" not in TH.groups_used(set(), v2=True, t3=True)
+
+
+def add_fuel_moisture_files(f, hot_future=False):
+    """hrrr2.npz (3-hourly temperature, dew point, sunshine, rain on a 2 x 2 weather grid) and green.npz."""
+    ts = pd.date_range("2019-08-06 00:00", "2019-08-12 06:00", freq="3h", tz="UTC")
+    local = (np.asarray(ts.hour) + (-120.0) / 15) % 24
+    warm = 0.5 * (1 + np.cos((local - 15) / 24 * 2 * np.pi))
+    t2 = np.repeat((12 + 23 * warm)[:, None], 4, 1).astype(np.float32)
+    if hot_future:                                             # a heat wave AFTER the forecast start
+        t2[np.asarray(ts > pd.Timestamp("2019-08-10 18:00", tz="UTC"))] += 15
+    idx = (np.arange(H)[:, None] >= H // 2) * 2 + (np.arange(W)[None, :] >= W // 2)
+    np.savez(f.d / "hrrr2.npz", times=ts.as_unit("ns").asi8, t2=t2.reshape(-1, 2, 2), dpt=np.full((len(ts), 2, 2), 2.0, np.float32),
+             dswrf=np.full((len(ts), 2, 2), np.nan, np.float32), apcp3=np.zeros((len(ts), 2, 2), np.float32),
+             idx=idx.astype(np.int32))
+    ends = pd.to_datetime(["2019-07-01", "2019-08-05", "2019-08-12"], utc=True)     # the last ends after the start
+    nd = np.stack([np.full((H, W), 7000), np.full((H, W), 5000), np.full((H, W), 1000)]).astype(np.int16)
+    np.savez(f.d / "green.npz", ends=ends.as_unit("ns").asi8, ndvi=nd, evi=nd // 2, reliability=np.zeros((3, H, W), np.int8),
+             scale=np.array(1e-4), missing=np.array(False))
+
+
+def test_fuel_moisture_and_greenness_groups(tmp_path, monkeypatch):
+    import train_hybrid as TH
+    f = make_fire(tmp_path)
+    add_fuel_moisture_files(f)
+    D._CACHE.clear()
+    monkeypatch.setattr(D, "FM_ON", True)
+    x = f.sample(0, 24.0, (0, H, 0, W))[0]
+    fm, gr = x["fmoist"], x["green"]
+    assert fm.shape == (15, H, W) and fm[14].all() and np.isfinite(fm).all()
+    assert fm[1].mean() < fm[3].mean()                         # driest < dampest in the window
+    assert fm[2, 90, 90] > fm[2, 50, 90]                       # higher ground (rows run uphill here) is moister
+    assert np.allclose(gr[0], 0.5) and np.allclose(gr[2], (0.5 - 0.7) * 5) and gr[3].all()   # not the 08-12 composite
+    g = TH.groups_used(set(), v2=True, t3=True, fm=True)
+    assert g.index("fmoist") < g.index("hrrr_seq") and "fmoist" not in TH.groups_used(set(), v2=True, t3=True)
+
+
+def test_forecast_mode_fuel_moisture_ignores_future_weather(tmp_path, monkeypatch):
+    monkeypatch.setattr(D, "FM_ON", True)
+    monkeypatch.setattr(D, "WEATHER_MODE", "forecast")
+    outs = []
+    for k, hot in enumerate((False, True)):
+        d = tmp_path / str(k)
+        d.mkdir()
+        f = make_fire(d)
+        add_fuel_moisture_files(f, hot_future=hot)
+        D._CACHE.clear()
+        outs.append(f.sample(0, 24.0, (0, H, 0, W))[0]["fmoist"])
+    assert np.allclose(outs[0], outs[1])

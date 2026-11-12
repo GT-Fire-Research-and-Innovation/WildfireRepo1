@@ -46,11 +46,17 @@ GROUPS = {  # name -> number of channels (including its mask channel where optio
     "weather": 14, "hrrr": 7, "suppression": 12, "physics": 4,
     "crownspot": 4,          # physics v2 only: crown probability, crown-adjusted spread, embers, intensity
     "origin": 1,             # stale-perimeter models only: age of the perimeter at the forecast start (h / 48)
+    "fmoist": 15,            # fuel-moisture models only: hourly 1-h / 10-h dead fuel moisture, rain, sunshine (fuel_moisture.py)
+    "green": 4,              # fuel-moisture models only: satellite greenness (NDVI, EVI, 32-day NDVI change, valid)
     "hrrr_seq": 16,          # unet3 (time) only: HRRR over the gap in 4 equal segments x (u, v, speed, RH)
     "seq": 24,               # unet3 (time) only: last 6 days x (burned, VIIRS detections, snapshot age, valid); kept LAST
 }
 V2_GROUPS = ["crownspot"]    # left out unless PHYSICS_V2 (keeps v1 models and checkpoints unchanged)
 T3_GROUPS = ["hrrr_seq", "seq"]  # left out unless TEMPORAL (unet3 with its time dimension)
+FM_GROUPS = ["fmoist", "green"]   # left out unless the model was trained with --fuel-moisture
+FM_ON = False                # set when a loaded model uses the fuel-moisture groups (they cost time to compute)
+FUEL_V2 = False              # --fuel-moisture: also read landfire2.npz (the right fuel map for the fire's year) when it exists
+FM_PHYSICS = False           # --fm-physics: the spread equations use the hourly, slope-aware fine fuel moisture (driest in the window)
 O_GROUPS = ["origin"]        # left out unless the model was trained with --origin-lag (forecasts from an ageing perimeter)
 ORIGIN_MAX_H = 36.0          # training draws the perimeter's age from 0..this (and 0 half the time)
 TEMPORAL = False             # set for unet3 runs that use the day-by-day history
@@ -299,7 +305,7 @@ class Fire:
                                  ter["tpi_500m"][sl].astype(np.float32) / 100, ter["tpi_2km"][sl].astype(np.float32) / 300,
                                  ter["rough"][sl].astype(np.float32) / 50])
 
-        lf = self.z("landfire")
+        lf = (self.z("landfire2") if FUEL_V2 and self.has("landfire2") else None) or self.z("landfire")
         fuels = np.zeros((12, h, w), np.float32)
         fb = None
         if lf is not None and not bool(lf.get("missing", True)) and "fuels" not in hide:
@@ -473,6 +479,11 @@ class Fire:
 
         # Rothermel fields (physics backbone)
         self._canopy = (np.clip(lf["cc"][sl], 0, 100) / 100.0, np.clip(lf["ch"][sl], 0, 1000) / 10.0) if fb is not None else None
+        if FM_ON or FM_PHYSICS:
+            f["fmoist"], self._fm = self.fuel_moist(sl, t_i, t_j, ter, self._canopy[0] * 100 if fb is not None else 0.0, h, w)
+            f["green"] = self.greenness(sl, t_sat, h, w)
+        else:
+            f["fmoist"], f["green"], self._fm = np.zeros((15, h, w), np.float32), np.zeros((4, h, w), np.float32), None
         phys = self.rothermel(fb, gmv, u_mean, v_mean, slope, ter["aspect"][sl].astype(np.float32), h, w)
         f["physics"] = np.stack([np.log1p(phys["r_head"]) / 3, phys["ecc"], phys["head_x"], phys["head_y"]]).astype(np.float32)
         if PHYSICS_V2:
@@ -488,6 +499,91 @@ class Fire:
         if DATA_VERSION >= 2:
             mask &= ~self.unsupported(target & ~B0 & ~oth, evidence[sl])
         return f, phys, target, mask, B0
+
+    def fuel_moist(self, sl, t_i, t_j, ter, canopy_cover, h, w):
+        """The 'fmoist' input group (fuel_moisture.py): fine dead fuel moisture stepped through the weather
+        from 72 h before the start to the end of the window, per cell. Needs hrrr2.npz (air temperature,
+        dew point, sunshine, rain); zeros and no mask when it is missing. Forecast weather mode sees
+        nothing after the start: the last 24 h of weather are repeated across the window, without rain."""
+        import fuel_moisture as FM
+        hz = self.z("hrrr2")
+        zero = np.zeros((FM.N_CH, h, w), np.float32)
+        if hz is None or not len(hz["times"]):
+            return zero, None
+        ts = pd.to_datetime(hz["times"], utc=True)
+        idx = hz["idx"][sl]
+        rz = self.z("hrrr")
+        wind_at = {}
+        if rz is not None:
+            wind_at = {int(t): k for k, t in enumerate(rz["times"])}
+            ridx = rz["idx"][sl]
+
+        def fields(k):
+            def load():
+                t2 = hz["t2"][k].astype(np.float32).ravel()[idx]
+                td = hz["dpt"][k].astype(np.float32).ravel()[idx] if "dpt" in hz else np.full((h, w), np.nan, np.float32)
+                es = lambda x: 6.112 * np.exp(17.67 * x / (x + 243.5))  # noqa: E731
+                rh = np.where(np.isfinite(td), 100 * es(td) / es(t2), np.nan)
+                if not np.isfinite(rh).all() and rz is not None and int(hz["times"][k]) in wind_at:
+                    rh2 = rz["fields"][wind_at[int(hz["times"][k])], 3].astype(np.float32).ravel()[ridx]
+                    rh = np.where(np.isfinite(rh), rh, rh2)
+                wind = 3.0
+                if int(hz["times"][k]) in wind_at:
+                    fz = rz["fields"][wind_at[int(hz["times"][k])]].astype(np.float32)
+                    wind = np.nan_to_num(np.hypot(fz[1], fz[2]).ravel()[ridx], nan=3.0)
+                return dict(temp_c=np.nan_to_num(t2, nan=20.0), rh=np.nan_to_num(rh, nan=30.0), wind_ms=wind,
+                            rain_mm=hz["apcp3"][k].astype(np.float32).ravel()[idx] if "apcp3" in hz else 0.0,
+                            ghi=hz["dswrf"][k].astype(np.float32).ravel()[idx] if "dswrf" in hz else None)
+            return load
+
+        ok = np.isfinite(hz["t2"].reshape(len(ts), -1)).any(1)
+        lo = t_i - pd.Timedelta(hours=FM.SPINUP_H)
+        if WEATHER_MODE == "forecast":
+            ks = [k for k in range(len(ts)) if ok[k] and lo <= ts[k] <= t_i]
+            steps = [dict(t=ts[k], load=fields(k)) for k in ks]
+            day = [k for k in ks if ts[k] > t_i - pd.Timedelta(hours=24)]
+            rep = 1
+            while day and ts[day[0]] + pd.Timedelta(hours=24 * rep) <= t_j:
+                for k in day:                               # yesterday's daily cycle again, dry
+                    t = ts[k] + pd.Timedelta(hours=24 * rep)
+                    if t <= t_j:
+                        steps.append(dict(t=t, load=(lambda ld: (lambda: {**ld(), "rain_mm": 0.0}))(fields(k))))
+                rep += 1
+        else:
+            steps = [dict(t=ts[k], load=fields(k)) for k in range(len(ts)) if ok[k] and lo <= ts[k] <= t_j]
+        tr = self.g["transform"]
+        lon_c, lat_c = tr[2] + tr[0] * (sl[1].start + w / 2), tr[5] + tr[4] * (sl[0].start + h / 2)
+        elev = ter["elev"][sl].astype(np.float32)
+        # the weather cell's own height: the mean elevation of the cells it covers (within this window)
+        flat = idx.ravel()
+        base = (np.bincount(flat, elev.ravel()) / np.maximum(np.bincount(flat), 1))[flat].reshape(h, w)
+        out, fm = FM.integrate(steps, t_i, t_j, lat_c, lon_c, elev - base, ter["slope"][sl].astype(np.float32),
+                               ter["aspect"][sl].astype(np.float32), canopy_cover)
+        return (zero, None) if out is None else (out, fm)
+
+    def greenness(self, sl, t_use, h, w):
+        """The 'green' input group: the newest satellite greenness composite whose 16 days ended before
+        t_use (NDVI, EVI), its NDVI change over the previous 32 days (curing), and a valid flag."""
+        out = np.zeros((4, h, w), np.float32)
+        gz = self.z("green")
+        if gz is None or bool(gz.get("missing", False)):
+            return out
+        ends = pd.to_datetime(gz["ends"], utc=True) + pd.Timedelta(days=1)     # usable from the day after it ends
+        past = np.flatnonzero(ends <= t_use)
+        if not len(past):
+            return out
+        k = past[-1]
+        nd = gz["ndvi"][k][sl].astype(np.float32) * 1e-4
+        ok = gz["ndvi"][k][sl] > -3000
+        out[0] = np.where(ok, nd, 0)
+        out[1] = np.where(ok, gz["evi"][k][sl].astype(np.float32) * 1e-4, 0)
+        older = np.flatnonzero(ends <= ends[k] - pd.Timedelta(days=32))
+        if len(older):
+            k0 = older[-1]
+            both = ok & (gz["ndvi"][k0][sl] > -3000)
+            out[2] = np.where(both, (nd - gz["ndvi"][k0][sl].astype(np.float32) * 1e-4) * 5, 0)
+        out[3] = ok
+        return out
 
     def sat_time(self, i):
         """Newest satellite observation the inputs of pair i may use. Normally the perimeter time. A perimeter
@@ -666,6 +762,9 @@ class Fire:
         emc = np.where(rh < 10, 0.03229 + 0.281073 * rh - 0.000578 * rh * tf,
                        np.where(rh < 50, 2.22749 + 0.160107 * rh - 0.01478 * tf,
                                 21.0606 + 0.005565 * rh ** 2 - 0.00035 * rh * tf - 0.483199 * rh))
+        m1, m10 = 1.03 * emc, 1.28 * emc
+        if FM_PHYSICS and getattr(self, "_fm", None) is not None:      # hourly, slope-aware moisture: driest in the window
+            m1, m10 = np.clip(self._fm["m1_min"], 1.0, 40.0), np.clip(self._fm["m10_min"], 1.0, 40.0)
         if u is not None:
             ws, wd = np.hypot(u, v), (np.degrees(np.arctan2(-u, -v)) + 360) % 360
             if ROTH_WIND != "vector" and getattr(self, "_spd_stats", None) is not None:
@@ -676,12 +775,12 @@ class Fire:
         canopy = {}
         if CANOPY_WAF and getattr(self, "_canopy", None) is not None:
             canopy = dict(canopy_cover=t(self._canopy[0]), canopy_height_m=t(self._canopy[1]))
-        out = R.spread(idx, t(1.03 * emc / 100), t(1.28 * emc / 100),
+        out = R.spread(idx, t(m1 / 100), t(m10 / 100),
                        t(gmv["fm100"] / 100), torch.full((h, w), HERB), torch.full((h, w), WOODY), t(ws), t(wd),
                        t(np.tan(np.radians(slope_deg))), t(aspect_deg), **canopy)
         res = {k: out[k].numpy().astype(np.float32) for k in ("r_head", "ecc", "head_x", "head_y", "i_r", "sigma")}
         res["burnable"] = out["burnable"].numpy()
-        res["effm"] = (1.03 * emc).astype(np.float32)          # fine dead fuel moisture, %
+        res["effm"] = (m1 * np.ones((h, w))).astype(np.float32)   # fine dead fuel moisture, %
         res["ws"] = np.asarray(ws, np.float32) * np.ones((h, w), np.float32)
         if PHYSICS_V2:
             from physics import crown_spot as CS

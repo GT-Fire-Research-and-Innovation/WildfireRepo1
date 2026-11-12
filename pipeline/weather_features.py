@@ -99,8 +99,15 @@ def gridmet_fire(datasets, fire, days):
 
 # ---------------------------------------------------------------------------- HRRR
 
-def _ranges(sess, url):
+# fuel-moisture weather: air temperature and sunshine from each analysis, rain from the 3 h forecast of the
+# run 3 h earlier (HRRR analyses carry no accumulated rain)
+FUELWX_FIELDS = [("t2", ":TMP:2 m above ground:"), ("dpt", ":DPT:2 m above ground:"), ("dswrf", ":DSWRF:surface:")]
+FUELWX_RAIN = [("apcp3", ":APCP:surface:0-3 hour acc")]
+
+
+def _ranges(sess, url, fields=None):
     """Byte ranges of the wanted fields in a HRRR file, from its .idx."""
+    fields = HRRR_FIELDS if fields is None else fields
     r = sess.get(url + ".idx", timeout=60)
     if r.status_code != 200:
         return None
@@ -108,19 +115,19 @@ def _ranges(sess, url):
     starts = [int(l.split(":")[1]) for l in lines]
     rng = {}
     for i, l in enumerate(lines):
-        for name, key in HRRR_FIELDS:
+        for name, key in fields:
             if key in l and name not in rng:
                 end = starts[i + 1] - 1 if i + 1 < len(lines) else None
                 rng[name] = (starts[i], end)
     return rng
 
 
-def hrrr_fetch(sess, url):
+def hrrr_fetch(sess, url, fields=None):
     """{field: 2-D array} for one HRRR file (CONUS grid), or None if unavailable."""
     import pygrib
     for tries in range(4):
         try:
-            rng = _ranges(sess, url)
+            rng = _ranges(sess, url, fields)
             if not rng:
                 return None
             out = {}

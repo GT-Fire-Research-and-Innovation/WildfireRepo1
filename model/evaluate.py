@@ -73,12 +73,17 @@ class Member:
         name, _, rest = spec.partition(":")
         mode = rest.split(":")[0] if rest else None
         meta = runs / f"{name}.json"
-        drop, origin = [], False
+        drop, origin, fm = [], False, False
         if meta.exists():
             j = json.loads(meta.read_text())
             mode = mode or j.get("mode")
             drop = j.get("drop", []) or []
             origin = bool(j.get("origin", False))
+            fm = bool(j.get("fuel_moisture", False))
+            if fm:
+                D.FM_ON = D.FUEL_V2 = True                 # the loader now also builds the fuel-moisture groups
+            if j.get("fm_physics"):
+                D.FM_PHYSICS = True
         if ":" in rest:
             drop = [g for g in rest.split(":")[1].split("+") if g]
         if mode is None:
@@ -97,7 +102,7 @@ class Member:
             arch = {"time": any(k.startswith("temporal.") for k in sd), "attn": any(k.startswith("bottleneck.") for k in sd)}
             if arch["time"]:
                 D.TEMPORAL = True                         # the loader now also builds the day-by-day history
-            self.groups = TH.groups_used(set(drop), v2=True, t3=arch["time"], origin=origin)
+            self.groups = TH.groups_used(set(drop), v2=True, t3=arch["time"], origin=origin, fm=fm)
             n_in = sum(D.GROUPS[g] for g in self.groups)
             self.model = TH.build_model(mode, n_in, int(sd["head.weight"].shape[1]), device, dx=dx, arch=arch)
             self.model.load_state_dict(sd)
@@ -105,7 +110,7 @@ class Member:
             print(f"  {name}: unet3 (time {'on' if arch['time'] else 'off'}, attention {'on' if arch['attn'] else 'off'}), {src}", flush=True)
             return
         v2 = mode in TH.V2_MODES
-        self.groups = [g for g in TH.groups_used(set(drop), v2=v2, origin=origin)]
+        self.groups = [g for g in TH.groups_used(set(drop), v2=v2, origin=origin, fm=fm)]
         n_in = sum(D.GROUPS[g] for g in self.groups)
         if mode == "physics":
             self.model = TH.build_model(mode, n_in, width, device, dx=dx)

@@ -61,7 +61,8 @@ def set_resolution(res_m):
 DAYS_BEFORE, DAYS_AFTER = 14, 2
 STAGES = ["grid", "labels", "history", "viirs", "terrain", "weather", "landfire", "tessera", "suppression",
           "hrrr", "goes", "human"]
-DATE_MAJOR = ["hrrr", "goes", "human"]
+EXTRA_STAGES = ["fuelwx", "green", "landfire2"]      # fuel-moisture inputs: only when named in --stages
+DATE_MAJOR = ["hrrr", "goes", "human", "fuelwx"]
 HIST_URL = ("https://services3.arcgis.com/T4QMspbfLg3qTGWY/arcgis/rest/services/"
             "InterAgencyFirePerimeterHistory_All_Years_View/FeatureServer/0")
 
@@ -345,13 +346,116 @@ def landfire_version(year):
     return f"LF{min(year - 1, 2025)}"
 
 
-def st_landfire(g, ctx):
+def landfire_versions_v2(year):
+    """LANDFIRE versions to try for a fire year, best first: the newest map that describes the land BEFORE
+    that year's fires. LF2012 for 2013-14, LF2014 for 2015-16, LF2016 (Remap) for 2017-20, LF2020 for
+    2021-22, then one map per year. Older maps are fallbacks; a map from the fire's own year or later is
+    never used, because it would show the fire's own burn scar."""
+    if year >= 2023:
+        return [f"LF{min(year - 1, 2025)}"] + (["LF2022"] if year > 2023 else []) + ["LF2020", "LF2016"]
+    if year >= 2021:
+        return ["LF2020", "LF2016"]
+    if year >= 2017:
+        return ["LF2016", "LF2014"]
+    if year >= 2015:
+        return ["LF2014", "LF2012", "LF2010"]
+    return ["LF2012", "LF2010", "LF2008"]
+
+
+def st_landfire2(g, ctx):
+    """landfire2.npz: fuels from the right LANDFIRE version for the fire's year (landfire.npz has none
+    before 2017 and the 2016 map for every fire up to 2022). Same arrays as landfire.npz."""
+    last = None
+    have = ctx["dir"] / "landfire.npz"
+    if have.exists():                                        # already the right version: reuse it, no download
+        z = dict(np.load(have))
+        if not bool(z.get("missing", True)) and str(z.get("version")) == landfire_versions_v2(g["year"])[0]:
+            return z
+    for v in landfire_versions_v2(g["year"]):
+        try:
+            return st_landfire(g, ctx, version=v)
+        except Exception as ex:  # noqa: BLE001      # that version is not served: try the next older one
+            last = ex
+            print(f"    {g['fire_id']}: LANDFIRE {v} failed ({str(ex)[:80]})", flush=True)
+    raise RuntimeError(f"no LANDFIRE version available for {g['year']}: {last}")
+
+
+def st_green(g, ctx):
+    """green.npz: satellite greenness (MODIS 16-day NDVI and EVI at 250 m, Terra and Aqua, so a new
+    composite every 8 days) from 80 days before the first perimeter to the last, on the fire's grid.
+    ends[k] is the last day of composite k's 16 days: a composite may only be used once that day is past.
+    Stand-in for live fuel moisture and grass curing. Source: Microsoft Planetary Computer (no account)."""
+    import requests
+    import rasterio
+    from rasterio.vrt import WarpedVRT
+    from rasterio.enums import Resampling
+    from affine import Affine
+    w, s_, e, n = g["bounds_lonlat"]
+    t0 = pd.Timestamp(g["first"]).tz_convert("UTC") - pd.Timedelta(days=80)
+    t1 = pd.Timestamp(g["last"]).tz_convert("UTC") + pd.Timedelta(days=1)
+    sess = requests.Session()
+    api = "https://planetarycomputer.microsoft.com/api"
+    items, body = [], {"collections": ["modis-13Q1-061"], "bbox": [w, s_, e, n], "limit": 200,
+                       "datetime": f"{t0.strftime('%Y-%m-%dT%H:%M:%SZ')}/{t1.strftime('%Y-%m-%dT%H:%M:%SZ')}"}
+    url = f"{api}/stac/v1/search"
+    while url:
+        r = sess.post(url, json=body, timeout=120)
+        r.raise_for_status()
+        j = r.json()
+        items += j.get("features", [])
+        nxt = [l for l in j.get("links", []) if l.get("rel") == "next"]
+        url, body = (nxt[0]["href"], nxt[0].get("body", body)) if nxt else (None, None)
+    if not items:
+        return dict(missing=np.array(True))
+    tok = sess.get(f"{api}/sas/v1/token/modis-13Q1-061", timeout=60).json()["token"]
+    H, W = g["height"], g["width"]
+    tr = Affine(*g["transform"])
+
+    def read(href, resampling):
+        with rasterio.Env(GDAL_DISABLE_READDIR_ON_OPEN="EMPTY_DIR"):
+            with rasterio.open(f"{href}?{tok}") as src:
+                with WarpedVRT(src, crs="EPSG:4326", transform=tr, width=W, height=H, resampling=resampling) as vrt:
+                    return vrt.read(1)
+
+    by_end = {}
+    for it in items:
+        p = it["properties"]
+        end = pd.Timestamp(p.get("end_datetime") or p.get("datetime")).tz_convert("UTC").floor("D")
+        by_end.setdefault(end, []).append(it)
+    ends, ndvi, evi, rel = [], [], [], []
+    for end in sorted(by_end):
+        nd = np.full((H, W), -32768, np.int16)
+        ev = np.full((H, W), -32768, np.int16)
+        rl = np.full((H, W), -1, np.int8)
+        for it in by_end[end]:                              # the tiles of one composite: fill where still empty
+            a = it["assets"]
+            try:
+                x = read(a["250m_16_days_NDVI"]["href"], Resampling.bilinear)
+                y = read(a["250m_16_days_EVI"]["href"], Resampling.bilinear)
+                q = read(a["250m_16_days_pixel_reliability"]["href"], Resampling.nearest)
+            except Exception as ex:  # noqa: BLE001
+                print(f"    {g['fire_id']}: greenness tile failed ({str(ex)[:80]})", flush=True)
+                continue
+            ok = (x > -3000) & (nd == -32768)
+            nd[ok], ev[ok], rl[ok] = x[ok], y[ok], q[ok]
+        if (nd > -3000).any():
+            ends.append(end.value)
+            ndvi.append(nd)
+            evi.append(ev)
+            rel.append(rl)
+    if not ends:
+        return dict(missing=np.array(True))
+    return dict(ends=np.array(ends, np.int64), ndvi=np.stack(ndvi), evi=np.stack(evi), reliability=np.stack(rel),
+                scale=np.array(1e-4), missing=np.array(False))
+
+
+def st_landfire(g, ctx, version=None):
     import rasterio
     import landfire_features as L
-    v = landfire_version(g["year"])
+    v = version or landfire_version(g["year"])
     if v is None:
         return dict(missing=np.array(True), version=np.array("none"))
-    tif = ctx["dir"] / "landfire_raw.tif"
+    tif = ctx["dir"] / f"landfire_raw_{v}.tif"
     res = float(g.get("res_m", 150.0))
     native = res < 120                                  # finer grids get LANDFIRE at its native 30 m
     L.fetch(g["bounds_lonlat"], tif, layers=[f"{v}_{x}" for x in ("FBFM40", "CC", "CH", "CBH", "CBD")],
@@ -411,7 +515,8 @@ def _landfire_per_cell(a, tr, g):
 
 
 FUNCS = {"labels": st_labels, "history": st_history, "viirs": st_viirs, "terrain": st_terrain,
-         "weather": st_weather, "landfire": st_landfire, "tessera": st_tessera, "suppression": st_suppression}
+         "weather": st_weather, "landfire": st_landfire, "tessera": st_tessera, "suppression": st_suppression,
+         "landfire2": st_landfire2, "green": st_green}
 
 
 # ---------------------------------------------------------------------------- shared resources (per process)
@@ -603,6 +708,75 @@ def hrrr_stage(out, grids, threads=16):
                     _save_hrrr(out, p, lat, lon, cKDTree)
             if k % 500 == 0:
                 print(f"  HRRR {k}/{len(keys)} files ({(time.time() - t_start) / 60:.0f} min)", flush=True)
+
+
+def fuelwx_stage(out, grids, threads=16):
+    """Per fire hrrr2.npz, the weather the hourly fuel-moisture model needs and hrrr.npz does not hold:
+    times (T,) ns UTC (the same 3-hourly analysis times, plus 12 h past the last perimeter), t2 (T, hh, wh)
+    air temperature in C, dpt dew point in C, dswrf sunshine on flat ground in W/m2, apcp3 rain in mm over the 3 h BEFORE each
+    time, and idx (H, W): flat index into the window for every cell. A separate file, so nothing that
+    reads hrrr.npz changes."""
+    import requests
+    from concurrent.futures import ThreadPoolExecutor
+    from scipy.spatial import cKDTree
+    import weather_features as WF
+    out = Path(out)
+    todo = [g for g in grids if not (out / "fires" / g["fire_id"] / "hrrr2.npz").exists()
+            and _fire_span(g)[1] >= pd.Timestamp("2014-08-01", tz="UTC")]
+    if not todo:
+        return
+    sess = requests.Session()
+    lat, lon = WF.hrrr_latlon(sess)
+    need, per = {}, {}
+    for g in todo:
+        win = WF.hrrr_window(lat, lon, g["bounds_lonlat"])
+        if win is None:
+            continue
+        t0, t1 = _fire_span(g)
+        ana = list(pd.date_range(t0 - pd.Timedelta(days=2), t1 + pd.Timedelta(hours=12), freq=f"{HRRR_STEP_H}h"))
+        r0, r1, c0, c1 = win
+        per[g["fire_id"]] = dict(g=g, win=win, ana=ana, left=2 * len(ana),
+                                 A=np.full((len(ana), 4, r1 - r0, c1 - c0), np.nan, np.float16))
+        for i, t in enumerate(ana):
+            need.setdefault((t, 0), []).append((g["fire_id"], i))                      # temperature, sunshine
+            need.setdefault((t - pd.Timedelta(hours=3), 3), []).append((g["fire_id"], i))   # rain of the 3 h before
+    keys = sorted(need)
+    print(f"fuel weather: {len(per)} fires, {len(keys)} distinct files", flush=True)
+
+    def fetch(key):
+        t, f = key
+        fields = WF.FUELWX_FIELDS if f == 0 else WF.FUELWX_RAIN
+        return key, WF.hrrr_fetch(sess, WF.HRRR.format(d=t.strftime("%Y%m%d"), h=t.hour, f=f), fields)
+
+    t_start = time.time()
+    with ThreadPoolExecutor(threads) as ex:
+        for k, (key, got) in enumerate(ex.map(fetch, keys)):
+            for fid, i in need[key]:
+                p = per[fid]
+                r0, r1, c0, c1 = p["win"]
+                if got:
+                    if "t2" in got:
+                        p["A"][i, 0] = got["t2"][r0:r1, c0:c1] - 273.15
+                    if "dswrf" in got:
+                        p["A"][i, 1] = got["dswrf"][r0:r1, c0:c1]
+                    if "dpt" in got:
+                        p["A"][i, 3] = got["dpt"][r0:r1, c0:c1] - 273.15
+                    if "apcp3" in got:
+                        p["A"][i, 2] = got["apcp3"][r0:r1, c0:c1]
+                p["left"] -= 1
+                if p["left"] == 0:                       # write a fire as soon as its last file is in
+                    g = p["g"]
+                    hlat, hlon = lat[r0:r1, c0:c1], lon[r0:r1, c0:c1]
+                    glon, glat = centres(g)
+                    cs = math.cos(math.radians(float(glat.mean())))
+                    _, idx = cKDTree(np.c_[hlat.ravel(), hlon.ravel() * cs]).query(np.c_[glat.ravel(), glon.ravel() * cs])
+                    np.savez_compressed(out / "fires" / g["fire_id"] / "hrrr2.npz",
+                                        times=np.array([t.value for t in p["ana"]], np.int64),
+                                        t2=p["A"][:, 0], dswrf=p["A"][:, 1], apcp3=p["A"][:, 2], dpt=p["A"][:, 3],
+                                        idx=idx.reshape(g["height"], g["width"]).astype(np.int32))
+                    p["A"] = None
+            if k % 500 == 0:
+                print(f"  fuel weather {k}/{len(keys)} files ({(time.time() - t_start) / 60:.0f} min)", flush=True)
 
 
 def _save_hrrr(out, p, lat, lon, cKDTree):
@@ -937,6 +1111,8 @@ def main():
                 break
     if "hrrr" in stages:
         hrrr_stage(out, grids)
+    if "fuelwx" in stages:
+        fuelwx_stage(out, grids)
     if "goes" in stages:
         goes_stage(out, grids)
     if "human" in stages:
@@ -945,9 +1121,11 @@ def main():
     for g in grids:
         d = out / "fires" / g["fire_id"]
         status.append({"fire_id": g["fire_id"], "year": g["year"], "H": g["height"], "W": g["width"],
-                       **{s: (d / f"{s}.npz").exists() for s in stages}})
-    pd.DataFrame(status).to_csv(out / "build_status.csv", index=False)
-    print("Done:", out / "build_status.csv")
+                       **{s: (d / f"{'hrrr2' if s == 'fuelwx' else s}.npz").exists() for s in stages}})
+    # the fuel-moisture stages report to their own file, so the main build's status table is not replaced
+    name = "build_status_extra.csv" if set(stages) <= set(EXTRA_STAGES) else "build_status.csv"
+    pd.DataFrame(status).to_csv(out / name, index=False)
+    print("Done:", out / name)
 
 
 if __name__ == "__main__":

@@ -119,12 +119,12 @@ HYBRID_V2 = ("hybrid2", "physics2")               # have the crown weight and em
 UNET_MODES = ("unet", "unet2", "unet3")
 
 
-def groups_used(drop, v2=False, t3=False, origin=False):
+def groups_used(drop, v2=False, t3=False, origin=False, fm=False):
     """Input groups in channel order; the physics-v2 group only for the v2 modes, the day-by-day
     history groups only for unet3 with its time dimension (they stay last: the history is the tail),
     the perimeter-age group only for models trained with --origin-lag."""
     return [g for g in D.GROUPS if g not in drop and (v2 or g not in D.V2_GROUPS) and (t3 or g not in D.T3_GROUPS)
-            and (origin or g not in D.O_GROUPS)]
+            and (origin or g not in D.O_GROUPS) and (fm or g not in D.FM_GROUPS)]
 
 
 def phys_stack(phys):
@@ -377,6 +377,11 @@ def main():
                     help="training crop size; 12 at 75 m keeps the cost per crop the same as 24 km at 150 m")
     ap.add_argument("--u3-time", type=int, default=1, help="unet3: day-by-day history + temporal attention (1/0)")
     ap.add_argument("--u3-attn", type=int, default=1, help="unet3: transformer bottleneck (1/0)")
+    ap.add_argument("--fuel-moisture", type=int, default=0,
+                    help="1: add the hourly, slope-aware fuel moisture and satellite greenness inputs, and use the fuel "
+                         "map of the fire's own year (needs the fuelwx / green / landfire2 build stages)")
+    ap.add_argument("--fm-physics", type=int, default=0,
+                    help="1: the spread equations use the hourly fuel moisture too (experiment; not for mixed routers)")
     ap.add_argument("--origin-lag", type=int, default=0,
                     help="1: train for forecasts that start hours after the perimeter was mapped, as on the live site "
                          "(half the samples start 0-36 h into the window; adds the perimeter's age as an input)")
@@ -410,7 +415,9 @@ def main():
     CROP_KM = a.crop_km
     D.TEMPORAL = a.mode == "unet3" and bool(a.u3_time)
     arch = {"time": D.TEMPORAL, "attn": bool(a.u3_attn)} if a.mode == "unet3" else None
-    groups = groups_used(set(a.drop), v2=D.PHYSICS_V2, t3=D.TEMPORAL, origin=bool(a.origin_lag))
+    D.FM_ON = D.FUEL_V2 = bool(a.fuel_moisture)
+    D.FM_PHYSICS = bool(a.fm_physics)
+    groups = groups_used(set(a.drop), v2=D.PHYSICS_V2, t3=D.TEMPORAL, origin=bool(a.origin_lag), fm=bool(a.fuel_moisture))
     n_in = sum(D.GROUPS[g] for g in groups)
     print(f"[{a.name}] mode={a.mode} inputs={n_in} ch  fires train/val/test = "
           f"{len(split['train'])}/{len(split['val'])}/{len(split['test'])}  pairs = "
@@ -500,7 +507,7 @@ def main():
               f"burning {extra['effective_minutes_per_day']:.0f} min/day", flush=True)
     if arch:
         extra.update(arch=arch, width=a.width, params=sum(p.numel() for p in model.parameters()))
-    json.dump({"name": a.name, "mode": a.mode, "drop": a.drop, "origin": bool(a.origin_lag), "data_version": D.DATA_VERSION, "input_version": D.INPUT_VERSION, "weather": D.WEATHER_MODE, "val": best[2], "test": mt, "history": hist,
+    json.dump({"name": a.name, "mode": a.mode, "drop": a.drop, "origin": bool(a.origin_lag), "fuel_moisture": bool(a.fuel_moisture), "fm_physics": bool(a.fm_physics), "data_version": D.DATA_VERSION, "input_version": D.INPUT_VERSION, "weather": D.WEATHER_MODE, "val": best[2], "test": mt, "history": hist,
                "pairs": rows, **extra}, open(runs / f"{a.name}.json", "w"), indent=1)
     print(f"[{a.name}] TEST AP {mt['ap']:.3f} F1 {mt['f1']:.3f} IoU {mt['iou']:.3f} P {mt['precision']:.3f} "
           f"R {mt['recall']:.3f} area {mt['area_ratio']:.2f}  edge {mt.get('edge_km_mean', float('nan')):.2f} km "
