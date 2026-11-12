@@ -347,7 +347,11 @@ def landfire_version(year):
 
 
 def landfire_versions_v2(year):
-    """LANDFIRE versions to try for a fire year, best first: the newest map that describes the land BEFORE
+    """NOT AVAILABLE as of 2026-11-12: LANDFIRE's product service and its full-extent downloads only carry
+    the fuel layers of LF2016, LF2022, LF2023, LF2024 and LF2025 (LF2012, LF2014 and LF2020 fuels were
+    withdrawn), so this falls back to what landfire.npz already has. Kept for the day older maps are
+    obtained another way (LANDFIRE help desk).
+    LANDFIRE versions to try for a fire year, best first: the newest map that describes the land BEFORE
     that year's fires. LF2012 for 2013-14, LF2014 for 2015-16, LF2016 (Remap) for 2017-20, LF2020 for
     2021-22, then one map per year. Older maps are fallbacks; a map from the fire's own year or later is
     never used, because it would show the fire's own burn scar."""
@@ -461,7 +465,7 @@ def st_green(g, ctx):
         if failed:                                           # a download problem, not a gap in the data: leave no
             raise RuntimeError(f"all {failed} greenness tiles failed")   # file behind, so the next run tries again
         return dict(missing=np.array(True))
-    return dict(ends=np.array(ends, np.int64), ndvi=np.stack(ndvi), evi=np.stack(evi), reliability=np.stack(rel),
+    return dict(ends=np.array(ends, np.int64), ndvi=np.stack(ndvi), evi=np.stack(evi),
                 scale=np.array(1e-4), missing=np.array(False))
 
 
