@@ -403,7 +403,11 @@ def st_green(g, ctx):
                        "datetime": f"{t0.strftime('%Y-%m-%dT%H:%M:%SZ')}/{t1.strftime('%Y-%m-%dT%H:%M:%SZ')}"}
     url = f"{api}/stac/v1/search"
     while url:
-        r = sess.post(url, json=body, timeout=120)
+        for tries in range(5):
+            r = sess.post(url, json=body, timeout=120)
+            if r.status_code not in (429, 500, 502, 503, 504):
+                break
+            time.sleep(min(60, 5 * 2 ** tries))
         r.raise_for_status()
         j = r.json()
         items += j.get("features", [])
@@ -415,17 +419,47 @@ def st_green(g, ctx):
     tr = Affine(*g["transform"])
     tokens = {}
 
+    cache = Path(ctx["dir"]).parent.parent / "cache"
+    cache.mkdir(parents=True, exist_ok=True)
+
+    def token(account, container):
+        """One read token per storage container, shared by every fire and worker through a small file and
+        reused until shortly before it expires. Asking for a new token per fire (1,800 requests in 20
+        minutes) got the anonymous token service to refuse most of them."""
+        key = (account, container)
+        f = cache / f"pc_token_{account}_{container}.json"
+        now = pd.Timestamp.now(tz="UTC")
+        for src in (tokens.get(key), None):
+            try:
+                j = src or json.loads(f.read_text())
+                if pd.Timestamp(j["msft:expiry"]) - now > pd.Timedelta(minutes=10):
+                    tokens[key] = j
+                    return j["token"]
+            except (OSError, ValueError, KeyError, TypeError):
+                pass
+        last = None
+        for tries in range(6):
+            try:
+                r = sess.get(f"{api}/sas/v1/token/{account}/{container}", timeout=60)
+                if r.status_code == 200:
+                    j = r.json()
+                    tokens[key] = j
+                    tmp = f.with_suffix(f".{os.getpid()}.tmp")
+                    tmp.write_text(json.dumps(j))
+                    tmp.replace(f)
+                    return j["token"]
+                last = f"HTTP {r.status_code}"
+            except requests.RequestException as ex:
+                last = type(ex).__name__
+            time.sleep(min(60, 5 * 2 ** tries))           # the service asks anonymous callers to slow down
+        raise RuntimeError(f"no read token ({last})")
+
     def signed(href):
         """The read token belongs to the storage container the file sits in (the image files are in a
-        different container from the one the collection names), so ask for it by account and container."""
+        different container from the one the collection names)."""
         from urllib.parse import urlparse
         u = urlparse(href)
-        key = (u.netloc.split(".")[0], u.path.lstrip("/").split("/")[0])
-        if key not in tokens:
-            r = sess.get(f"{api}/sas/v1/token/{key[0]}/{key[1]}", timeout=60)
-            r.raise_for_status()
-            tokens[key] = r.json()["token"]
-        return f"{href}?{tokens[key]}"
+        return f"{href}?{token(u.netloc.split('.')[0], u.path.lstrip('/').split('/')[0])}"
 
     def read(href, resampling):
         with rasterio.Env(GDAL_DISABLE_READDIR_ON_OPEN="EMPTY_DIR"):
@@ -446,9 +480,16 @@ def st_green(g, ctx):
         for it in by_end[end]:                              # the tiles of one composite: fill where still empty
             a = it["assets"]
             try:
-                x = read(a["250m_16_days_NDVI"]["href"], Resampling.bilinear)
-                y = read(a["250m_16_days_EVI"]["href"], Resampling.bilinear)
-                q = read(a["250m_16_days_pixel_reliability"]["href"], Resampling.nearest)
+                for tries in range(3):                       # a refused or dropped read: wait and try again
+                    try:
+                        x = read(a["250m_16_days_NDVI"]["href"], Resampling.bilinear)
+                        y = read(a["250m_16_days_EVI"]["href"], Resampling.bilinear)
+                        break
+                    except Exception:  # noqa: BLE001
+                        if tries == 2:
+                            raise
+                        time.sleep(10 * (tries + 1))
+                q = np.zeros((H, W), np.int8)
             except Exception as ex:  # noqa: BLE001
                 failed += 1
                 if failed <= 2:
