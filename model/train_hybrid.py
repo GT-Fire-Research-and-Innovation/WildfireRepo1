@@ -217,6 +217,9 @@ def flip_y_channels(groups):
 def build_model(mode, n_in, width, device, dx=150.0, arch=None):
     if mode == "unet3":
         arch = arch or {"time": True, "attn": True}
+        if arch.get("swin"):                                 # Swin transformer encoder (nets.SwinUNet)
+            from nets import SwinUNet
+            return SwinUNet(n_in, D.GROUPS["seq"] if arch["time"] else 0, D.SEQ_DAYS, width).to(device)
         return UNet3(n_in, D.GROUPS["seq"] if arch["time"] else 0, D.SEQ_DAYS, width, attn=arch["attn"]).to(device)
     if mode in UNET_MODES:
         return UNet(n_in, 1, width).to(device)
@@ -377,6 +380,8 @@ def main():
                     help="training crop size; 12 at 75 m keeps the cost per crop the same as 24 km at 150 m")
     ap.add_argument("--u3-time", type=int, default=1, help="unet3: day-by-day history + temporal attention (1/0)")
     ap.add_argument("--u3-attn", type=int, default=1, help="unet3: transformer bottleneck (1/0)")
+    ap.add_argument("--u3-swin", type=int, default=0,
+                    help="unet3: Swin transformer encoder at the two coarse levels, in place of convolutions and the bottleneck (1/0)")
     ap.add_argument("--origin-lag", type=int, default=0,
                     help="1: train for forecasts that start hours after the perimeter was mapped, as on the live site "
                          "(half the samples start 0-36 h into the window; adds the perimeter's age as an input)")
@@ -409,7 +414,7 @@ def main():
     global CROP_KM
     CROP_KM = a.crop_km
     D.TEMPORAL = a.mode == "unet3" and bool(a.u3_time)
-    arch = {"time": D.TEMPORAL, "attn": bool(a.u3_attn)} if a.mode == "unet3" else None
+    arch = {"time": D.TEMPORAL, "attn": bool(a.u3_attn) and not a.u3_swin, "swin": bool(a.u3_swin)} if a.mode == "unet3" else None
     groups = groups_used(set(a.drop), v2=D.PHYSICS_V2, t3=D.TEMPORAL, origin=bool(a.origin_lag))
     n_in = sum(D.GROUPS[g] for g in groups)
     print(f"[{a.name}] mode={a.mode} inputs={n_in} ch  fires train/val/test = "
@@ -423,7 +428,8 @@ def main():
     set_grid(res_m / 1000)
     print(f"  grid {res_m:.0f} m: crops {CROP} cells, eval margin {EVAL_PAD} cells", flush=True)
     if arch:
-        print(f"  unet3: width {a.width}, time {'on' if arch['time'] else 'off'}, attention {'on' if arch['attn'] else 'off'}", flush=True)
+        print(f"  unet3: width {a.width}, time {'on' if arch['time'] else 'off'}, "
+              + ("Swin transformer encoder" if arch["swin"] else f"attention {'on' if arch['attn'] else 'off'}"), flush=True)
     model = build_model(a.mode, n_in, a.width, a.device, dx=res_m, arch=arch)
     if a.init and not ck.exists():
         model.load_state_dict(torch.load(a.init, map_location=a.device, weights_only=False))

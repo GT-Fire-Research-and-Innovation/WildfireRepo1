@@ -94,7 +94,8 @@ class Member:
                 sd, src = (best[1], f"best so far (val AP {best[0]:.3f})") if best and best[1] is not None else (c["model"], "latest")
             else:
                 raise SystemExit(f"no checkpoint for {name} in {runs}")
-            arch = {"time": any(k.startswith("temporal.") for k in sd), "attn": any(k.startswith("bottleneck.") for k in sd)}
+            arch = {"time": any(k.startswith("temporal.") for k in sd), "attn": any(k.startswith("bottleneck.") for k in sd),
+                    "swin": any(k.startswith("swin.") for k in sd)}
             if arch["time"]:
                 D.TEMPORAL = True                         # the loader now also builds the day-by-day history
             self.groups = TH.groups_used(set(drop), v2=True, t3=arch["time"], origin=origin)
@@ -102,7 +103,8 @@ class Member:
             self.model = TH.build_model(mode, n_in, int(sd["head.weight"].shape[1]), device, dx=dx, arch=arch)
             self.model.load_state_dict(sd)
             self.model.eval()
-            print(f"  {name}: unet3 (time {'on' if arch['time'] else 'off'}, attention {'on' if arch['attn'] else 'off'}), {src}", flush=True)
+            kind = "Swin encoder" if arch["swin"] else f"attention {'on' if arch['attn'] else 'off'}"
+            print(f"  {name}: unet3 (time {'on' if arch['time'] else 'off'}, {kind}), {src}", flush=True)
             return
         v2 = mode in TH.V2_MODES
         self.groups = [g for g in TH.groups_used(set(drop), v2=v2, origin=origin)]
