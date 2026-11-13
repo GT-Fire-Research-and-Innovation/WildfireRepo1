@@ -20,7 +20,7 @@ export PATH="$HOME/scratch/envs/wildfire/bin:$PATH"
 git pull -q --ff-only || echo "(git pull failed: using the code on disk)"
 
 echo "1) perimeter archive"
-if [ -d "$ARCH/.git" ]; then git -C "$ARCH" pull -q --ff-only; else git clone -q --depth 1 --branch perimeter-archive https://github.com/Javyn05/WildfireRepo1.git "$ARCH"; fi
+if [ -d "$ARCH/.git" ]; then git -C "$ARCH" pull -q --ff-only; else git clone -q --depth 1 --branch perimeter-archive https://github.com/GT-Fire-Research-and-Innovation/WildfireRepo1.git "$ARCH"; fi
 
 echo "2) archive -> training catalog"
 python pipeline/archive_catalog.py --archive "$ARCH" --out "$CAT" || exit 1

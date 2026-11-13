@@ -7,7 +7,7 @@ tags: [wildfire, remote-sensing, geospatial, fire-spread]
 
 Daily fire perimeters for 1,841 U.S. wildfires (≥ 1,000 acres, ≥ 2 good perimeters after quality control)
 with 11 co-registered input layers, built for next-perimeter fire spread prediction.
-Code: https://github.com/rafiki230/WildfireRepo1 (`pipeline/catalog.py`, `pipeline/qc_fires.py`,
+Code: https://github.com/GT-Fire-Research-and-Innovation/WildfireRepo1 (`pipeline/catalog.py`, `pipeline/qc_fires.py`,
 `pipeline/build_multiyear.py`).
 
 ## Layout

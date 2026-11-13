@@ -27,7 +27,7 @@ hotspots, plus the project's 24-hour spread forecast for every actively burning 
    - `FIRMS_MAP_KEY`: your NASA FIRMS map key
    - `LANDFIRE_EMAIL`: the contact email the LANDFIRE service requires
 3. **First run:** Actions → Live forecast → Run workflow. The site appears at
-   `https://<owner>.github.io/<repo>/` (the run's deploy step prints the link).
+   `https://gt-fire-research-and-innovation.github.io/WildfireRepo1/` (the run's deploy step prints the link).
 
 Until trained weights are added, forecasts use the physics-only model (Rothermel + crown fire +
 embers). Add the router for the real forecasts. Model scores before the v3 retrain (Nov 2026) came from
