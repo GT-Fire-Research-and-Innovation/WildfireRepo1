@@ -1,30 +1,53 @@
-# Saves every new or changed NIFC perimeter version to the perimeter-archive branch, every 15 minutes.
-# Incident GIS teams edit perimeters in place, and public archives keep roughly one per day, so
-# sub-daily versions are lost unless someone saves them while they are visible. This job does that.
-# Sources: WFIGS Current + Year-to-Date (active fires) + every Year-to-Date perimeter edited in the
-# last 6 hours (any fire type or status). Duplicates are skipped by geometry + perimeter time.
+# Saves every version of every NIFC fire perimeter to the perimeter-archive branch, checking every 5 minutes.
+# Incident GIS teams edit perimeters in place, and public archives keep roughly one per day, so sub-daily
+# versions are lost unless someone saves them while they are visible. This job does that.
+#
+# GitHub's own timer cannot be relied on for this (it started this workflow 2-3 times a day when asked for
+# every 15 minutes), so the job does not wait for it: one run polls in a loop for 5.5 hours and then starts
+# the next run itself. The timer is only a safety net that starts a loop when none is running.
+#   Start it:  Actions > Perimeter capture > Run workflow   (once, after this file is merged)
+#   Stop it:   Actions > Perimeter capture > ... > Disable workflow, then cancel the running job
+#   Check it:  python live/wfigs_poller.py --out <checkout of perimeter-archive> --report
+# What is saved and how changes are detected: live/wfigs_poller.py.
 name: Perimeter capture
 
 on:
   schedule:
-    - cron: "*/15 * * * *"
+    - cron: "7,37 * * * *"
   workflow_dispatch:
 
 permissions:
   contents: write
-
-concurrency:
-  group: perimeter-archive
-  cancel-in-progress: false
+  actions: write          # to start the next run
 
 jobs:
-  capture:
+  watchdog:               # timer runs: start a capture loop only if none is running or waiting
+    if: github.event_name == 'schedule'
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 5
+    steps:
+      - name: Start the capture loop if none is running
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          n=$(gh run list -R "$GITHUB_REPOSITORY" --workflow perimeter-capture.yml --event workflow_dispatch \
+                --limit 30 --json status --jq '[.[] | select(.status != "completed")] | length')
+          echo "capture loops running or waiting: $n"
+          if [ "$n" = "0" ]; then gh workflow run perimeter-capture.yml -R "$GITHUB_REPOSITORY" --ref "$GITHUB_REF_NAME"; fi
+
+  capture:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    concurrency:          # one loop at a time; a second one waits its turn
+      group: perimeter-archive
+      cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4          # only the poller (the repo also holds ~180 MB of model weights)
         with:
-          sparse-checkout: live/wfigs_poller.py
+          sparse-checkout: |
+            live/wfigs_poller.py
+            live/capture_loop.sh
           sparse-checkout-cone-mode: false
           filter: blob:none
 
@@ -35,22 +58,24 @@ jobs:
       - name: Install
         run: pip install -q requests pandas
 
-      - name: Save new perimeter versions
+      - name: Capture loop (5.5 hours)
+        id: loop
+        env:
+          ARCHIVE_URL: https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}
+          POLL_SECONDS: 300
+          LOOP_SECONDS: 19800
+        run: bash live/capture_loop.sh
+
+      - name: Start the next loop
+        if: ${{ !cancelled() }}            # a run cancelled by hand does not restart itself
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          cd "$RUNNER_TEMP"
-          URL="https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}"
-          # only index.csv is checked out: the archive grows all season and we just add files to it
-          if git clone -q --depth 1 --filter=blob:none --sparse --branch perimeter-archive "$URL" arch 2>/dev/null; then
-            git -C arch sparse-checkout set --no-cone /perimeters/index.csv
-          else
-            mkdir arch && git -C arch init -q -b perimeter-archive && git -C arch remote add origin "$URL"
+          if [ "${{ steps.loop.outcome }}" != "success" ]; then
+            # after three failures in a row, stop restarting: the timer tries again later, without a storm of failed runs
+            bad=$(gh run list -R "$GITHUB_REPOSITORY" --workflow perimeter-capture.yml --event workflow_dispatch \
+                    --status completed --limit 2 --json conclusion --jq '[.[] | select(.conclusion == "failure")] | length')
+            if [ "$bad" = "2" ]; then echo "third failure in a row: leaving the restart to the timer"; exit 0; fi
+            sleep 600
           fi
-          python "$GITHUB_WORKSPACE/live/wfigs_poller.py" --out arch --once
-          cd arch
-          git add --sparse -A
-          if git -c user.name="gt-fire-bot" -c user.email="actions@users.noreply.github.com" \
-                 commit -qm "NIFC perimeters $(date -u +%Y-%m-%dT%H:%MZ)"; then
-            for i in 1 2 3; do git push -q origin perimeter-archive && break; git pull -q --rebase origin perimeter-archive; done
-          else
-            echo "no new perimeter versions"
-          fi
+          gh workflow run perimeter-capture.yml -R "$GITHUB_REPOSITORY" --ref "$GITHUB_REF_NAME"

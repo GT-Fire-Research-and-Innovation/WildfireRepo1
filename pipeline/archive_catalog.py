@@ -1,5 +1,5 @@
 """
-Turn the live perimeter archive (perimeter-archive branch, filled every 2 h by live/wfigs_poller.py)
+Turn the live perimeter archive (perimeter-archive branch, filled every 5 min by live/wfigs_poller.py)
 into a training catalog in the same format as pipeline/catalog.py, so new fires can be built with
 build_multiyear.py and added to training (the continuous-learning loop, scripts/ice_continual.sh).
 
@@ -40,7 +40,7 @@ def load_archive(arch):
             continue
         p = f.get("properties", {})
         # WFIGS times are true UTC. A perimeter with no mapping time was archived under the time it was first
-        # seen (within 15 min of its upload): an edit time.
+        # seen (minutes after its upload when the capture is running): an edit time.
         tsrc = "edit" if str(r.polygon_time) == str(getattr(r, "first_seen", "")) else "mapped"
         rows.append(dict(incident=str(r.fire_id), incident_name=r.name, category=str(r.category or ""),
                          map_method=str(r.map_method or ""), perim_time=pd.Timestamp(r.polygon_time),

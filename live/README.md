@@ -10,9 +10,11 @@ hotspots, plus the project's 24-hour spread forecast for every actively burning 
   GRIDMET, FIRMS VIIRS, latest HRRR forecast) with the training pipeline's own code, runs the model,
   and writes `site/data/index.json` + `site/data/forecast/<fire>.json` (the forecast on the model's own 150 m cells). The workflow then deploys
   `site/` to GitHub Pages.
-- **Retraining feed:** `.github/workflows/perimeter-capture.yml` saves every new NIFC perimeter version
-  to the `perimeter-archive` branch every 15 minutes (`live/wfigs_poller.py`), the raw material for adding
-  new fires to the training set.
+- **Retraining feed:** `.github/workflows/perimeter-capture.yml` saves every version of every NIFC perimeter
+  to the `perimeter-archive` branch, checking every 5 minutes in a job that restarts itself (GitHub's timer
+  alone fired 2-3 times a day). `live/wfigs_poller.py` lists both NIFC services without outlines, downloads
+  only what changed, and logs every poll (`perimeters/polls/`), so gaps in coverage are on record. This is
+  the raw material for adding new fires to the training set.
 - **Starting fire:** a fire with a perimeter starts from it plus any satellite detection made after it
   (within 2 km, one 150 m cell each). A fire with no perimeter starts as a compact shape of its reported
   size around the incident point and its detections; forecasts for fires with no recent satellite heat
@@ -58,9 +60,9 @@ Experimental research forecast, not an official product. The app says so on ever
 
 The model keeps learning from fires as they happen:
 
-1. **Collect** (every 15 min, GitHub Actions): every new NIFC perimeter version is saved to the
-   `perimeter-archive` branch. Perimeters come from NIFC's Current service *and* the Year-to-Date
-   service, because Current drops active fires whose incident record went stale.
+1. **Collect** (every 5 min, GitHub Actions): every new NIFC perimeter version is saved to the
+   `perimeter-archive` branch. Perimeters come from NIFC's Current service *and* the whole Year-to-Date
+   service (any fire type or status), because Current drops active fires whose incident record went stale.
 2. **Catalog** (weekly, ICE): `pipeline/archive_catalog.py` turns the archive into training fires with
    the same cleaning as the main catalog (wildfires only, no hand sketches, one perimeter per burn day,
    no shrinking re-maps, 3+ burn days, 300+ acres, finished growing).

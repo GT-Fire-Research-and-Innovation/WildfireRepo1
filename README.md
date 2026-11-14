@@ -28,7 +28,8 @@ cp .env.example .env        # add your FIRMS MAP_KEY
 
 ## Live data
 ```bash
-python live/wfigs_poller.py --out data/live            # polls every 15 min; --once for cron
+python live/wfigs_poller.py --out data/live            # saves every changed NIFC perimeter, polling every 5 min
+python live/wfigs_poller.py --out data/live --report   # how complete the archive is (gaps between polls, versions)
 python live/firms.py latest --days 1                    # CONUS VIIRS, last 24 h (S-NPP, NOAA-20, NOAA-21)
 python live/firms.py fires --live data/live --days 2    # detections around every archived fire
 python live/firms.py history --bbox W S E N --start 2020-09-01 --end 2020-09-20
