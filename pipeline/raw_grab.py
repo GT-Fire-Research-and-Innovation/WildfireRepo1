@@ -152,8 +152,9 @@ class Batcher:
         self._open()
         self.rows.append(dict(fire_id=fire["fire_id"], name=fire["name"], year=fire["year"], channel=self.channel,
                               status=status, n_files=len(files), bytes=nbytes, files=";".join(files),
-                              sources=";".join(sources), fetched_utc=datetime.now(timezone.utc).isoformat(timespec="seconds"),
-                              error=(error or "")[:500]))
+                              sources=";".join(RC.redact(s) for s in sources),
+                              fetched_utc=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                              error=RC.redact(error)[:500]))       # manifests are published: no keys, no email
         self.bytes += nbytes
         self.totals[status if status in self.totals else "error"] += 1
         self.totals["bytes"] += nbytes
@@ -255,6 +256,7 @@ def run(a):
         if ch in RC.GROUP:
             results = RC.GROUP_FUNCS[ch](runnable, ctx)
             for k, (f, status, sources, err) in enumerate(results, 1):
+                err = RC.redact(err)
                 stage = ctx.stage_root / f["fire_id"] / ch
                 b.add(f, status, stage, sources, err)
                 ctx.drop_stage(f["fire_id"])
@@ -271,10 +273,10 @@ def run(a):
                     status, sources = fn(f, stage, ctx)
                     err = ""
                 except Exception as ex:  # noqa: BLE001
-                    status, sources, err = "error", [], f"{type(ex).__name__}: {ex}"
+                    status, sources, err = "error", [], RC.redact(f"{type(ex).__name__}: {ex}")
                     if a.verbose:
-                        traceback.print_exc()
-                b.add(f, status, stage, [RC.redact(s) for s in sources], err)
+                        print(RC.redact(traceback.format_exc()), flush=True)
+                b.add(f, status, stage, sources, err)
                 ctx.drop_stage(f["fire_id"])
                 print(f"[{k}/{len(runnable)}] {f['fire_id']} {f['name']} ({f['year']}): {status}"
                       + (f" {err[:120]}" if err else "") + f"  ({(time.time() - t0) / 60:.0f} min)", flush=True)

@@ -160,10 +160,38 @@ def goes_hours(fire):
     return out
 
 
-def redact(url):
-    """Source URL safe to publish: no FIRMS map key, no LANDFIRE email."""
-    url = re.sub(r"(/api/area/csv/)[^/]+/", r"\1{MAP_KEY}/", url)
-    return re.sub(r"([?&])Email=[^&]*&?", r"\1", url).rstrip("&?")
+SECRET_NAMES = {"FIRMS_MAP_KEY": "{MAP_KEY}", "LANDFIRE_EMAIL": "{EMAIL}", "HF_TOKEN": "{HF_TOKEN}"}
+
+
+def _secret_values():
+    """{value: placeholder} for every secret this process can see (environment, .env, ~/.config/wildfire/env)."""
+    vals = {}
+    for name, ph in SECRET_NAMES.items():
+        v = os.environ.get(name)
+        if not v:
+            for p in (Path(".env"), Path.home() / ".config" / "wildfire" / "env"):
+                try:
+                    for line in p.read_text().splitlines():
+                        if line.startswith(name + "="):
+                            v = line.split("=", 1)[1].split("#")[0].strip()
+                except OSError:
+                    pass
+        if v and len(v) >= 4:
+            from urllib.parse import quote, quote_plus
+            for form in (v, quote(v, safe=""), quote_plus(v)):     # as typed, and as it appears inside URLs
+                vals[form] = ph
+    return vals
+
+
+def redact(text):
+    """Text safe to publish (manifests, logs): no FIRMS map key, LANDFIRE email or HF token, whether they
+    appear as URL parts (also inside exception messages) or literally."""
+    text = str(text or "")
+    for v, ph in _secret_values().items():
+        text = text.replace(v, ph)
+    text = re.sub(r"(/api/area/csv/)[^/\s]+/", r"\1{MAP_KEY}/", text)
+    text = re.sub(r"([?&])Email=[^&\s]*&?", r"\1", text)
+    return re.sub(r"[?&]+(?=\s|$)", "", text)
 
 
 # ------------------------------------------------------------------------------------- context

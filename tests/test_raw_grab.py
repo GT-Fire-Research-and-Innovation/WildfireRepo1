@@ -71,6 +71,20 @@ def test_redact_removes_map_key_and_email():
     assert "me@x.org" not in v and "Layer_List=LF2016_CC" in v
 
 
+def test_errors_in_manifest_never_hold_secrets(tmp_path, monkeypatch):
+    """A connection error quotes the request URL; the manifest is public, so the key and email must go."""
+    monkeypatch.setenv("FIRMS_MAP_KEY", "k3yK3yK3y")
+    monkeypatch.setenv("LANDFIRE_EMAIL", "crew@example.org")
+    api = FakeApi()
+    b = RG.Batcher(api, "me/raw", "firms", tmp_path, batch_fires=2, min_free_gb=0, keep=True)
+    b.add(fire(fire_id="A"), "error", error="ConnectionError: HTTPSConnectionPool(host='firms.modaps.eosdis.nasa.gov', "
+                                            "port=443): Max retries exceeded with url: /api/area/csv/k3yK3yK3y/VIIRS_SNPP_SP/x/5/2018-11-02")
+    b.add(fire(fire_id="B"), "error", error="ReadTimeout for https://lfps.usgs.gov/api/job/submit?Email=crew%40example.org&Layer_List=x "
+                                            "(contact crew@example.org)")
+    text = "".join(p.read_text() for p in (tmp_path / "batch").rglob("*.csv"))
+    assert "k3yK3yK3y" not in text and "crew@example.org" not in text and "crew%40example.org" not in text
+
+
 # ------------------------------------------------------------------------------------- resume
 
 def test_latest_manifest_row_decides_done():
