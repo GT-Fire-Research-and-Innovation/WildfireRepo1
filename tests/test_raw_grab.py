@@ -155,6 +155,39 @@ def test_shared_file_added_once(tmp_path):
     assert "shared/ics209/ics209plus-wildfire.zip" in files and "shared/old.zip" not in files
 
 
+# ------------------------------------------------------------------------------------- setup check
+
+class WhoAmI:
+    def __init__(self, token="hf_x", me=None, fail=False):
+        self.token, self.me, self.fail = token, me, fail
+
+    def whoami(self):
+        if self.fail:
+            raise RuntimeError("401 Client Error: Unauthorized")
+        return self.me
+
+
+ME = {"name": "sam", "orgs": [{"name": "gt-fire"}], "auth": {"accessToken": {"role": "write"}}}
+
+
+@pytest.mark.parametrize("api, repo, says", [
+    (WhoAmI(token=None, fail=True), "sam/raw", "HF_TOKEN is not set"),
+    (WhoAmI(fail=True), "sam/raw", "rejected HF_TOKEN"),
+    (WhoAmI(me=ME), "your-name/wildfire-raw-2014-2025", "'your-name' is not your account"),
+    (WhoAmI(me=dict(ME, auth={"accessToken": {"role": "read"}})), "sam/raw", "read-only"),
+    (WhoAmI(me=ME), "no-slash", "account/repo-name"),
+])
+def test_setup_problems_stop_with_one_clear_line(api, repo, says, capsys):
+    with pytest.raises(SystemExit) as e:
+        RG.check_hf(api, repo)
+    assert e.value.code == RG.SETUP_ERROR and says in capsys.readouterr().err
+
+
+def test_setup_ok_for_own_account_and_org():
+    assert RG.check_hf(WhoAmI(me=ME), "sam/raw") == "sam"
+    assert RG.check_hf(WhoAmI(me=ME), "gt-fire/raw") == "sam"
+
+
 # ------------------------------------------------------------------------------------- per-fire links
 
 def test_fire_links_cover_every_channel_with_files_and_sources():

@@ -213,6 +213,39 @@ def ensure_repo(api, repo, private, source_repo, cache):
     api.create_commit(repo, ops, repo_type="dataset", commit_message="Dataset card and catalog")
 
 
+SETUP_ERROR = 3          # exit code for a setup problem (token, repo name): retrying other channels cannot help
+
+
+def setup_error(msg):
+    print(f"SETUP ERROR: {msg}", file=sys.stderr, flush=True)
+    raise SystemExit(SETUP_ERROR)
+
+
+def check_hf(api, repo):
+    """Fail fast, with one clear line, when this token cannot write to `repo`. Returns the account name."""
+    if not repo or "/" not in repo:
+        setup_error(f"--hf-repo must look like 'account/repo-name', got {repo!r}")
+    try:
+        me = api.whoami()                      # HF_TOKEN, else a cached `hf auth login`
+    except Exception as ex:  # noqa: BLE001
+        if not api.token:
+            setup_error("HF_TOKEN is not set. On Kaggle: Add-ons > Secrets > add a WRITE token from "
+                        "https://huggingface.co/settings/tokens under the label SECRET_LABELS names (default HF_TOKEN_ALL), "
+                        "switch it on for this notebook, then rerun the secrets cell.")
+        setup_error(f"Hugging Face rejected HF_TOKEN ({type(ex).__name__}: {RC.redact(str(ex))[:120]}). "
+                    "Make a new WRITE token at https://huggingface.co/settings/tokens and update the Kaggle secret.")
+    names = {me.get("name")} | {o.get("name") for o in me.get("orgs") or []}
+    names.discard(None)
+    ns = repo.split("/")[0]
+    if ns not in names:
+        setup_error(f"HF_REPO {repo!r}: '{ns}' is not your account or one of your organisations ({', '.join(sorted(names))}). "
+                    f"Use e.g. HF_REPO = \"{me.get('name')}/wildfire-raw-2014-2025\".")
+    role = ((me.get("auth") or {}).get("accessToken") or {}).get("role")
+    if role == "read":
+        setup_error("HF_TOKEN is read-only. Make a token with write access at https://huggingface.co/settings/tokens.")
+    return me.get("name")
+
+
 def shared_in_repo(api, repo):
     try:
         return {p.path for p in api.list_repo_tree(repo, path_in_repo="shared", recursive=True, repo_type="dataset")}
@@ -229,6 +262,8 @@ def run(a):
     api = HfApi(token=os.environ.get("HF_TOKEN") or None)
     deadline = time.time() + a.max_hours * 3600 if a.max_hours else None
     ch = a.channel
+    if not a.dry_run:
+        check_hf(api, a.hf_repo)
     RC.requirements(ch)
 
     fires = load_fires(a.source_repo, a.fires, a.ids, work / "source")
@@ -361,6 +396,8 @@ def build_links(a):
     from huggingface_hub import HfApi
     api = HfApi(token=os.environ.get("HF_TOKEN") or None)
     work = Path(a.work)
+    if not a.dry_run:
+        check_hf(api, a.hf_repo)
     fires = load_fires(a.source_repo, a.fires, a.ids, work / "source")
     if a.local_manifests:
         files = glob.glob(str(Path(a.local_manifests) / "**" / "manifest" / "*" / "*.csv"), recursive=True)
@@ -414,6 +451,7 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--channel", choices=RC.CHANNELS)
     ap.add_argument("--status", action="store_true", help="per-channel progress of --hf-repo")
+    ap.add_argument("--check", action="store_true", help="check HF_TOKEN can write to --hf-repo, and which keys are set")
     ap.add_argument("--links", action="store_true",
                     help="write fires/<id>/links.json + LINKS.md (every channel's files and sources) from the manifests")
     ap.add_argument("--links-chunk", type=int, default=500, help="fires per commit for --links")
@@ -436,6 +474,12 @@ def main(argv=None):
     ap.add_argument("--keep-cache", action="store_true", help="keep one-time downloads at the end")
     ap.add_argument("--verbose", action="store_true")
     a = ap.parse_args(argv)
+    if a.check:
+        from huggingface_hub import HfApi
+        who = check_hf(HfApi(token=os.environ.get("HF_TOKEN") or None), a.hf_repo)
+        keys = {k: ("set" if os.environ.get(k) else "missing (channel skipped)") for k in ("FIRMS_MAP_KEY", "LANDFIRE_EMAIL")}
+        print(f"OK: HF_TOKEN can write as '{who}' to {a.hf_repo}; {keys}", flush=True)
+        return 0
     if a.status:
         if not a.hf_repo:
             ap.error("--status needs --hf-repo")
