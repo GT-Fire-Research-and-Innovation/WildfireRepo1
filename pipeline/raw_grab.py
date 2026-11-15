@@ -5,6 +5,7 @@ Built for Kaggle (notebooks/kaggle_data_grab.ipynb) but runs anywhere with inter
   python pipeline/raw_grab.py --channel firms --hf-repo you/wildfire-raw-2014-2025 --work /tmp/raw
   python pipeline/raw_grab.py --channel goes  --hf-repo you/wildfire-raw-2014-2025 --max-hours 11.5
   python pipeline/raw_grab.py --status --hf-repo you/wildfire-raw-2014-2025
+  python pipeline/raw_grab.py --links  --hf-repo you/wildfire-raw-2014-2025          # per-fire links files
   python pipeline/raw_grab.py --channel history --ids F2003403265 --dry-run --work /tmp/raw   # local test
 
 How a run works
@@ -21,7 +22,9 @@ How a run works
 Target repo layout
   README.md                          dataset card (docs/RAW_DATA_CARD.md)
   catalog/fires.csv, qc_fires.csv    copied from the built dataset
+  catalog/raw_index.csv              --links: one row per fire and channel (status, files, bytes)
   fires/<fire_id>/<channel>/...      raw files
+  fires/<fire_id>/links.json, LINKS.md   --links: every channel of the fire, its files here and its upstream URLs
   manifest/<channel>/<batch>.csv     fire_id, status, files, bytes, sources, fetched_utc, error
   shared/ics209/...                  source files used by many fires, stored once
 
@@ -45,6 +48,7 @@ import raw_channels as RC  # noqa: E402
 
 SOURCE_REPO = "Javyn123/wildfire-spread-2014-2025"
 DONE = {"ok", "empty", "n/a"}
+SEP = " | "                      # between source URLs in a manifest cell (URLs may hold ';' and ',')
 MANIFEST_COLS = ["fire_id", "name", "year", "channel", "status", "n_files", "bytes", "files", "sources", "fetched_utc", "error"]
 
 
@@ -152,7 +156,7 @@ class Batcher:
         self._open()
         self.rows.append(dict(fire_id=fire["fire_id"], name=fire["name"], year=fire["year"], channel=self.channel,
                               status=status, n_files=len(files), bytes=nbytes, files=";".join(files),
-                              sources=";".join(RC.redact(s) for s in sources),
+                              sources=SEP.join(RC.redact(s) for s in sources),
                               fetched_utc=datetime.now(timezone.utc).isoformat(timespec="seconds"),
                               error=RC.redact(error)[:500]))       # manifests are published: no keys, no email
         self.bytes += nbytes
@@ -290,6 +294,106 @@ def run(a):
     return 0
 
 
+# ------------------------------------------------------------------------------------- per-fire links
+
+def fire_links(fire, rows, repo, source_repo=SOURCE_REPO):
+    """links.json for one fire: for every channel its status, its files in this repo and the upstream
+    URLs they came from (latest manifest row per channel; channels not run yet are 'pending')."""
+    fid = fire["fire_id"]
+    base = f"https://huggingface.co/datasets/{repo}" if repo else "."
+    latest = {}
+    for r in sorted(rows, key=lambda r: str(r.get("fetched_utc", ""))):
+        latest[r["channel"]] = r
+    chans = {}
+    for ch in RC.CHANNELS:
+        r = latest.get(ch)
+        if r is None:
+            chans[ch] = {"status": "pending"}
+            continue
+        e = {"status": r["status"], "fetched_utc": r.get("fetched_utc", "")}
+        files = [x for x in str(r.get("files") or "").split(";") if x]
+        if files:
+            e["bytes"] = int(float(r.get("bytes") or 0))
+            e["files"] = [{"name": x, "url": f"{base}/resolve/main/fires/{fid}/{ch}/{x}"} for x in files]
+        src = [s.strip() for s in str(r.get("sources") or "").split(SEP) if s.strip()]
+        if src:
+            e["sources"] = src
+        if r.get("error"):
+            e["note"] = r["error"]
+        chans[ch] = e
+    return {"fire_id": fid, "name": fire["name"], "year": fire["year"], "irwin_incident": RC.norm_irwin(fire["incident"]),
+            "first_perimeter_utc": fire["first"], "last_perimeter_utc": fire["last"], "bbox_lonlat": fire["bounds"],
+            "folder": f"{base}/tree/main/fires/{fid}",
+            "built_dataset": f"https://huggingface.co/datasets/{source_repo}/tree/main/fires/{fid}",
+            "channels": chans}
+
+
+def links_markdown(L):
+    """LINKS.md: the same as links.json, readable on the Hugging Face file page."""
+    w, s, e, n = L["bbox_lonlat"]
+    out = [f"# {L['name']} ({L['year']}) · `{L['fire_id']}`", "",
+           f"IRWIN `{L['irwin_incident']}` · perimeters {str(L['first_perimeter_utc'])[:16]} → {str(L['last_perimeter_utc'])[:16]} UTC · "
+           f"box W {w:.4f} S {s:.4f} E {e:.4f} N {n:.4f}", "",
+           f"[This fire's folder]({L['folder']}) · [Built dataset layers]({L['built_dataset']})", "",
+           "| channel | status | files | upstream sources |", "|---|---|---|---|"]
+    for ch, c in L["channels"].items():
+        files = ", ".join(f"[{x['name']}]({x['url']})" for x in c.get("files", [])) or "—"
+        src = c.get("sources", [])
+        srct = f"[link]({src[0]})" if len(src) == 1 else (f"{len(src)} links (below)" if src else "—")
+        status = c["status"] + (f" ({c['note'][:80]})" if c.get("note") and c["status"] != "ok" else "")
+        out.append(f"| {ch} | {status} | {files} | {srct} |")
+    many = [(ch, c["sources"]) for ch, c in L["channels"].items() if len(c.get("sources", [])) > 1]
+    if many:
+        out += ["", "## Upstream sources"]
+        for ch, src in many:
+            out += ["", f"<details><summary>{ch}: {len(src)} links</summary>", ""] + [f"- {u}" for u in src] + ["", "</details>"]
+    if any("{MAP_KEY}" in u for _, c in L["channels"].items() for u in c.get("sources", [])):
+        out += ["", "FIRMS links need your own map key in place of `{MAP_KEY}` (free: https://firms.modaps.eosdis.nasa.gov/api/map_key/)."]
+    return "\n".join(out) + "\n"
+
+
+def build_links(a):
+    """Write fires/<id>/links.json + LINKS.md for every fire, and catalog/raw_index.csv (one row per fire
+    and channel), from the manifests; upload them in commits of --links-chunk fires."""
+    import json
+    import glob
+    import pandas as pd
+    from huggingface_hub import HfApi
+    api = HfApi(token=os.environ.get("HF_TOKEN") or None)
+    work = Path(a.work)
+    fires = load_fires(a.source_repo, a.fires, a.ids, work / "source")
+    if a.local_manifests:
+        files = glob.glob(str(Path(a.local_manifests) / "**" / "manifest" / "*" / "*.csv"), recursive=True)
+        m = pd.concat([pd.read_csv(f, dtype=str, keep_default_na=False) for f in files], ignore_index=True) if files \
+            else pd.DataFrame(columns=MANIFEST_COLS)
+    else:
+        m = read_manifests(api, a.hf_repo)
+    by_fire = {fid: g.to_dict("records") for fid, g in m.groupby("fire_id")} if len(m) else {}
+    print(f"links for {len(fires)} fires from {len(m)} manifest rows", flush=True)
+    root = work / "links"
+    shutil.rmtree(root, ignore_errors=True)
+    index = []
+    for k in range(0, len(fires), a.links_chunk):
+        d = root / f"chunk{k // a.links_chunk:03d}"
+        for f in fires[k:k + a.links_chunk]:
+            L = fire_links(f, by_fire.get(f["fire_id"], []), a.hf_repo, a.source_repo)
+            fd = d / "fires" / f["fire_id"]
+            fd.mkdir(parents=True, exist_ok=True)
+            (fd / "links.json").write_text(json.dumps(L, indent=1))
+            (fd / "LINKS.md").write_text(links_markdown(L))
+            index += [dict(fire_id=f["fire_id"], name=f["name"], year=f["year"], channel=ch, status=c["status"],
+                           n_files=len(c.get("files", [])), bytes=c.get("bytes", 0)) for ch, c in L["channels"].items()]
+        if k + a.links_chunk >= len(fires):
+            (d / "catalog").mkdir(parents=True, exist_ok=True)
+            pd.DataFrame(index).to_csv(d / "catalog" / "raw_index.csv", index=False)
+        if not a.dry_run:
+            api.upload_folder(repo_id=a.hf_repo, folder_path=str(d), repo_type="dataset",
+                              commit_message=f"Per-fire links ({min(k + a.links_chunk, len(fires))}/{len(fires)} fires)")
+            shutil.rmtree(d, ignore_errors=True)
+    print(("[dry-run] kept " + str(root)) if a.dry_run else "links uploaded", flush=True)
+    return 0
+
+
 def status(a):
     import pandas as pd
     from huggingface_hub import HfApi
@@ -310,6 +414,10 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--channel", choices=RC.CHANNELS)
     ap.add_argument("--status", action="store_true", help="per-channel progress of --hf-repo")
+    ap.add_argument("--links", action="store_true",
+                    help="write fires/<id>/links.json + LINKS.md (every channel's files and sources) from the manifests")
+    ap.add_argument("--links-chunk", type=int, default=500, help="fires per commit for --links")
+    ap.add_argument("--local-manifests", help="--links: read manifests from local --dry-run batches under this folder")
     ap.add_argument("--hf-repo", help="target dataset repo, e.g. you/wildfire-raw-2014-2025")
     ap.add_argument("--source-repo", default=SOURCE_REPO, help="built dataset the fire list comes from")
     ap.add_argument("--work", default="raw_work", help="local scratch (staging, batches, one-time downloads)")
@@ -332,6 +440,10 @@ def main(argv=None):
         if not a.hf_repo:
             ap.error("--status needs --hf-repo")
         return status(a)
+    if a.links:
+        if not a.hf_repo and not a.dry_run:
+            ap.error("--links needs --hf-repo (or --dry-run)")
+        return build_links(a)
     if not a.channel:
         ap.error("--channel is required")
     if not a.hf_repo and not a.dry_run:

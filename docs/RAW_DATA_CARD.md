@@ -16,11 +16,19 @@ https://github.com/GT-Fire-Research-and-Innovation/WildfireRepo1, one channel at
 ## Layout
 ```
 catalog/fires.csv, qc_fires.csv      the fire list (fire_id, IRWIN incident, name, dates, box, QC rating)
-fires/<fire_id>/<channel>/...        raw files, below
+catalog/raw_index.csv                one row per fire and channel: status, number of files, bytes
+fires/<fire_id>/
+  LINKS.md, links.json               every channel of this fire: status, links to its files here, and the
+                                     upstream URLs they came from (pending = channel not run yet)
+  <channel>/...                      raw files, below
 manifest/<channel>/<batch>.csv       one row per fire and channel: status (ok / empty / n/a / error),
-                                     files, bytes, source URLs, fetch time
+                                     files, bytes, source URLs (separated by " | "), fetch time
 shared/ics209/                       source files used by many fires, stored once
 ```
+To get one fire, download `fires/<fire_id>/`, for example with
+`huggingface_hub.snapshot_download(repo, repo_type="dataset", allow_patterns=["fires/<fire_id>/*"])`.
+FIRMS links contain `{MAP_KEY}` where your own free FIRMS key goes. The LANDFIRE link is the job request;
+add `&Email=<you>` to submit it.
 `fire_id` = `"F"` followed by the first 10 hex characters of the SHA-1 of the incident key (its IRWIN ID).
 It matches the built dataset.
 

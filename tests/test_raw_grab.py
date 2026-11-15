@@ -155,6 +155,39 @@ def test_shared_file_added_once(tmp_path):
     assert "shared/ics209/ics209plus-wildfire.zip" in files and "shared/old.zip" not in files
 
 
+# ------------------------------------------------------------------------------------- per-fire links
+
+def test_fire_links_cover_every_channel_with_files_and_sources():
+    lf = "https://lfps.usgs.gov/api/job/submit?Layer_List=LF2016_FBFM40%3BLF2016_CC&Area_of_Interest=-121.89+39.51+-121.24+39.98"
+    rows = [dict(fire_id="F2003403265", channel="terrain", status="error", files="", sources="", bytes="0",
+                 fetched_utc="2026-11-15T10:00:00+00:00", error="timeout"),
+            dict(fire_id="F2003403265", channel="terrain", status="ok", files="dem_glo30.tif", bytes="10106268",
+                 sources="https://copernicus-dem-30m.s3.amazonaws.com/a.tif", fetched_utc="2026-11-15T11:00:00+00:00", error=""),
+            dict(fire_id="F2003403265", channel="landfire", status="ok", files="landfire_LF2016.zip", bytes="5",
+                 sources=lf, fetched_utc="2026-11-15T11:00:00+00:00", error=""),
+            dict(fire_id="F2003403265", channel="hrrr", status="ok", files="hrrr_ana.nc;hrrr_fc.nc", bytes="9",
+                 sources=RG.SEP.join(["https://h/a.grib2", "https://h/b.grib2"]), fetched_utc="2026-11-15T11:00:00+00:00", error=""),
+            dict(fire_id="F2003403265", channel="ics209", status="n/a", files="", bytes="0", sources="",
+                 fetched_utc="2026-11-15T11:00:00+00:00", error="ICS-209-PLUS covers 1999-2020")]
+    L = RG.fire_links(CAMP, rows, "me/raw")
+    assert list(L["channels"]) == RC.CHANNELS
+    t = L["channels"]["terrain"]
+    assert t["status"] == "ok" and t["files"][0]["url"] == \
+        "https://huggingface.co/datasets/me/raw/resolve/main/fires/F2003403265/terrain/dem_glo30.tif"
+    assert L["channels"]["landfire"]["sources"] == [lf]                     # ';' inside a URL is not a separator
+    assert len(L["channels"]["hrrr"]["sources"]) == 2 and len(L["channels"]["hrrr"]["files"]) == 2
+    assert L["channels"]["ics209"]["note"].startswith("ICS-209") and L["channels"]["goes"] == {"status": "pending"}
+    assert L["folder"].endswith("/tree/main/fires/F2003403265")
+    md = RG.links_markdown(L)
+    assert "[dem_glo30.tif](https://huggingface.co/datasets/me/raw/resolve/main/fires/F2003403265/terrain/dem_glo30.tif)" in md
+    assert "| goes | pending | — | — |" in md and "hrrr: 2 links" in md
+
+
+def test_query_links_are_complete_urls():
+    u = RC.arcgis_query_url("https://x/FeatureServer/0", CAMP["bounds"], where="FIRE_YEAR_INT < 2018")
+    assert "f=geojson" in u and "where=FIRE_YEAR_INT+%3C+2018" in u and "geometry=-121.88999%2C39.51118" in u
+
+
 # ------------------------------------------------------------------------------------- helpers
 
 def test_windowed_map_keeps_order():

@@ -51,11 +51,14 @@ python analyze.py --out ../data --name full
 ```bash
 python pipeline/raw_grab.py --channel history --hf-repo you/wildfire-raw-2014-2025   # one channel, resumable
 python pipeline/raw_grab.py --status --hf-repo you/wildfire-raw-2014-2025           # progress per channel
+python pipeline/raw_grab.py --links --hf-repo you/wildfire-raw-2014-2025            # fires/<id>/LINKS.md + links.json
 python pipeline/raw_grab.py --channel goes --ids F2003403265 --dry-run --work /tmp/raw  # one fire, no upload
 ```
 Channels: history, perimeters, firms, gridmet, ics209, suppression, tessera (reference only), terrain, landfire,
 goes, hrrr, osm. Each fire is cut to the built dataset's box and dates on the source's own grid. Batches are
-uploaded and then deleted locally. Repo layout and sources: `docs/RAW_DATA_CARD.md`.
+uploaded and then deleted locally. Each fire gets one folder, `fires/<id>/`, with a subfolder per channel and a
+`LINKS.md` that links every file and its upstream source. `notebooks/kaggle_data_grab.ipynb` runs all channels
+on Kaggle. Repo layout and sources: `docs/RAW_DATA_CARD.md`.
 
 ## Evaluation protocol
 Scores only cells that newly burn between consecutive perimeters (already-burned cells are

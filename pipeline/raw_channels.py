@@ -281,7 +281,15 @@ def _layer_source(url, bbox):
         year = next((y for y in NP.ARCHIVE_FGDB_ITEMS if f"/{y}/" in gdb.replace(os.sep, "/")), None)
         item = NP.ARCGIS_ITEM_DATA.format(NP.ARCHIVE_FGDB_ITEMS[year]) if year else gdb
         return f"{item}#{layer}"
-    return f"{url}/query?geometry={','.join(f'{b:.5f}' for b in bbox)}&geometryType=esriGeometryEnvelope&inSR=4326&outFields=*"
+    return arcgis_query_url(url, bbox)
+
+
+def arcgis_query_url(layer_url, bbox, where="1=1", fields="*"):
+    """Clickable ArcGIS query returning the box's features as GeoJSON (what the channel downloaded)."""
+    from urllib.parse import urlencode
+    q = {"where": where, "geometry": ",".join(f"{b:.5f}" for b in bbox), "geometryType": "esriGeometryEnvelope",
+         "inSR": 4326, "spatialRel": "esriSpatialRelIntersects", "outFields": fields, "outSR": 4326, "f": "geojson"}
+    return f"{layer_url}/query?{urlencode(q)}"
 
 
 def _years(fire):
@@ -322,8 +330,7 @@ def grab_history(fire, out, ctx):
               "spatialRel": "esriSpatialRelIntersects", "outFields": "*", "returnGeometry": "true", "f": "geojson"}
     feats = _arcgis_paged(ctx.sess, BM.HIST_URL, params)
     _write_geojson(out / "history.geojson", feats)
-    src = f"{BM.HIST_URL}/query?where=FIRE_YEAR_INT<{int(fire['year'])}&geometry={w:.5f},{s:.5f},{e:.5f},{n:.5f}&outFields=*"
-    return ("ok" if feats else "empty"), [src]
+    return ("ok" if feats else "empty"), [arcgis_query_url(BM.HIST_URL, fire["bounds"], where=params["where"])]
 
 
 def _perimeter_layers(ctx, year):
@@ -413,7 +420,10 @@ def grab_gridmet(fire, out, ctx):
                     raise
                 print(f"    gridmet {short} retry ({str(ex)[:100]})", flush=True)
                 time.sleep(5 * (t + 1))
-        sources.append(f"{url}?{var}[day={ds[0].date()}..{ds[-1].date()}][lat={s - pad:.4f}..{n + pad:.4f}][lon={w - pad:.4f}..{e + pad:.4f}]")
+        # the same subset from the server's NetCDF Subset Service: a link that downloads it directly
+        sources.append(url.replace("/dodsC/", "/ncss/grid/") +
+                       f"?var={var}&north={n + pad:.4f}&west={w - pad:.4f}&east={e + pad:.4f}&south={s - pad:.4f}"
+                       f"&horizStride=1&time_start={ds[0].date()}T00:00:00Z&time_end={ds[-1].date()}T00:00:00Z&accept=netcdf")
     m = xr.merge(parts, compat="override", combine_attrs="drop_conflicts")
     m.attrs.update(source="GRIDMET (University of Idaho), THREDDS OPeNDAP aggregation", fire_id=fire["fire_id"])
     m.to_netcdf(out / "gridmet.nc", encoding={v: {"zlib": True, "complevel": 4} for v in m.data_vars})
@@ -685,7 +695,8 @@ def grab_goes_many(fires, ctx, chunk=25):
                                 t_scan = pd.to_datetime(key.split("_s")[1][:13], format="%Y%j%H%M%S", utc=True).value
                                 s.append(t_scan, f"s3://{bucket}/{key}",
                                          {nm: (v[r0:r1, c0:c1], dt, at) for nm, (v, dt, at) in raw.items()})
-                                scans[fid][bucket] = scans[fid].get(bucket, 0) + 1
+                                day = f"ABI-L2-FDCC/{t.year}/{t.dayofyear:03d}/"
+                                scans[fid][(bucket, day)] = scans[fid].get((bucket, day), 0) + 1
                     finally:
                         ds.close()
                 for f in need[(t, sat, bucket)]:
@@ -695,8 +706,9 @@ def grab_goes_many(fires, ctx, chunk=25):
                         for (ff, _), v in list(series.items()):
                             if ff == fid and v is not None:
                                 v[0].close()
+                        # one listing link per satellite-day (the exact scan of each hour is in the file's `source`)
                         yield f, ("ok" if scans[fid] else "empty"), \
-                            [f"s3://{b}/ABI-L2-FDCC/ ({n} scans)" for b, n in sorted(scans[fid].items())], None
+                            [f"https://{b}.s3.amazonaws.com/?list-type=2&prefix={d}" for b, d in sorted(scans[fid])], None
                 if ctx.expired():
                     stopped = True
                     break
@@ -733,7 +745,7 @@ def grab_hrrr_many(fires, ctx, chunk=25, step_h=3):
             ana = [t for t in ana if t >= _ts(HRRR_START)]
             fc = [t for t in fc if t >= _ts(HRRR_START)]
             wins[fid] = WF.hrrr_window(lat, lon, f["bounds"])
-            left[fid], got_n[fid] = len(ana) + len(fc), 0
+            left[fid], got_n[fid] = len(ana) + len(fc), []
             for t in ana:
                 need.setdefault((t, 0), []).append((f, "ana"))
             for t in fc:
@@ -755,13 +767,13 @@ def grab_hrrr_many(fires, ctx, chunk=25, step_h=3):
                                                   "window_rows_cols": f"{r0}:{r1},{c0}:{c1}"})
                         valid = t + pd.Timedelta(hours=fh)
                         series[k].append(valid.value, url, {n: (got[n][r0:r1, c0:c1], "f4", {}) for n in names if n in got})
-                        got_n[fid] += 1
+                        got_n[fid].append(url)
                     left[fid] -= 1
                     if left[fid] == 0:
                         for w in ("ana", "fc"):
                             if (fid, w) in series:
                                 series.pop((fid, w)).close()
-                        yield f, ("ok" if got_n[fid] else "empty"), [f"https://noaa-hrrr-bdp-pds.s3.amazonaws.com/ ({got_n[fid]} files)"], None
+                        yield f, ("ok" if got_n[fid] else "empty"), sorted(got_n[fid]), None
                 if ctx.expired():
                     stopped = True
                     break
@@ -781,9 +793,11 @@ def grab_landfire_many(fires, ctx, parallel=3):
     def job(f):
         v = landfire_version(int(f["year"]))
         layers = [f"{v}_{x}" for x in ("FBFM40", "CC", "CH", "CBH", "CBD")]
+        from urllib.parse import urlencode
         L.fetch(f["bounds"], ctx.stage(f["fire_id"]) / f"landfire_{v}.zip", layers=layers, native=True)
         w, s, e, n = f["bounds"]
-        return redact(f"{L.LFPS}/submit?Email=x&Layer_List={';'.join(layers)}&Area_of_Interest={w:.4f} {s:.4f} {e:.4f} {n:.4f}")
+        # the LFPS job request (add &Email=<you> to submit it; the reply's jobId gives /status and the zip)
+        return f"{L.LFPS}/submit?" + urlencode({"Layer_List": ";".join(layers), "Area_of_Interest": f"{w:.4f} {s:.4f} {e:.4f} {n:.4f}"})
 
     it = iter(fires)
     with ThreadPoolExecutor(parallel) as ex:
