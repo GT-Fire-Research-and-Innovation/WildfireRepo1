@@ -15,6 +15,10 @@ on:
   schedule:
     - cron: "7,37 * * * *"
   workflow_dispatch:
+    inputs:
+      loop_seconds:       # for testing the hand-over: a short loop, whose successor runs the normal 5.5 hours
+        description: "Seconds this loop runs before it starts the next one (normal: 19800)"
+        default: "19800"
 
 permissions:
   contents: write
@@ -58,12 +62,12 @@ jobs:
       - name: Install
         run: pip install -q requests pandas
 
-      - name: Capture loop (5.5 hours)
+      - name: Capture loop (5.5 hours unless loop_seconds is given)
         id: loop
         env:
           ARCHIVE_URL: https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}
           POLL_SECONDS: 300
-          LOOP_SECONDS: 19800
+          LOOP_SECONDS: ${{ inputs.loop_seconds || 19800 }}
         run: bash live/capture_loop.sh
 
       - name: Start the next loop
