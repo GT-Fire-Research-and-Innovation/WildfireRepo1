@@ -38,7 +38,7 @@ It matches the built dataset.
 | history | NIFC Interagency Fire Perimeter History (every earlier fire in the box) | all | `history.geojson` |
 | perimeters | NIFC GeoMAC (2014–2019), NIFS (2018–2019), Operational Data Archive (2020–2025): every record of the fire's incident, before cleaning | all | `records.geojson` (`_source_layer` per record) |
 | firms | NASA FIRMS VIIRS 375 m active fire: S-NPP and NOAA-20 standard product, plus near-real-time for 2024+ | all | `<SOURCE>.csv.gz` |
-| gridmet | GRIDMET daily, 9 variables (vpd, fm100, fm1000, bi, erc, rmin, vs, th, tmmx), from 14 days before the first perimeter to 2 days after the last | all | `gridmet.nc` |
+| gridmet | GRIDMET daily, 9 variables (vpd, fm100, fm1000, bi, erc, rmin, vs, th, tmmx), from 14 days before the first perimeter to 2 days after the last, as the THREDDS subset service returns it | all | `gridmet_<var>.nc` (9 files) |
 | ics209 | ICS-209-PLUS (St. Denis et al.): incident and situation-report rows | ≤ 2020 | `incidents.csv`, `sitreps.csv` |
 | suppression | NIFS / ODA EventLine and EventPolygon: every archived version (GDB_FROM_DATE / GDB_TO_DATE) | 2018+ | `event_lines.geojson`, `event_polygons.geojson` |
 | tessera | GeoTessera v1.1: reference only (year, box, how to fetch) | 2018+ | `tessera_ref.json` |

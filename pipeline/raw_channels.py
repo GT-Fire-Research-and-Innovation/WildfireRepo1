@@ -10,7 +10,7 @@ Channels (cheap -> heavy) and what each writes into fires/<fire_id>/<channel>/:
   history      Interagency Fire Perimeter History, every prior fire in the box   history.geojson
   perimeters   NIFC GeoMAC / NIFS / Operational Data Archive records of the fire  records.geojson
   firms        NASA FIRMS VIIRS active fire (SP, + NRT fill 2024+)               <SOURCE>.csv.gz
-  gridmet      GRIDMET daily, 9 variables (OPeNDAP subset)                       gridmet.nc
+  gridmet      GRIDMET daily, 9 variables (THREDDS NetCDF Subset Service)        gridmet_<var>.nc
   ics209       ICS-209-PLUS incident + sitrep rows (fires <= 2020)              incidents.csv, sitreps.csv
   suppression  NIFS / ODA EventLine + EventPolygon, every archived version (2018+) event_lines.geojson, event_polygons.geojson
   tessera      GeoTessera v1.1 reference only (no embedding data)                tessera_ref.json
@@ -400,33 +400,46 @@ def grab_firms(fire, out, ctx):
     return ("ok" if n else "empty"), sources
 
 
-def grab_gridmet(fire, out, ctx):
-    import xarray as xr
+def gridmet_url(short, var, bounds, d0, d1, pad):
+    """GRIDMET subset from the THREDDS NetCDF Subset Service: plain HTTPS returning a netCDF file (no
+    OPeNDAP client needed; the OPeNDAP route failed on Kaggle). Same box (+pad) and days as the build."""
     import weather_features as WF
-    w, s, e, n = fire["bounds"]
+    w, s, e, n = bounds
+    return (WF.GRIDMET.format(v=short).replace("/dodsC/", "/ncss/grid/") +
+            f"?var={var}&north={n + pad:.4f}&west={w - pad:.4f}&east={e + pad:.4f}&south={s - pad:.4f}"
+            f"&horizStride=1&time_start={d0.date()}T00:00:00Z&time_end={d1.date()}T00:00:00Z&accept=netcdf")
+
+
+def http_get(ctx, url, tries=5, timeout=300):
+    """Body of a GET, retried on network errors and 429 / 5xx; other HTTP errors raise with the reply text."""
+    import requests
+    for t in range(tries):
+        try:
+            r = ctx.sess.get(url, timeout=timeout)
+            if r.status_code == 200:
+                return r.content
+            if r.status_code != 429 and r.status_code < 500:
+                raise RuntimeError(f"HTTP {r.status_code}: {r.text[:200]}")
+            err = f"HTTP {r.status_code}"
+        except requests.RequestException as ex:
+            err = f"{type(ex).__name__}: {str(ex)[:120]}"
+        if t == tries - 1:
+            raise RuntimeError(f"{err} after {tries} tries")
+        time.sleep(5 * 2 ** t)
+
+
+def grab_gridmet(fire, out, ctx):
+    """One netCDF per variable, exactly as the server returns it: gridmet_<var>.nc."""
+    import weather_features as WF
     ds = days(fire)
-    pad = WF.PAD_DEG
-    parts, sources = [], []
+    sources = []
     for short, var in WF.GM_VARS.items():
-        url = WF.GRIDMET.format(v=short)
-        src = ctx.memo(("gm", short), lambda u=url: xr.open_dataset(u, decode_times=True))
-        sub = src[[var]].sel(lat=slice(n + pad, s - pad), lon=slice(w - pad, e + pad), day=slice(ds[0], ds[-1]))
-        for t in range(5):
-            try:
-                parts.append(sub.load())
-                break
-            except Exception as ex:  # noqa: BLE001
-                if t == 4:
-                    raise
-                print(f"    gridmet {short} retry ({str(ex)[:100]})", flush=True)
-                time.sleep(5 * (t + 1))
-        # the same subset from the server's NetCDF Subset Service: a link that downloads it directly
-        sources.append(url.replace("/dodsC/", "/ncss/grid/") +
-                       f"?var={var}&north={n + pad:.4f}&west={w - pad:.4f}&east={e + pad:.4f}&south={s - pad:.4f}"
-                       f"&horizStride=1&time_start={ds[0].date()}T00:00:00Z&time_end={ds[-1].date()}T00:00:00Z&accept=netcdf")
-    m = xr.merge(parts, compat="override", combine_attrs="drop_conflicts")
-    m.attrs.update(source="GRIDMET (University of Idaho), THREDDS OPeNDAP aggregation", fire_id=fire["fire_id"])
-    m.to_netcdf(out / "gridmet.nc", encoding={v: {"zlib": True, "complevel": 4} for v in m.data_vars})
+        url = gridmet_url(short, var, fire["bounds"], ds[0], ds[-1], WF.PAD_DEG)
+        data = http_get(ctx, url)
+        if not (data[:3] == b"CDF" or data[:4] == b"\x89HDF"):
+            raise RuntimeError(f"GRIDMET {short}: reply is not netCDF: {data[:120]!r}")
+        (out / f"gridmet_{short}.nc").write_bytes(data)
+        sources.append(url)
     return "ok", sources
 
 

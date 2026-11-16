@@ -214,6 +214,23 @@ def ensure_repo(api, repo, private, source_repo, cache):
 
 
 SETUP_ERROR = 3          # exit code for a setup problem (token, repo name): retrying other channels cannot help
+CHANNEL_BROKEN = 4       # exit code when a channel fails for many fires in a row: other channels may still work
+
+
+class ErrorStreak:
+    """Counts errors in a row; trips at `limit` (0 = never) so a broken source does not burn through
+    every fire. Any fire that is not an error resets it."""
+
+    def __init__(self, limit):
+        self.limit, self.n, self.last, self.tripped = limit, 0, "", False
+
+    def hit(self, status, err):
+        if status != "error":
+            self.n = 0
+            return False
+        self.n, self.last = self.n + 1, err
+        self.tripped = bool(self.limit) and self.n >= self.limit
+        return self.tripped
 
 
 def setup_error(msg):
@@ -292,6 +309,7 @@ def run(a):
         if runnable:
             for src, repo_path in RC.shared_files(ch, ctx):
                 b.add_shared(src, repo_path)
+        streak = ErrorStreak(a.max_errors_in_row)
         if ch in RC.GROUP:
             results = RC.GROUP_FUNCS[ch](runnable, ctx)
             for k, (f, status, sources, err) in enumerate(results, 1):
@@ -301,6 +319,8 @@ def run(a):
                 ctx.drop_stage(f["fire_id"])
                 print(f"[{k}/{len(runnable)}] {f['fire_id']} {f['name']} ({f['year']}): {status}"
                       + (f" {err[:120]}" if err else "") + f"  ({(time.time() - t0) / 60:.0f} min)", flush=True)
+                if streak.hit(status, err):
+                    break
         else:
             fn = RC.PER_FIRE[ch]
             for k, f in enumerate(runnable, 1):
@@ -319,11 +339,18 @@ def run(a):
                 ctx.drop_stage(f["fire_id"])
                 print(f"[{k}/{len(runnable)}] {f['fire_id']} {f['name']} ({f['year']}): {status}"
                       + (f" {err[:120]}" if err else "") + f"  ({(time.time() - t0) / 60:.0f} min)", flush=True)
+                if streak.hit(status, err):
+                    break
         b.upload()
     finally:
         if not a.keep_cache:
             ctx.cleanup()
     t = b.totals
+    if streak.tripped:
+        print(f"CHANNEL STOPPED: {ch} failed for {streak.n} fires in a row, so the source or this machine's access to it "
+              f"is probably broken, not single fires. Last error: {streak.last[:300]}\n"
+              f"Those fires are recorded as errors and retried on the next run.", file=sys.stderr, flush=True)
+        return CHANNEL_BROKEN
     print(f"done: {t['ok']} ok, {t['empty']} empty, {t['n/a']} n/a, {t['error']} error; {t['bytes'] / 1e9:.2f} GB "
           f"in {t['batches']} batch(es), {(time.time() - t0) / 60:.0f} min", flush=True)
     return 0
@@ -472,6 +499,8 @@ def main(argv=None):
     ap.add_argument("--dry-run", action="store_true", help="no upload; batches are kept under WORK/batch")
     ap.add_argument("--keep", action="store_true", help="keep local batches after upload")
     ap.add_argument("--keep-cache", action="store_true", help="keep one-time downloads at the end")
+    ap.add_argument("--max-errors-in-row", type=int, default=10,
+                    help="stop the channel (exit 4) after this many fires fail in a row; 0 = never")
     ap.add_argument("--verbose", action="store_true")
     a = ap.parse_args(argv)
     if a.check:

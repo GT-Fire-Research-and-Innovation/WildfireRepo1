@@ -155,6 +155,51 @@ def test_shared_file_added_once(tmp_path):
     assert "shared/ics209/ics209plus-wildfire.zip" in files and "shared/old.zip" not in files
 
 
+def test_gridmet_url_is_plain_https_subset():
+    d = RC.days(CAMP)
+    u = RC.gridmet_url("vpd", "daily_mean_vapor_pressure_deficit", CAMP["bounds"], d[0], d[-1], 0.05)
+    assert u.startswith("https://thredds.northwestknowledge.net/thredds/ncss/grid/agg_met_vpd_1979_CurrentYear_CONUS.nc?")
+    assert "time_start=2018-10-26T00:00:00Z" in u and "time_end=2018-11-27T00:00:00Z" in u and "accept=netcdf" in u
+    assert "north=40.0346" in u and "west=-121.9400" in u and "/dodsC/" not in u
+
+
+class Reply:
+    def __init__(self, code, body=b""):
+        self.status_code, self.content, self.text = code, body, body.decode(errors="replace")
+
+
+class Sess:
+    def __init__(self, replies):
+        self.replies, self.calls = list(replies), 0
+
+    def get(self, url, timeout):
+        self.calls += 1
+        r = self.replies.pop(0)
+        if isinstance(r, Exception):
+            raise r
+        return r
+
+
+def test_http_get_retries_server_errors_not_client_errors(monkeypatch):
+    import requests
+    monkeypatch.setattr(RC.time, "sleep", lambda s: None)
+    ctx = type("C", (), {})()
+    ctx.sess = Sess([Reply(503), requests.ConnectionError("reset"), Reply(200, b"CDF\x01")])
+    assert RC.http_get(ctx, "u") == b"CDF\x01" and ctx.sess.calls == 3
+    ctx.sess = Sess([Reply(400, b"Requested time range is outside the dataset")])
+    with pytest.raises(RuntimeError, match="HTTP 400: Requested time range"):
+        RC.http_get(ctx, "u")
+    assert ctx.sess.calls == 1
+
+
+def test_error_streak_stops_a_broken_channel_only():
+    s = RG.ErrorStreak(3)
+    assert not any(s.hit(st, "e") for st in ["error", "error", "ok", "error", "error", "n/a"])
+    assert [s.hit("error", f"e{i}") for i in range(3)] == [False, False, True] and s.tripped and s.last == "e2"
+    never = RG.ErrorStreak(0)
+    assert not any(never.hit("error", "e") for _ in range(50))
+
+
 # ------------------------------------------------------------------------------------- setup check
 
 class WhoAmI:
