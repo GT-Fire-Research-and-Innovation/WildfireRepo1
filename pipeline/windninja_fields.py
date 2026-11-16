@@ -18,6 +18,15 @@ the error as a fraction of the input speed).
 Writes fires/<fire_id>/terrain_wind.npz: resp (2, 2, H, W) float16 on the fire grid, valid, check_*, settings.
 Install WindNinja once:  conda create -y -p ~/scratch/envs/windninja -c conda-forge windninja
 
+Solve fine, average up (--mesh 75). By default WindNinja sees the fire's stored terrain, already averaged to the
+grid: a sharp ridge or a ravine inside a cell is flat before the wind is solved. With --mesh M the 30 m
+elevation is downloaded again (Copernicus GLO-30), the wind is solved on an M-metre mesh that reaches 3 km past
+the grid on every side, and the wind is then averaged into each grid cell. Wind over averaged terrain is not the
+average wind over the real terrain; this keeps the second. The file is terrain_wind<M>.npz, so both versions
+can be scored side by side. It also stores sq (3, H, W): the mean of speed squared inside each cell is
+    u0^2 * sq[0] + 2 * u0 * v0 * sq[1] + v0^2 * sq[2]
+exactly, for any broad wind, so the spread of wind speed inside a cell is known too (not used by the loader yet).
+
 What this is not: no daily upslope / downslope winds (they need the hour, sun and temperature per run), no
 eddies behind ridges (the momentum solver does those, at 50-100x the cost), and the terrain is our 150 m
 average, so features narrower than a few cells are already smoothed. Cells within about 3 km of the grid
@@ -41,7 +50,10 @@ VEG = "grass"           # one roughness everywhere: this file isolates the terra
 DIRS = (270.0, 180.0)   # winds FROM the west (blowing east: u = +1) and FROM the south (blowing north: v = +1)
 CHECK_DIR = 315.0
 MAX_CELLS = 400_000     # WindNinja needs about 11 GB per million cells: larger grids are solved on a coarser mesh
+BUFFER_M = 3000.0       # fine mode: terrain this far past the grid, so the solver's edge is not the grid's edge
 VERSION = 1
+DEM_URL = ("https://copernicus-dem-30m.s3.amazonaws.com/Copernicus_DSM_COG_10_{ns}{lat:02d}_00_{ew}{lon:03d}_00_DEM/"
+           "Copernicus_DSM_COG_10_{ns}{lat:02d}_00_{ew}{lon:03d}_00_DEM.tif")
 
 
 def utm_epsg(lon, lat):
@@ -72,6 +84,50 @@ def to_utm(elev, g):
     dem = np.full((h, w), np.nan, np.float32)
     reproject(fill_nearest(elev.astype(np.float32)), dem, src_transform=Affine(*g["transform"]), src_crs="EPSG:4326",
               dst_transform=tr, dst_crs=crs, resampling=Resampling.bilinear, src_nodata=np.nan, dst_nodata=np.nan)
+    return fill_nearest(dem), tr, crs
+
+
+def mesh_for(cells_at_res, res):
+    """Mesh size that keeps a run within MAX_CELLS (rounded up to 5 m)."""
+    return float(np.ceil(res * max(1.0, np.sqrt(cells_at_res / MAX_CELLS)) / 5.0) * 5.0)
+
+
+def dem_fine(g, mesh):
+    """30 m elevation averaged straight onto a `mesh`-metre UTM grid covering the fire grid plus BUFFER_M."""
+    import math
+    import rasterio
+    from pyproj import Transformer
+    from rasterio.transform import from_origin
+    from rasterio.warp import Resampling, reproject
+    dx, _, x0, _, dy, y0 = g["transform"]
+    west, north, east, south = x0, y0, x0 + dx * g["width"], y0 + dy * g["height"]
+    crs = f"EPSG:{utm_epsg((west + east) / 2, (north + south) / 2)}"
+    tf = Transformer.from_crs("EPSG:4326", crs, always_xy=True)
+    xs, ys = tf.transform([west, east, west, east], [north, north, south, south])
+    xmin, xmax, ymin, ymax = min(xs) - BUFFER_M, max(xs) + BUFFER_M, min(ys) - BUFFER_M, max(ys) + BUFFER_M
+    w, h = int(math.ceil((xmax - xmin) / mesh)), int(math.ceil((ymax - ymin) / mesh))
+    tr = from_origin(xmin, ymax, mesh, mesh)
+    lons, lats = Transformer.from_crs(crs, "EPSG:4326", always_xy=True).transform([xmin, xmax, xmin, xmax], [ymax, ymax, ymin, ymin])
+    dem = np.full((h, w), np.nan, np.float32)
+    for lat in range(math.floor(min(lats)), math.floor(max(lats)) + 1):
+        for lon in range(math.floor(min(lons)), math.floor(max(lons)) + 1):
+            url = DEM_URL.format(ns="N" if lat >= 0 else "S", lat=abs(lat), ew="W" if lon < 0 else "E", lon=abs(lon))
+            for attempt in range(3):
+                try:
+                    with rasterio.open("/vsicurl/" + url) as src:
+                        tmp = np.full((h, w), np.nan, np.float32)
+                        reproject(rasterio.band(src, 1), tmp, dst_transform=tr, dst_crs=crs,
+                                  resampling=Resampling.average, dst_nodata=np.nan)
+                    dem = np.where(np.isnan(dem), tmp, dem)
+                    break
+                except Exception as ex:  # noqa: BLE001
+                    if any(k in str(ex) for k in ("404", "not recognized", "No such file", "does not exist")):
+                        break                                              # ocean: no tile
+                    if attempt == 2:
+                        raise
+                    time.sleep(5 * (attempt + 1))
+    if np.isfinite(dem).mean() < 0.98:
+        raise RuntimeError(f"30 m elevation covers only {100 * np.isfinite(dem).mean():.0f} % of the area")
     return fill_nearest(dem), tr, crs
 
 
@@ -122,14 +178,21 @@ def unit(direction):
     return np.array([-np.sin(d), -np.cos(d)])
 
 
-def response(elev, g, wn, work, threads=1, check=True):
-    """The fire's wind response on its own grid, and the linearity check."""
+def response(elev, g, wn, work, threads=1, check=True, fine=None):
+    """The fire's wind response on its own grid, and the linearity check. fine: solve on a mesh of this many
+    metres from 30 m elevation and average the wind into the grid cells (see the top of the file)."""
     import rasterio
     from affine import Affine
     from rasterio.warp import Resampling, reproject
-    dem, tr, crs = to_utm(elev, g)
     res = float(g.get("res_m", 150.0))
-    mesh = res * max(1, int(np.ceil(np.sqrt(dem.size / MAX_CELLS))))
+    if fine:
+        H0, W0 = g["height"], g["width"]
+        area = (W0 * res + 2 * BUFFER_M) * (H0 * res + 2 * BUFFER_M)
+        mesh = mesh_for(area / fine ** 2, float(fine))
+        dem, tr, crs = dem_fine(g, mesh)
+    else:
+        dem, tr, crs = to_utm(elev, g)
+        mesh = mesh_for(dem.size, res)
     tif = Path(work) / "dem.tif"
     with rasterio.open(tif, "w", driver="GTiff", height=dem.shape[0], width=dem.shape[1], count=1, dtype="float32",
                        crs=crs, transform=tr) as d:
@@ -141,37 +204,46 @@ def response(elev, g, wn, work, threads=1, check=True):
         a, b = unit(CHECK_DIR)                                                   # CHECK = a * west run + b * south run
         err = np.hypot(*(a * F[0] + b * F[1] - run_wn(wn, tif, CHECK_DIR, work, mesh, threads)[0]))
         chk = dict(check_p95=np.float32(np.nanpercentile(err, 95)), check_max=np.float32(np.nanmax(err)))
-    H, W = elev.shape
+    H, W = g["height"], g["width"]
+    how = Resampling.average if mesh < res else Resampling.bilinear             # finer than the grid: mean of the cell
+    kw = dict(src_transform=tr, src_crs=crs, dst_transform=Affine(*g["transform"]), dst_crs="EPSG:4326",
+              resampling=how, src_nodata=np.nan, dst_nodata=np.nan)
     resp = np.full((2, 2, H, W), np.nan, np.float32)
-    reproject(F.reshape(4, *F.shape[2:]), resp.reshape(4, H, W), src_transform=tr, src_crs=crs,
-              dst_transform=Affine(*g["transform"]), dst_crs="EPSG:4326", resampling=Resampling.bilinear,
-              src_nodata=np.nan, dst_nodata=np.nan)
+    reproject(F.reshape(4, *F.shape[2:]), resp.reshape(4, H, W), **kw)
     valid = np.isfinite(resp).all((0, 1))
     flat = np.array([[1.0, 0.0], [0.0, 1.0]], np.float32)[:, :, None, None]     # no terrain effect
     resp = np.where(valid, resp, flat)
-    return dict(resp=resp.astype(np.float16), valid=valid, mesh_m=np.array(mesh), **chk)
+    out = dict(resp=resp.astype(np.float16), valid=valid, mesh_m=np.array(mesh), **chk)
+    if mesh < res:                                                               # second moments of the wind inside a cell
+        m2 = np.stack([(F[0] ** 2).sum(0), (F[0] * F[1]).sum(0), (F[1] ** 2).sum(0)])
+        sq = np.full((3, H, W), np.nan, np.float32)
+        reproject(m2, sq, **kw)
+        out["sq"] = np.where(valid, sq, np.array([1.0, 0.0, 1.0], np.float32)[:, None, None]).astype(np.float16)
+    return out
 
 
 def one(job):
-    d, wn, threads, check, force = job
+    global MAX_CELLS
+    d, wn, threads, check, force, fine, MAX_CELLS = job
     d = Path(d)
-    dst = d / "terrain_wind.npz"
+    dst = d / (f"terrain_wind{int(fine)}.npz" if fine else "terrain_wind.npz")
     if dst.exists() and not force:
         return d.name, "exists", 0.0
     t0 = time.time()
     try:
         g = json.loads((d / "grid.json").read_text())
-        elev = np.load(d / "terrain.npz")["elev"]
+        elev = None if fine else np.load(d / "terrain.npz")["elev"]
         work = tempfile.mkdtemp(prefix=f"wn_{d.name}_", dir=os.environ.get("TMPDIR"))
         try:
-            out = response(elev, g, wn, work, threads, check)
+            out = response(elev, g, wn, work, threads, check, fine)
         finally:
             shutil.rmtree(work, ignore_errors=True)
-        tmp = d / "terrain_wind.tmp.npz"
+        tmp = d / f"{dst.stem}.tmp.npz"
         np.savez_compressed(tmp, version=np.array(VERSION), speed=np.array(SPEED), height=np.array(HEIGHT),
                             vegetation=np.array(VEG), dirs=np.array(DIRS), **out)
         tmp.replace(dst)
-        return d.name, f"ok p95 {float(out.get('check_p95', np.nan)):.4f} max {float(out.get('check_max', np.nan)):.3f}", time.time() - t0
+        return d.name, (f"ok p95 {float(out.get('check_p95', np.nan)):.4f} max {float(out.get('check_max', np.nan)):.3f} "
+                        f"mesh {float(out['mesh_m']):.0f} m"), time.time() - t0
     except Exception as ex:  # noqa: BLE001
         return d.name, f"ERROR {type(ex).__name__}: {str(ex)[:300]}", time.time() - t0
 
@@ -184,6 +256,9 @@ def main():
     ap.add_argument("--fires", help="only these fire ids (comma separated, or a CSV with a fire_id column)")
     ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--threads", type=int, default=1, help="threads per WindNinja run")
+    ap.add_argument("--mesh", type=float, help="solve fine, average up: mesh in metres (e.g. 75) from 30 m elevation; "
+                                               "writes terrain_wind<mesh>.npz. Default: the fire's stored grid-size terrain")
+    ap.add_argument("--max-cells", type=int, help=f"largest mesh WindNinja is given (default {MAX_CELLS:,}; about 11 GB per million)")
     ap.add_argument("--no-check", action="store_true", help="skip the third run that checks linearity")
     ap.add_argument("--force", action="store_true")
     a = ap.parse_args()
@@ -202,7 +277,7 @@ def main():
             keep = set(a.fires.split(","))
         dirs = [p for p in dirs if p.name in keep]
     print(f"{len(dirs)} fires, {a.workers} at a time", flush=True)
-    jobs = [(str(p), a.wn, a.threads, not a.no_check, a.force) for p in dirs]
+    jobs = [(str(p), a.wn, a.threads, not a.no_check, a.force, a.mesh, a.max_cells or MAX_CELLS) for p in dirs]
     n = dict(ok=0, exists=0, error=0)
     p95 = []
     t0 = time.time()

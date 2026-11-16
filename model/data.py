@@ -66,11 +66,18 @@ HRRR_ROTATE = True           # rotate HRRR winds from the HRRR grid's axes to tr
 HRRR_CONE, HRRR_LON0 = 0.622515, -97.5     # HRRR Lambert conformal: sin(38.5 deg), central meridian
 ROTH_WIND = "vector"         # wind speed given to Rothermel: "vector" (speed of the mean wind vector), "mean", "p90"
 CANOPY_WAF = False           # shelter the midflame wind under forest canopy (LANDFIRE cover and height)
-WIND_TERRAIN = False         # reshape HRRR winds with the fire's WindNinja terrain response (terrain_wind.npz, built by
+WIND_TERRAIN = False         # False, or the file to use (see wind_file): reshape HRRR winds with the fire's WindNinja terrain response (built by
                              #   pipeline/windninja_fields.py): ridges and gaps faster, sheltered ground slower, flow turned
                              #   along drainages. Changes the hrrr, hrrr_seq and physics inputs, so a model must be trained
                              #   and scored with the same setting.
 TW_MISSING = set()           # fires that were asked for terrain wind and have no file (they keep the plain HRRR wind)
+
+
+def wind_file(n):
+    """--wind-terrain N -> the file to use: 0 none, 1 terrain_wind.npz (solved on the grid's own terrain),
+    any other N terrain_wind<N>.npz (solved on an N-metre mesh from 30 m elevation and averaged up)."""
+    n = int(n or 0)
+    return False if n == 0 else "terrain_wind" if n == 1 else f"terrain_wind{n}"
 GM_DAY = "start"             # GRIDMET day: "start" (local day of t_i) or "window" (days whose afternoon is in the window)
 WEATHER_MODE = "observed"    # "observed": HRRR analyses over the gap (oracle weather, best case)
                              # "forecast": only what a forecaster has at t_i: HRRR analyses of the last 24 h
@@ -448,7 +455,7 @@ class Fire:
                 gust = np.where(np.isfinite(flat[:, 0]), flat[:, 0], spd)
                 self.broad_spd = spd.mean(0)
                 if WIND_TERRAIN:
-                    tw = self.z("terrain_wind")
+                    tw = self.z(WIND_TERRAIN if isinstance(WIND_TERRAIN, str) else "terrain_wind")
                     if tw is None:
                         TW_MISSING.add(self.fid)
                     else:

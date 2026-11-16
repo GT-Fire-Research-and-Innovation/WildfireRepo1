@@ -100,7 +100,7 @@ def test_loader_applies_the_response_only_when_asked(tmp_path, settings):
     D.WIND_TERRAIN = False
     off = hrrr(f)
     assert np.allclose(off[2] * 8, 6.0, atol=1e-3) and np.allclose(off[1], 0.0, atol=1e-6)
-    D.WIND_TERRAIN = True
+    D.WIND_TERRAIN = D.wind_file(1)
     D._CACHE.clear()
     on = hrrr(f)
     assert np.allclose(on[2][:, 40:] * 8, 9.0, atol=1e-2)            # speed-up where the response says so
@@ -113,9 +113,28 @@ def test_loader_applies_the_response_only_when_asked(tmp_path, settings):
 
 def test_missing_file_is_recorded_and_wind_left_alone(tmp_path, settings):
     f = make_fire(tmp_path)
-    D.WIND_TERRAIN = True
+    D.WIND_TERRAIN = D.wind_file(1)
     assert np.allclose(hrrr(f)[2] * 8, 6.0, atol=1e-3)
     assert D.TW_MISSING == {"F1"}
+
+
+def test_the_finer_version_is_a_separate_file(tmp_path, settings):
+    assert D.wind_file(0) is False and D.wind_file(1) == "terrain_wind" and D.wind_file(75) == "terrain_wind75"
+    f = make_fire(tmp_path, FLAT)                                    # the grid-terrain file says: no change
+    r = FLAT.copy()
+    r[0, 0] = 2.0
+    np.savez(f.d / "terrain_wind75.npz", resp=r.astype(np.float16), valid=np.ones((H, W), bool))
+    D.WIND_TERRAIN = D.wind_file(75)
+    assert np.allclose(hrrr(f)[2] * 8, 12.0, atol=1e-2)
+    D.WIND_TERRAIN = D.wind_file(1)
+    D._CACHE.clear()
+    assert np.allclose(hrrr(f)[2] * 8, 6.0, atol=1e-2)
+
+
+def test_mesh_is_coarsened_to_fit_memory():
+    assert WF.mesh_for(100_000, 150.0) == 150.0
+    assert WF.mesh_for(1_600_000, 75.0) == 150.0                     # four times too many cells: twice the mesh
+    assert 75.0 < WF.mesh_for(600_000, 75.0) <= 95.0
 
 
 @pytest.mark.skipif(not os.environ.get("WINDNINJA_CLI"), reason="set WINDNINJA_CLI to run WindNinja itself")
