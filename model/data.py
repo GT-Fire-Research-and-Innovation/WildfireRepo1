@@ -66,6 +66,11 @@ HRRR_ROTATE = True           # rotate HRRR winds from the HRRR grid's axes to tr
 HRRR_CONE, HRRR_LON0 = 0.622515, -97.5     # HRRR Lambert conformal: sin(38.5 deg), central meridian
 ROTH_WIND = "vector"         # wind speed given to Rothermel: "vector" (speed of the mean wind vector), "mean", "p90"
 CANOPY_WAF = False           # shelter the midflame wind under forest canopy (LANDFIRE cover and height)
+WIND_TERRAIN = False         # reshape HRRR winds with the fire's WindNinja terrain response (terrain_wind.npz, built by
+                             #   pipeline/windninja_fields.py): ridges and gaps faster, sheltered ground slower, flow turned
+                             #   along drainages. Changes the hrrr, hrrr_seq and physics inputs, so a model must be trained
+                             #   and scored with the same setting.
+TW_MISSING = set()           # fires that were asked for terrain wind and have no file (they keep the plain HRRR wind)
 GM_DAY = "start"             # GRIDMET day: "start" (local day of t_i) or "window" (days whose afternoon is in the window)
 WEATHER_MODE = "observed"    # "observed": HRRR analyses over the gap (oracle weather, best case)
                              # "forecast": only what a forecaster has at t_i: HRRR analyses of the last 24 h
@@ -130,6 +135,14 @@ def fix_times(times_ns, sources, lon, lat, year):
 
 LAYER_CACHE = 24            # layers kept in memory per process (a fire has ~11)
 _CACHE = OrderedDict()
+
+
+def terrain_wind(resp, u, v):
+    """HRRR's broad wind reshaped by the terrain. resp (2, 2, h, w) is the fire's WindNinja response: resp[0] is
+    the (u, v) wind at each cell for a unit wind blowing east, resp[1] for a unit wind blowing north. WindNinja's
+    mass-conserving solver is linear in the input wind, so any wind is a sum of the two. u, v: (T, h, w)."""
+    r = np.asarray(resp, np.float32)
+    return u * r[0, 0] + v * r[1, 0], u * r[0, 1] + v * r[1, 1]
 
 
 class Fire:
@@ -395,6 +408,7 @@ class Fire:
         u_mean = v_mean = None
         hseq = None
         self._spd_stats = None
+        self.broad_spd = None        # mean HRRR speed before any terrain adjustment (evaluation bins cells by it)
         if rz is not None and "hrrr" not in hide:
             ts = pd.to_datetime(rz["times"], utc=True)
             if WEATHER_MODE == "forecast":
@@ -432,6 +446,15 @@ class Fire:
                     u, vv = u * math.cos(ang) + vv * math.sin(ang), -u * math.sin(ang) + vv * math.cos(ang)
                 spd = np.hypot(u, vv)
                 gust = np.where(np.isfinite(flat[:, 0]), flat[:, 0], spd)
+                self.broad_spd = spd.mean(0)
+                if WIND_TERRAIN:
+                    tw = self.z("terrain_wind")
+                    if tw is None:
+                        TW_MISSING.add(self.fid)
+                    else:
+                        u, vv = terrain_wind(tw["resp"][:, :, r0:r1, c0:c1], u, vv)
+                        spd, broad = np.hypot(u, vv), spd
+                        gust = gust * np.clip(spd / np.maximum(broad, 0.5), 0.25, 3.0)   # gusts follow the local speed
                 rh = flat[:, 3]
                 rh_ok = np.isfinite(rh)
                 with warnings.catch_warnings():

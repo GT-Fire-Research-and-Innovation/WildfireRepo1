@@ -281,6 +281,8 @@ def run_split(members, fires, calibrate, max_pairs=None, log_every=200):
             fuel = np.where(fu[11] > 0, np.argmax(fu[:7], 0), 7).astype(np.int8)
             hr = feats["hrrr"]
             spd = hr[2] * 8 if hr[6].max() > 0 else feats["weather"][6] * 2 + 4
+            if hr[6].max() > 0 and getattr(f, "broad_spd", None) is not None:
+                spd = f.broad_spd                # the weather model's wind, so the bins hold the same cells with terrain wind on or off
             FUEL.append(fuel[m])
             WIND.append(np.digitize(spd, WIND_EDGES).astype(np.int8)[m])
             GAP.append(np.full(int(m.sum()), np.digitize(gap, GAP_EDGES), np.int8))
@@ -410,6 +412,9 @@ def main():
     ap.add_argument("--test-years", default="2024,2025")
     ap.add_argument("--weather", default="observed", choices=["observed", "forecast"],
                     help="weather inputs; use what the model was trained with (forecast = only weather known at t_i)")
+    ap.add_argument("--wind-terrain", type=int, choices=[0, 1],
+                    help="HRRR winds reshaped by terrain (WindNinja). Default: what the models were trained with. "
+                         "Giving it scores a model on winds it was not trained on: fair only for physics-only runs")
     ap.add_argument("--lag-h", type=float, default=0.0,
                     help="start every forecast this many hours after its perimeter was mapped (the live situation); "
                          "windows with less than 3 h left are skipped")
@@ -424,6 +429,15 @@ def main():
     D.WEATHER_MODE = a.weather
     torch.manual_seed(0)
     runs = Path(a.data) / "runs"
+    trained = {sp: bool(json.loads((runs / f"{sp.split(':')[0]}.json").read_text()).get("wind_terrain", False))
+               for sp in a.model if (runs / f"{sp.split(':')[0]}.json").exists()}
+    if a.wind_terrain is None and len(set(trained.values())) > 1:
+        raise SystemExit(f"these models were trained on different winds (terrain-adjusted or not): {trained}; score them separately")
+    D.WIND_TERRAIN = bool(a.wind_terrain) if a.wind_terrain is not None else any(trained.values())
+    off = [sp for sp, t in trained.items() if t != D.WIND_TERRAIN]
+    if off:
+        print(f"  !! {off} trained with terrain wind {'off' if D.WIND_TERRAIN else 'on'}, scored with it "
+              f"{'on' if D.WIND_TERRAIN else 'off'}: an indication only", flush=True)
     pca = TH.fit_pca(a.data, runs)
     fires = TH.load_fires(a.data, pca, None, a.catalog)
     split = {s: [f for f in fires if D.year_split(f.year) == s] for s in ("val", "test")}
@@ -443,7 +457,7 @@ def main():
     print(f"[{a.out}] {len(members)} model(s); val/test fires {len(split['val'])}/{len(split['test'])}; "
           f"calibration {'on' if calibrate else 'off'}", flush=True)
 
-    res = {"name": a.out, "models": a.model, "resolution_m": res_m, "data_version": D.DATA_VERSION, "input_version": D.INPUT_VERSION, "weather": D.WEATHER_MODE, "lag_h": LAG_H}
+    res = {"name": a.out, "models": a.model, "resolution_m": res_m, "data_version": D.DATA_VERSION, "input_version": D.INPUT_VERSION, "weather": D.WEATHER_MODE, "lag_h": LAG_H, "wind_terrain": D.WIND_TERRAIN}
     print("  validation pass (thresholds)", flush=True)
     sv, cv, rows_v = run_split(members, split["val"], calibrate, a.max_pairs)
     thr = {v: TH.metrics(sv[v], cv["y"])["thr"] for v in sv}
@@ -483,6 +497,10 @@ def main():
             r.pop(k, None)
     res["pairs"] = rows
     path = runs / f"eval_{a.out}.json"
+    if D.WIND_TERRAIN:
+        res["wind_terrain_missing"] = sorted(D.TW_MISSING)
+        print(f"  terrain wind: {len(D.TW_MISSING)} fires had no terrain_wind.npz and kept the plain HRRR wind"
+              + (f": {sorted(D.TW_MISSING)[:8]}" if D.TW_MISSING else ""), flush=True)
     json.dump(res, open(path, "w"), indent=1)
     try:
         save_preds(runs / f"preds_{a.out}.npz", sv, cv, rows_v, st, ct, rows)
