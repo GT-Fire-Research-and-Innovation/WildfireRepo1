@@ -28,7 +28,7 @@ Target repo layout
   manifest/<channel>/<batch>.csv     fire_id, status, files, bytes, sources, fetched_utc, error
   shared/ics209/...                  source files used by many fires, stored once
 
-Needs HF_TOKEN (write access) unless --dry-run; FIRMS_MAP_KEY for firms; LANDFIRE_EMAIL for landfire.
+Needs HF_TOKEN (write access) unless --dry-run, and FIRMS_MAP_KEY for firms. No other keys.
 """
 import argparse
 import io
@@ -506,7 +506,7 @@ def main(argv=None):
     if a.check:
         from huggingface_hub import HfApi
         who = check_hf(HfApi(token=os.environ.get("HF_TOKEN") or None), a.hf_repo)
-        keys = {k: ("set" if os.environ.get(k) else "missing (channel skipped)") for k in ("FIRMS_MAP_KEY", "LANDFIRE_EMAIL")}
+        keys = {k: ("set" if os.environ.get(k) else "missing (channel skipped)") for k in ("FIRMS_MAP_KEY",)}
         print(f"OK: HF_TOKEN can write as '{who}' to {a.hf_repo}; {keys}", flush=True)
         return 0
     if a.status:

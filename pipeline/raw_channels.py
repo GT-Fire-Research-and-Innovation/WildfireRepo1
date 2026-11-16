@@ -15,14 +15,14 @@ Channels (cheap -> heavy) and what each writes into fires/<fire_id>/<channel>/:
   suppression  NIFS / ODA EventLine + EventPolygon, every archived version (2018+) event_lines.geojson, event_polygons.geojson
   tessera      GeoTessera v1.1 reference only (no embedding data)                tessera_ref.json
   terrain      Copernicus GLO-30 DEM, native 1 arc-second window                 dem_glo30.tif
-  landfire     LANDFIRE (LFPS) zip as delivered, native 30 m (fires 2017+)       landfire_<version>.zip
+  landfire     LANDFIRE image services, native 30 m EPSG:5070 (fires 2017+)      landfire_<version>_<layer>.tif
   goes         GOES-16/17/18/19 ABI L2 FDCC, hourly scan, fixed-grid crop        goes_<sat>.nc
   hrrr         HRRR gust/u10/v10/rh2, 3-hourly analyses + 12z+9h forecasts       hrrr_ana.nc, hrrr_fc.nc
   osm          OpenStreetMap 1 January snapshot of the fire's year, full extract osm_<YYYY>-01-01.osm.pbf
 
 Per-fire channels: grab_<channel>(fire, out_dir, ctx) -> (status, sources), status "ok" or "empty".
-Group channels (goes, hrrr, landfire, osm) share downloads across fires: grab_<channel>_many(fires, ctx)
-yields (fire, status, sources, error). Secrets (FIRMS map key, LANDFIRE email) never reach the manifest.
+Group channels (goes, hrrr, osm) share downloads across fires: grab_<channel>_many(fires, ctx)
+yields (fire, status, sources, error). Secrets (FIRMS map key, HF token) never reach the manifest.
 """
 import gzip
 import json
@@ -41,7 +41,7 @@ sys.path.insert(0, str(HERE.parent))
 
 CHANNELS = ["history", "perimeters", "firms", "gridmet", "ics209", "suppression", "tessera", "terrain",
             "landfire", "goes", "hrrr", "osm"]
-GROUP = {"goes", "hrrr", "landfire", "osm"}
+GROUP = {"goes", "hrrr", "osm"}
 GOES_VARS = ("Mask", "Power", "Area", "Temp", "DQF")
 HRRR_START = "2014-08-01"            # first HRRR files on AWS used by the build
 GOES_START = "2017-06-01"
@@ -250,9 +250,6 @@ def requirements(channel):
     if channel == "firms":
         from live import firms
         firms.map_key()
-    if channel == "landfire":
-        import landfire_features as L
-        L.email()
     if channel == "osm" and not shutil.which("osmium"):
         raise SystemExit("osm needs osmium-tool (apt-get install -y osmium-tool, or conda install osmium-tool)")
     if channel == "hrrr":
@@ -297,40 +294,57 @@ def _years(fire):
     return list(range(_ts(fire["first"]).year, t1.year + 1))
 
 
-def _arcgis_paged(sess, url, params, page=1000):
-    feats, off = [], 0
-    while True:
-        for attempt in range(6):
-            try:
-                r = sess.get(f"{url}/query", params=dict(params, resultOffset=off, resultRecordCount=page), timeout=180)
-                js = r.json()
-                if "error" in js:
-                    raise RuntimeError(js["error"])
-                break
-            except (ValueError, RuntimeError, OSError) as ex:
-                if attempt == 5:
-                    raise
-                print(f"    retry {attempt + 1}: {str(ex)[:120]}", flush=True)
-                time.sleep(5 * 2 ** attempt)
-        batch = js.get("features", [])
-        feats += batch
-        more = js.get("exceededTransferLimit") or js.get("properties", {}).get("exceededTransferLimit")
-        if not batch or (len(batch) < page and not more):
-            return feats
-        off += len(batch)
+def _arcgis_call(sess, layer_url, params, post=False, tries=6):
+    """One ArcGIS query, retried; ArcGIS reports errors with HTTP 200 and an 'error' body, raised here."""
+    for attempt in range(tries):
+        try:
+            r = (sess.post(f"{layer_url}/query", data=params, timeout=300) if post
+                 else sess.get(f"{layer_url}/query", params=params, timeout=180))
+            js = r.json()
+            if "error" in js:
+                raise RuntimeError(js["error"])
+            return js
+        except (ValueError, RuntimeError, OSError) as ex:
+            if attempt == tries - 1:
+                raise
+            print(f"    retry {attempt + 1}: {str(ex)[:120]}", flush=True)
+            time.sleep(5 * 2 ** attempt)
+
+
+def arcgis_box_features(sess, layer_url, bbox, where="1=1", chunk=200):
+    """Every feature of a layer intersecting bbox (lon/lat), as GeoJSON, all fields, full geometry.
+    Pages by OBJECTID (list the ids, then fetch them in chunks), not by resultOffset: offset paging on the
+    2018 NIFS archive repeats records and silently misses others (California, 2018 EventLine: 137,930 rows
+    returned, 92,926 unique). Raises if any listed id does not come back."""
+    q = {"where": where, "geometry": ",".join(f"{b}" for b in bbox), "geometryType": "esriGeometryEnvelope",
+         "inSR": 4326, "spatialRel": "esriSpatialRelIntersects"}
+    ids = sorted(set(_arcgis_call(sess, layer_url, dict(q, returnIdsOnly="true", f="json")).get("objectIds") or []))
+    feats = []
+    for i in range(0, len(ids), chunk):
+        js = _arcgis_call(sess, layer_url, {"objectIds": ",".join(map(str, ids[i:i + chunk])), "outFields": "*",
+                                            "returnGeometry": "true", "outSR": 4326, "f": "geojson"}, post=True)
+        feats += js.get("features", [])
+    if len(feats) != len(ids):
+        raise RuntimeError(f"{layer_url}: listed {len(ids)} features, received {len(feats)}")
+    return feats
+
+
+def _box_query(ctx, url, bbox):
+    """Archive layer features in the box: ArcGIS services by id, 2020/2021 geodatabases from the local copy."""
+    import nifc_perimeters as NP
+    if url.startswith("fgdb://"):
+        return NP.query_layer(ctx.sess, url, bbox, ctx.tmp())
+    return arcgis_box_features(ctx.sess, url, bbox)
 
 
 # ------------------------------------------------------------------------------------- per-fire channels
 
 def grab_history(fire, out, ctx):
     import build_multiyear as BM
-    w, s, e, n = fire["bounds"]
-    params = {"where": f"FIRE_YEAR_INT < {int(fire['year'])}", "geometry": f"{w},{s},{e},{n}",
-              "geometryType": "esriGeometryEnvelope", "inSR": 4326, "outSR": 4326,
-              "spatialRel": "esriSpatialRelIntersects", "outFields": "*", "returnGeometry": "true", "f": "geojson"}
-    feats = _arcgis_paged(ctx.sess, BM.HIST_URL, params)
+    where = f"FIRE_YEAR_INT < {int(fire['year'])}"
+    feats = arcgis_box_features(ctx.sess, BM.HIST_URL, fire["bounds"], where=where, chunk=100)
     _write_geojson(out / "history.geojson", feats)
-    return ("ok" if feats else "empty"), [arcgis_query_url(BM.HIST_URL, fire["bounds"], where=params["where"])]
+    return ("ok" if feats else "empty"), [arcgis_query_url(BM.HIST_URL, fire["bounds"], where=where)]
 
 
 def _perimeter_layers(ctx, year):
@@ -347,7 +361,7 @@ def grab_perimeters(fire, out, ctx):
     keep, sources = [], []
     for y in _years(fire):
         for kind, url in _perimeter_layers(ctx, y):
-            feats = NP.query_layer(ctx.sess, url, bbox, ctx.tmp())
+            feats = _box_query(ctx, url, bbox)
             sources.append(_layer_source(url, bbox))
             for f in feats:
                 p = {k.lower(): v for k, v in (f.get("properties") or {}).items()}
@@ -489,7 +503,7 @@ def grab_suppression(fire, out, ctx):
     for y in [y for y in _years(fire) if y >= 2018]:
         layers = ctx.memo(("supp", y), lambda y=y: SL.discover_archive_layers(ctx.sess, [y]).get(y, []))
         for url, kind in layers:
-            feats = NP.query_layer(ctx.sess, url, bbox, ctx.tmp())
+            feats = _box_query(ctx, url, bbox)
             sources.append(_layer_source(url, bbox))
             for f in feats:
                 f = dict(f)
@@ -524,11 +538,20 @@ def grab_terrain(fire, out, ctx):
         for lat in range(math.floor(s), math.floor(n) + 1):
             for lon in range(math.floor(w), math.floor(e) + 1):
                 url = B.DEM_URL.format(ns="N" if lat >= 0 else "S", lat=abs(lat), ew="W" if lon < 0 else "E", lon=abs(lon))
+                code = ctx.sess.head(url, timeout=60).status_code
+                if code in (403, 404):
+                    continue                                 # ocean: the archive has no tile there
+                if code != 200:
+                    raise RuntimeError(f"DEM tile HEAD {code}: {url}")
                 try:
-                    srcs.append(rasterio.open("/vsicurl/" + url))
-                    sources.append(url)
+                    srcs.append(rasterio.open("/vsicurl/" + url))    # COG: reads only the window it needs
                 except rasterio.errors.RasterioIOError:
-                    pass                                    # ocean: no tile
+                    tile = ctx.cache / "dem" / url.rsplit("/", 1)[1]   # no remote reads here: fetch the whole tile
+                    if not tile.exists():
+                        tile.parent.mkdir(parents=True, exist_ok=True)
+                        tile.write_bytes(http_get(ctx, url, timeout=600))
+                    srcs.append(rasterio.open(tile))
+                sources.append(url)
         if not srcs:
             return "empty", []
         arr, tr = merge(srcs, bounds=(w, s, e, n))
@@ -544,8 +567,63 @@ def grab_terrain(fire, out, ctx):
     return "ok", sources
 
 
+LANDFIRE_IMAGE = "https://lfps.usgs.gov/arcgis/rest/services/Landfire_{v}/{v}_{layer}_CONUS/ImageServer"
+LANDFIRE_LAYERS = ("FBFM40", "CC", "CH", "CBH", "CBD")
+
+
+def native_window(bounds_ll, origin, res, crs=5070):
+    """Box in the service's own projection, snapped outward to its pixel edges (origin = top-left corner of
+    the service extent), so the export is the stored pixels with no resampling. -> (x0, y0, x1, y1, w, h)"""
+    from pyproj import Transformer
+    xs0, ys0, xs1, ys1 = Transformer.from_crs(4326, crs, always_xy=True).transform_bounds(*bounds_ll, densify_pts=21)
+    X0, Y1 = origin
+    x0 = X0 + math.floor((xs0 - X0) / res) * res
+    x1 = X0 + math.ceil((xs1 - X0) / res) * res
+    y1 = Y1 - math.floor((Y1 - ys1) / res) * res
+    y0 = Y1 - math.ceil((Y1 - ys0) / res) * res
+    return x0, y0, x1, y1, int(round((x1 - x0) / res)), int(round((y1 - y0) / res))
+
+
+def landfire_export_url(v, layer, bounds_ll, info):
+    from urllib.parse import urlencode
+    ext, res = info["extent"], info["pixelSizeX"]
+    x0, y0, x1, y1, w, h = native_window(bounds_ll, (ext["xmin"], ext["ymax"]), res, info["spatialReference"]["wkid"])
+    q = {"bbox": f"{x0:.0f},{y0:.0f},{x1:.0f},{y1:.0f}", "bboxSR": 5070, "imageSR": 5070, "size": f"{w},{h}",
+         "format": "tiff", "compression": "LZW", "pixelType": info["pixelType"], "noData": info.get("noDataValue", -9999),
+         "interpolation": "RSP_NearestNeighbor", "f": "image"}
+    return f"{LANDFIRE_IMAGE.format(v=v, layer=layer)}/exportImage?{urlencode(q)}"
+
+
+def grab_landfire(fire, out, ctx):
+    """FBFM40, CC, CH, CBH, CBD of the newest LANDFIRE version before the fire, from LANDFIRE's own image
+    services: native 30 m pixels in EPSG:5070, nearest neighbour on the stored grid (no resampling), LZW
+    GeoTIFF exactly as the server returns it. No email or job queue (the LFPS route needed both)."""
+    import requests
+    from concurrent.futures import ThreadPoolExecutor
+    v = landfire_version(int(fire["year"]))
+
+    def one(layer):
+        info = ctx.memo(("lf", v, layer), lambda: ctx.sess.get(LANDFIRE_IMAGE.format(v=v, layer=layer),
+                                                                params={"f": "json"}, timeout=60).json())
+        if "extent" not in info:
+            raise RuntimeError(f"LANDFIRE {v}_{layer}: service info unavailable: {str(info)[:150]}")
+        url = landfire_export_url(v, layer, fire["bounds"], info)
+        data = http_get(ctx, url, timeout=600)
+        if data[:4] not in (b"II*\x00", b"MM\x00*", b"II+\x00"):
+            raise RuntimeError(f"LANDFIRE {v}_{layer}: reply is not a GeoTIFF: {data[:150]!r}")
+        (out / f"landfire_{v}_{layer}.tif").write_bytes(data)
+        return url
+
+    try:
+        with ThreadPoolExecutor(len(LANDFIRE_LAYERS)) as ex:
+            return "ok", list(ex.map(one, LANDFIRE_LAYERS))
+    except requests.RequestException as ex:
+        raise RuntimeError(f"LANDFIRE {v}: {ex}") from ex
+
+
 PER_FIRE = {"history": grab_history, "perimeters": grab_perimeters, "firms": grab_firms, "gridmet": grab_gridmet,
-            "ics209": grab_ics209, "suppression": grab_suppression, "tessera": grab_tessera, "terrain": grab_terrain}
+            "ics209": grab_ics209, "suppression": grab_suppression, "tessera": grab_tessera, "terrain": grab_terrain,
+            "landfire": grab_landfire}
 
 
 # ------------------------------------------------------------------------------------- group channels
@@ -627,6 +705,19 @@ def _windowed_map(ex, fn, keys, ahead):
             break
 
 
+def _open_nc_bytes(netCDF4, data, ctx):
+    """Open a downloaded netCDF from memory; if this netCDF4 build cannot (some preinstalled builds), from a
+    temporary file instead. -> (dataset, temp path or None)"""
+    try:
+        return netCDF4.Dataset("mem", memory=data), None
+    except (OSError, ValueError, RuntimeError):
+        import tempfile
+        fd, p = tempfile.mkstemp(suffix=".nc", dir=ctx.tmp())
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+        return netCDF4.Dataset(p), Path(p)
+
+
 def grab_goes_many(fires, ctx, chunk=25):
     """Per fire and satellite: the scan nearest each hour, cropped to the box on the ABI fixed grid, with
     the fire product's own variables (Mask, Power, Area, Temp, DQF) left packed as in the source file."""
@@ -671,7 +762,7 @@ def grab_goes_many(fires, ctx, chunk=25):
         with ThreadPoolExecutor(ctx.threads) as ex:
             for (t, sat, bucket), key, data in _windowed_map(ex, fetch, sorted(need), 4 * ctx.threads):
                 if data is not None:
-                    ds = netCDF4.Dataset("mem", memory=data)
+                    ds, tmp = _open_nc_bytes(netCDF4, data, ctx)
                     try:
                         shape = ds.variables["Mask"].shape
                         if (sat, shape) not in grids:
@@ -712,6 +803,8 @@ def grab_goes_many(fires, ctx, chunk=25):
                                 scans[fid][(bucket, day)] = scans[fid].get((bucket, day), 0) + 1
                     finally:
                         ds.close()
+                        if tmp:
+                            tmp.unlink(missing_ok=True)
                 for f in need[(t, sat, bucket)]:
                     fid = f["fire_id"]
                     left[fid] -= 1
@@ -797,41 +890,6 @@ def grab_hrrr_many(fires, ctx, chunk=25, step_h=3):
             return
 
 
-def grab_landfire_many(fires, ctx, parallel=3):
-    """LFPS jobs, a few at a time: FBFM40, CC, CH, CBH, CBD of the newest LANDFIRE predating the fire, on
-    LANDFIRE's own 30 m grid and projection, kept as the zip LFPS delivers."""
-    from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
-    import landfire_features as L
-
-    def job(f):
-        v = landfire_version(int(f["year"]))
-        layers = [f"{v}_{x}" for x in ("FBFM40", "CC", "CH", "CBH", "CBD")]
-        from urllib.parse import urlencode
-        L.fetch(f["bounds"], ctx.stage(f["fire_id"]) / f"landfire_{v}.zip", layers=layers, native=True)
-        w, s, e, n = f["bounds"]
-        # the LFPS job request (add &Email=<you> to submit it; the reply's jobId gives /status and the zip)
-        return f"{L.LFPS}/submit?" + urlencode({"Layer_List": ";".join(layers), "Area_of_Interest": f"{w:.4f} {s:.4f} {e:.4f} {n:.4f}"})
-
-    it = iter(fires)
-    with ThreadPoolExecutor(parallel) as ex:
-        running = {}
-        while True:
-            while len(running) < parallel and not ctx.expired():
-                f = next(it, None)
-                if f is None:
-                    break
-                running[ex.submit(job, f)] = f
-            if not running:
-                return
-            done, _ = wait(running, return_when=FIRST_COMPLETED)
-            for fut in done:
-                f = running.pop(fut)
-                try:
-                    yield f, "ok", [fut.result()], None
-                except Exception as ex_:  # noqa: BLE001
-                    yield f, "error", [], str(ex_)[:300]
-
-
 def grab_osm_many(fires, ctx):
     """Full (unfiltered) OpenStreetMap extract of each box from the Geofabrik snapshot of 1 January of the
     fire's year. Fires are grouped by (region, year) so each ~2-3 GB snapshot downloads once, then it is
@@ -876,4 +934,4 @@ def grab_osm_many(fires, ctx):
         snap.unlink(missing_ok=True)
 
 
-GROUP_FUNCS = {"goes": grab_goes_many, "hrrr": grab_hrrr_many, "landfire": grab_landfire_many, "osm": grab_osm_many}
+GROUP_FUNCS = {"goes": grab_goes_many, "hrrr": grab_hrrr_many, "osm": grab_osm_many}

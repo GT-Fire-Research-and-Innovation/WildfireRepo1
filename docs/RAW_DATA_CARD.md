@@ -27,8 +27,7 @@ shared/ics209/                       source files used by many fires, stored onc
 ```
 To get one fire, download `fires/<fire_id>/`, for example with
 `huggingface_hub.snapshot_download(repo, repo_type="dataset", allow_patterns=["fires/<fire_id>/*"])`.
-FIRMS links contain `{MAP_KEY}` where your own free FIRMS key goes. The LANDFIRE link is the job request;
-add `&Email=<you>` to submit it.
+FIRMS links contain `{MAP_KEY}` where your own free FIRMS key goes.
 `fire_id` = `"F"` followed by the first 10 hex characters of the SHA-1 of the incident key (its IRWIN ID).
 It matches the built dataset.
 
@@ -43,7 +42,7 @@ It matches the built dataset.
 | suppression | NIFS / ODA EventLine and EventPolygon: every archived version (GDB_FROM_DATE / GDB_TO_DATE) | 2018+ | `event_lines.geojson`, `event_polygons.geojson` |
 | tessera | GeoTessera v1.1: reference only (year, box, how to fetch) | 2018+ | `tessera_ref.json` |
 | terrain | Copernicus GLO-30 DEM, native 1 arc-second | all | `dem_glo30.tif` |
-| landfire | LANDFIRE FBFM40, CC, CH, CBH, CBD from the newest version before the fire, native 30 m, as LFPS delivers it | 2017+ | `landfire_<version>.zip` |
+| landfire | LANDFIRE FBFM40, CC, CH, CBH, CBD from the newest version before the fire: the stored 30 m pixels in EPSG:5070 from LANDFIRE's image services (snapped to its grid, nearest neighbour), LZW GeoTIFF as the server returns it | 2017+ | `landfire_<version>_<layer>.tif` (5 files) |
 | goes | GOES-16/17/18/19 ABI L2 fire product (FDCC): the scan nearest each hour, cropped on the fixed grid; Mask/Power/Area/Temp/DQF stay packed as in the source | span ≥ 2017-06 | `goes_<sat>.nc` |
 | hrrr | NOAA HRRR GUST, UGRD/VGRD 10 m, RH 2 m, decoded from the files' own GRIB2 messages and cropped on the native 3 km grid: analyses every 3 h and the 12z run's 9 h forecast each day | span ≥ 2014-08 | `hrrr_ana.nc`, `hrrr_fc.nc` |
 | osm | OpenStreetMap, Geofabrik snapshot of 1 January of the fire's year: full extract of the box | all | `osm_<YYYY>-01-01.osm.pbf` |

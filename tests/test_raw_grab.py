@@ -2,6 +2,7 @@
 skip fires they have no data for, secrets never reach the manifest, dirty IRWIN keys still match, resume
 reads manifests right, and a batch is deleted only after its upload worked.
 Run: python -m pytest tests/test_raw_grab.py -q"""
+import json
 import sys
 from pathlib import Path
 
@@ -167,6 +168,9 @@ class Reply:
     def __init__(self, code, body=b""):
         self.status_code, self.content, self.text = code, body, body.decode(errors="replace")
 
+    def json(self):
+        return json.loads(self.content)
+
 
 class Sess:
     def __init__(self, replies):
@@ -190,6 +194,54 @@ def test_http_get_retries_server_errors_not_client_errors(monkeypatch):
     with pytest.raises(RuntimeError, match="HTTP 400: Requested time range"):
         RC.http_get(ctx, "u")
     assert ctx.sess.calls == 1
+
+
+def test_landfire_window_snaps_to_native_30m_grid():
+    pytest.importorskip("pyproj")
+    x0, y0, x1, y1, w, h = RC.native_window(CAMP["bounds"], (-2362425, 3177435), 30)
+    assert (x0 + 2362425) % 30 == 0 and (3177435 - y1) % 30 == 0          # pixel edges of the stored grid
+    assert (w, h) == ((x1 - x0) / 30, (y1 - y0) / 30) == (2246, 2195)      # Camp, as served
+    info = {"extent": {"xmin": -2362425, "ymax": 3177435}, "pixelSizeX": 30, "spatialReference": {"wkid": 5070},
+            "pixelType": "S16", "noDataValue": -9999}
+    u = RC.landfire_export_url("LF2016", "FBFM40", CAMP["bounds"], info)
+    assert "/Landfire_LF2016/LF2016_FBFM40_CONUS/ImageServer/exportImage?" in u
+    assert "size=2246%2C2195" in u and "interpolation=RSP_NearestNeighbor" in u and "compression=LZW" in u
+    assert "Email" not in u
+
+
+class IdSession:
+    """ArcGIS layer with 450 features: lists ids, then returns the ones asked for (optionally dropping one)."""
+
+    def __init__(self, drop=None):
+        self.drop, self.posts = drop, []
+
+    def get(self, url, params, timeout):
+        assert params["returnIdsOnly"] == "true" and "resultOffset" not in params
+        return Reply(200, json.dumps({"objectIds": list(range(450, 0, -1))}).encode())
+
+    def post(self, url, data, timeout):
+        ids = [int(i) for i in data["objectIds"].split(",") if int(i) != self.drop]
+        self.posts.append(len(ids))
+        return Reply(200, json.dumps({"type": "FeatureCollection", "features": [{"id": i} for i in ids]}).encode())
+
+
+def test_box_features_page_by_id_and_check_completeness():
+    s = IdSession()
+    feats = RC.arcgis_box_features(s, "https://x/FeatureServer/1", CAMP["bounds"])
+    assert [f["id"] for f in feats] == list(range(1, 451)) and s.posts == [200, 200, 50]
+    with pytest.raises(RuntimeError, match="listed 450 features, received 449"):
+        RC.arcgis_box_features(IdSession(drop=7), "https://x/FeatureServer/1", CAMP["bounds"])
+
+
+def test_netcdf_bytes_fall_back_to_a_file(tmp_path):
+    class NoMem:
+        def Dataset(self, path, memory=None):
+            if memory is not None:
+                raise OSError("NetCDF: HDF error")
+            return ("opened", Path(path).read_bytes())
+    ctx = type("C", (), {"tmp": lambda self: tmp_path})()
+    ds, tmp = RC._open_nc_bytes(NoMem(), b"CDF\x01data", ctx)
+    assert ds == ("opened", b"CDF\x01data") and tmp.exists()
 
 
 def test_error_streak_stops_a_broken_channel_only():

@@ -37,14 +37,11 @@ def email():
     return e
 
 
-def fetch(bounds, dst, layers=LAYERS, tries=3, resolution=90, native=False):
-    """resolution: 90 m for 150 m grids (unchanged), 30 m (native) for finer grids.
-    native=True: no reprojection or resampling (LANDFIRE's own 30 m grid and projection), and dst receives
-    the LFPS output zip exactly as delivered (raw-data pull, pipeline/raw_grab.py)."""
+def fetch(bounds, dst, layers=LAYERS, tries=3, resolution=90):
+    """resolution: 90 m for 150 m grids (unchanged), 30 m (native) for finer grids."""
     w, s, e, n = bounds
-    params = {"Email": email(), "Layer_List": ";".join(layers), "Area_of_Interest": f"{w:.4f} {s:.4f} {e:.4f} {n:.4f}"}
-    if not native:
-        params.update({"Output_Projection": "4326", "Resample_Resolution": str(int(resolution))})
+    params = {"Email": email(), "Layer_List": ";".join(layers), "Area_of_Interest": f"{w:.4f} {s:.4f} {e:.4f} {n:.4f}",
+              "Output_Projection": "4326", "Resample_Resolution": str(int(resolution))}
     for t in range(tries):
         try:
             job = requests.get(f"{LFPS}/submit", params=params, timeout=120).json()
@@ -56,10 +53,9 @@ def fetch(bounds, dst, layers=LAYERS, tries=3, resolution=90, native=False):
                     break
             if st["status"] != "Succeeded":
                 raise RuntimeError(f"job {jid}: {st['status']} {[m['description'] for m in st.get('messages', [])[-3:]]}")
-            data = requests.get(st["outputFile"], timeout=600).content
-            z = zipfile.ZipFile(io.BytesIO(data))
+            z = zipfile.ZipFile(io.BytesIO(requests.get(st["outputFile"], timeout=600).content))
             tif = [n for n in z.namelist() if n.lower().endswith(".tif")][0]
-            dst.write_bytes(data if native else z.read(tif))
+            dst.write_bytes(z.read(tif))
             return
         except Exception as ex:  # noqa: BLE001
             print(f"    retry {t + 1}: {ex}", flush=True)
