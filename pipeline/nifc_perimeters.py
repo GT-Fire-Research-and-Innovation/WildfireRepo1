@@ -63,6 +63,9 @@ FGDB_DIR = Path("nifc_out") / "fgdb"  # set from --out in main()
 NIFS_CATEGORIES = {"Wildfire Daily Fire Perimeter", "Wildfire Final Fire Perimeter"}
 # Map methods dropped by default (low positional accuracy).
 DROP_MAP_METHODS = {"hand sketch", "modeled"}
+# Not mapped at all: NIFS draws a circle of the reported size around the incident point. 80 % of the 2024
+# archive's perimeter records are these, nearly all on small fires (catalog rules v2 leaves them out).
+AUTO_MAP_METHODS = {"auto-generated", "auto-generated for inform"}
 # Ranking used when an incident has several perimeters on the same burn day
 # at the same time: lower is better.
 MAP_METHOD_RANK = {
@@ -496,8 +499,33 @@ def _safe_valid(g):
     return MultiPolygon(polys) if polys else None
 
 
-def clean(gdf, keep_methods=None):
-    """Returns (clean_gdf, counts_of_what_was_dropped)."""
+def same_day_keep(grp, min_h):
+    """Which of an incident's perimeters to keep when a burn day may hold several (grp sorted by time).
+    Each day's pick is the one the daily rule keeps (the latest, best mapped, largest). Earlier perimeters of
+    the same day are kept too when they carry their own mapping time (not an edit time or a bare date) and
+    sit at least min_h hours after the previous kept perimeter and before the day's pick. Returns index labels."""
+    order = grp.sort_values(["burn_day", "perim_time", "method_rank", "acres_calc"], ascending=[True, False, True, False])
+    daily = set(order.drop_duplicates("burn_day", keep="first").index)
+    pick_time = {d: t for d, t in zip(order.drop_duplicates("burn_day", keep="first")["burn_day"],
+                                      order.drop_duplicates("burn_day", keep="first")["perim_time"])}
+    mapped = grp["time_source"].eq("mapped") if "time_source" in grp else pd.Series(False, index=grp.index)
+    keep, last = [], None
+    for idx, t, day in zip(grp.index, grp["perim_time"], grp["burn_day"]):
+        if idx in daily:
+            keep.append(idx)
+            last = t
+        elif mapped[idx] and (last is None or (t - last).total_seconds() >= min_h * 3600) \
+                and (pick_time[day] - t).total_seconds() >= min_h * 3600:
+            keep.append(idx)
+            last = t
+    return keep
+
+
+def clean(gdf, keep_methods=None, drop_methods=None, sameday_h=None):
+    """Returns (clean_gdf, counts_of_what_was_dropped).
+    drop_methods: map methods to leave out (default DROP_MAP_METHODS).
+    sameday_h: None keeps one perimeter per burn day; a number also keeps earlier perimeters of a day that were
+    mapped at least that many hours apart (same_day_keep)."""
     import shapely
     drops = {}
 
@@ -522,7 +550,8 @@ def clean(gdf, keep_methods=None):
                "test / placeholder incident")
     methods = gdf["map_method"].str.lower()
     if keep_methods is None:
-        gdf = drop(methods.isin(DROP_MAP_METHODS), "hand sketch / modeled")
+        dm = DROP_MAP_METHODS if drop_methods is None else {m.lower() for m in drop_methods}
+        gdf = drop(methods.isin(dm), "hand sketch / modeled" if drop_methods is None else "map method left out")
     else:
         gdf = drop(~methods.isin({m.lower() for m in keep_methods}), "map method not kept")
     area_acres = gdf.to_crs(5070).area / 4046.8564224
@@ -560,16 +589,23 @@ def clean(gdf, keep_methods=None):
         gdf["acres_calc"] = gdf.to_crs(5070).area / 4046.8564224
 
     # One perimeter per incident per burn day: the latest, then best map method, then largest.
-    gdf = gdf.sort_values(["incident", "burn_day", "perim_time", "method_rank", "acres_calc"],
-                          ascending=[True, True, False, True, False])
+    # With sameday_h, earlier perimeters of the day that were mapped separately are kept as well.
     before = len(gdf)
-    gdf = gdf.drop_duplicates(subset=["incident", "burn_day"], keep="first")
+    if sameday_h is None:
+        gdf = gdf.sort_values(["incident", "burn_day", "perim_time", "method_rank", "acres_calc"],
+                              ascending=[True, True, False, True, False])
+        gdf = gdf.drop_duplicates(subset=["incident", "burn_day"], keep="first")
+    else:
+        gdf = gdf.sort_values(["incident", "perim_time", "method_rank", "acres_calc"], ascending=[True, True, True, False])
+        gdf = gdf.drop_duplicates(subset=["incident", "perim_time"], keep="first")
+        kept = [i for _, grp in gdf.groupby("incident", sort=False) for i in same_day_keep(grp, sameday_h)]
+        gdf = gdf.loc[kept]
     if before - len(gdf):
         drops["extra perimeter same day"] = before - len(gdf)
 
     # Shrinking re-maps: an incident's perimeter that is much smaller than one it already had.
     keep = []
-    for _, grp in gdf.sort_values("burn_day").groupby("incident", sort=False):
+    for _, grp in gdf.sort_values(["burn_day", "perim_time"]).groupby("incident", sort=False):
         best = 0.0
         for idx, a in zip(grp.index, grp["acres_calc"]):
             if best and a < SHRINK_TOL * best:
@@ -579,7 +615,7 @@ def clean(gdf, keep_methods=None):
     n_shrink = len(gdf) - len(keep)
     if n_shrink:
         drops["shrinking re-map"] = n_shrink
-    gdf = gdf.loc[keep].sort_values(["incident", "burn_day"])
+    gdf = gdf.loc[keep].sort_values(["incident", "burn_day", "perim_time"])
     return gdf, drops
 
 

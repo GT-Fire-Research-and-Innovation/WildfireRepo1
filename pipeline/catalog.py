@@ -16,6 +16,15 @@ Steps (each resumable; outputs in OUT/catalog):
            median hours between perimeters)
 
   python catalog.py all --out data --years 2014-2025
+
+Rules v2 (--rules v2): the expanded catalog, written to a second folder so the first stays as it is.
+  - smaller fires: final size >= --min-acres (100) with at least --min-perims (2) perimeters mapped 3 h or more
+    apart; the 3-burn-day rule is gone
+  - same-day perimeters: a burn day keeps its daily perimeter and any earlier one that was mapped separately
+    (its own mapping time, 3 h or more from its neighbours); edit-time copies are not counted as new mappings
+  - auto-generated circles are left out (they are not maps; they were 80 % of the 2024 archive's records)
+  python catalog.py all --out ~/scratch/wildfire --name catalog2 --from-catalog ~/scratch/wildfire/catalog --rules v2
+  (--from-catalog reuses the attribute scans and the geometries already downloaded)
 """
 import argparse
 import hashlib
@@ -33,6 +42,9 @@ import nifc_perimeters as N
 CATS = ("Wildfire Daily Fire Perimeter", "Wildfire Final Fire Perimeter")
 CONUS = (-125.0, 24.0, -66.0, 50.0)
 SIMPLIFY_DEG = 0.0002            # ~20 m; labels are rasterised at 150 m
+NAME = "catalog"                 # folder under --out (--name)
+SAMEDAY_H = 3.0                  # rules v2: hours between two perimeters of one burn day (the loader's shortest window)
+V2 = False                       # --rules v2
 
 
 def years_arg(s):
@@ -74,7 +86,7 @@ def layer_fields(sess, url):
 
 
 def scan(out, years):
-    d = out / "catalog"
+    d = out / NAME
     d.mkdir(parents=True, exist_ok=True)
     sess = N._session()
     N.FGDB_DIR = out / "nifc_fgdb"
@@ -124,7 +136,7 @@ def scan_fgdb(out, y, url):
     import pyogrio
     import shapely
     gdb, layer = url[len("fgdb://"):].split("|")
-    d = out / "catalog"
+    d = out / NAME
     gpath = d / f"geoms_{y}.parquet"
     info = pyogrio.read_info(gdb, layer=layer)
     n = info["features"]
@@ -207,7 +219,7 @@ def incident_keys(df):
 
 
 def select(out, years, min_acres, min_days):
-    d = out / "catalog"
+    d = out / NAME
     rows = []
     for y in years:
         p = d / f"attrs_{y}.parquet"
@@ -222,7 +234,7 @@ def select(out, years, min_acres, min_days):
     cat = df.get("featurecategory")
     if cat is not None:
         df = df[cat.isna() | cat.isin(CATS)]
-    ok_method = ~df["mapmethod"].astype("string").str.lower().isin(N.DROP_MAP_METHODS)
+    ok_method = ~df["mapmethod"].astype("string").str.lower().isin(N.DROP_MAP_METHODS | (N.AUTO_MAP_METHODS if V2 else set()))
     df["key"] = incident_keys(df)
     lon = pd.to_numeric(df["cx"], errors="coerce")
     lat = pd.to_numeric(df["cy"], errors="coerce")
@@ -231,8 +243,11 @@ def select(out, years, min_acres, min_days):
     acres = pd.to_numeric(df["gisacres"], errors="coerce")
     g = df[ok_method.reindex(df.index)].assign(acres=acres).groupby("key")
     summ = g.agg(year=("year", "max"), name=("incidentname", "first"), days=("day", "nunique"),
-                 max_acres=("acres", "max"), n=("t", "size"))
-    cand = summ[(summ["max_acres"] >= min_acres) & (summ["days"] >= min_days)]
+                 max_acres=("acres", "max"), n=("t", "size"), span_h=("t", lambda x: (x.max() - x.min()).total_seconds() / 3600))
+    if V2:                                    # two real mappings at least SAMEDAY_H apart (checked properly in clean)
+        cand = summ[(summ["max_acres"] >= min_acres) & (summ["span_h"] >= SAMEDAY_H)]
+    else:
+        cand = summ[(summ["max_acres"] >= min_acres) & (summ["days"] >= min_days)]
     keep = df[df["key"].isin(cand.index)].copy()
     for c in keep.columns:                    # archives mix ms numbers and ISO strings: store as text
         if keep[c].dtype == object or c in ("perimeterdatetime", "polygondatetime", "datecurrent", "gdb_from_date", "day"):
@@ -244,8 +259,10 @@ def select(out, years, min_acres, min_days):
     return cand
 
 
-def geoms(out, years):
-    d = out / "catalog"
+def geoms(out, years, reuse=None):
+    """reuse: a catalog folder whose geoms_<year>.parquet already holds some of the geometries (only the
+    missing ones are downloaded)."""
+    d = out / NAME
     rec = pd.read_parquet(d / "candidate_records.parquet")
     sess = N._session()
     for y in years:
@@ -253,9 +270,17 @@ def geoms(out, years):
         r = rec[(rec["year"] == y) & ~rec["layer_url"].str.startswith("fgdb://")]
         if dst.exists() or r.empty:
             continue
+        old = None
+        if reuse is not None and (Path(reuse) / f"geoms_{y}.parquet").exists():
+            old = pd.read_parquet(Path(reuse) / f"geoms_{y}.parquet")
+            if "featurecategory" in old.columns:          # a geodatabase year: handled by link_scans
+                old = None
         parts = []
         for url, grp in r.groupby("layer_url"):
             ids = sorted(set(pd.to_numeric(grp["objectid"]).astype(int).tolist()))
+            if old is not None:
+                have = set(pd.to_numeric(old.loc[old["layer_url"] == url, "objectid"]).astype(int))
+                ids = [i for i in ids if i not in have]
             t0 = time.time()
             for i in range(0, len(ids), 200):
                 for t in range(5):
@@ -280,7 +305,30 @@ def geoms(out, years):
         from shapely.geometry import shape
         g = pd.DataFrame(parts, columns=["layer_url", "objectid", "gj"])
         g["wkb"] = shapely.to_wkb([shape(json.loads(s)) for s in g.pop("gj")])
+        if old is not None:
+            g = pd.concat([old[["layer_url", "objectid", "wkb"]], g], ignore_index=True)
         g.to_parquet(dst, index=False)
+
+
+def link_scans(out, years, reuse):
+    """Reuse another catalog's attribute scans (and the geodatabase years' geometry files): links, not copies."""
+    import os
+    d = out / NAME
+    d.mkdir(parents=True, exist_ok=True)
+    for y in years:
+        names = [f"attrs_{y}.parquet"]
+        g = Path(reuse) / f"geoms_{y}.parquet"
+        if g.exists():
+            import pyarrow.parquet as pq
+            if "featurecategory" in pq.read_schema(g).names:
+                names.append(g.name)
+        for n in names:
+            src, dst = Path(reuse) / n, d / n
+            if src.exists() and not dst.exists():
+                try:
+                    os.link(src, dst)
+                except OSError:
+                    os.symlink(src.resolve(), dst)
 
 
 def norm_frame(g, geom, year):
@@ -360,11 +408,11 @@ def _bucket(df):
     return key.map(lambda k: zlib.crc32(str(k).encode()) % N_BUCKETS).astype("int8")
 
 
-def clean_all(out, years, min_acres, min_days):
+def clean_all(out, years, min_acres, min_days, min_perims=2):
     """Normalise each year to disk, then clean in incident buckets (keeps memory under ~2 GB)."""
     import geopandas as gpd
     import shapely
-    d = out / "catalog"
+    d = out / NAME
     nd = d / "norm"
     nd.mkdir(exist_ok=True)
     rec = pd.read_parquet(d / "candidate_records.parquet")
@@ -399,19 +447,26 @@ def clean_all(out, years, min_acres, min_days):
         del frames
         gdf["geometry"] = [polygonal(x) for x in gdf.geometry]
         gdf = gdf[gdf.geometry.notna()]
-        gdf, drops = N.clean(gdf)
+        gdf, drops = N.clean(gdf, drop_methods=(N.DROP_MAP_METHODS | N.AUTO_MAP_METHODS) if V2 else None,
+                             sameday_h=SAMEDAY_H if V2 else None)
         for k, v in drops.items():
             drops_all[k] = drops_all.get(k, 0) + v
         for inc, grp in gdf.groupby("incident"):
             grp = main_episode(grp.sort_values("perim_time"))
-            if grp["acres_calc"].max() < min_acres or grp["burn_day"].nunique() < min_days:
+            if grp["acres_calc"].max() < min_acres:
+                continue
+            if V2:
+                if len(grp) < min_perims or (grp["perim_time"].iloc[-1] - grp["perim_time"].iloc[0]).total_seconds() < SAMEDAY_H * 3600:
+                    continue
+            elif grp["burn_day"].nunique() < min_days:
                 continue
             bb = grp.total_bounds
             gaps = grp["perim_time"].diff().dt.total_seconds().dropna() / 3600
             fid = "F" + hashlib.sha1(inc.encode()).hexdigest()[:10]
             rows.append(dict(fire_id=fid, incident=inc, name=grp["incident_name"].iloc[-1], year=grp["perim_time"].iloc[-1].year,
                              first=grp["perim_time"].iloc[0], last=grp["perim_time"].iloc[-1], days=grp["burn_day"].nunique(),
-                             perimeters=len(grp), final_acres=float(grp["acres_calc"].max()),
+                             perimeters=len(grp), same_day=int(len(grp) - grp["burn_day"].nunique()),
+                             final_acres=float(grp["acres_calc"].max()),
                              first_acres=float(grp["acres_calc"].iloc[0]),
                              median_gap_h=float(gaps.median()) if len(gaps) else np.nan,
                              west=bb[0], south=bb[1], east=bb[2], north=bb[3], sources=",".join(sorted(grp["source"].unique())),
@@ -436,18 +491,32 @@ def main():
     ap.add_argument("step", choices=["scan", "select", "geoms", "clean", "all"])
     ap.add_argument("--out", default="data")
     ap.add_argument("--years", default="2014-2025")
-    ap.add_argument("--min-acres", type=float, default=1000)
-    ap.add_argument("--min-days", type=int, default=3)
+    ap.add_argument("--min-acres", type=float, help="smallest final size (default 1000; 100 with --rules v2)")
+    ap.add_argument("--min-days", type=int, default=3, help="rules v1: distinct burn days with a perimeter")
+    ap.add_argument("--min-perims", type=int, default=2, help="rules v2: perimeters kept after cleaning")
+    ap.add_argument("--rules", choices=["v1", "v2"], default="v1",
+                    help="v2: smaller fires, same-day perimeters, no auto-generated circles (see the top of this file)")
+    ap.add_argument("--name", default="catalog", help="catalog folder under --out")
+    ap.add_argument("--from-catalog", help="another catalog folder whose scans and geometries are reused")
     a = ap.parse_args()
-    out, years = Path(a.out), years_arg(a.years)
+    global NAME, V2
+    NAME, V2 = a.name, a.rules == "v2"
+    if a.min_acres is None:
+        a.min_acres = 100.0 if V2 else 1000.0
+    out, years = Path(a.out).expanduser(), years_arg(a.years)
+    reuse = Path(a.from_catalog).expanduser() if a.from_catalog else None
+    if reuse is not None:
+        if reuse.resolve() == (out / NAME).resolve():
+            raise SystemExit("--from-catalog is the folder being written: give the new one another --name")
+        link_scans(out, years, reuse)
     if a.step in ("scan", "all"):
         scan(out, years)
     if a.step in ("select", "all"):
         select(out, years, a.min_acres, a.min_days)
     if a.step in ("geoms", "all"):
-        geoms(out, years)
+        geoms(out, years, reuse)
     if a.step in ("clean", "all"):
-        clean_all(out, years, a.min_acres, a.min_days)
+        clean_all(out, years, a.min_acres, a.min_days, a.min_perims)
 
 
 if __name__ == "__main__":

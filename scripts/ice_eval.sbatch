@@ -21,4 +21,4 @@ echo "code: $(git -C "$SLURM_SUBMIT_DIR" log --oneline -1)"
 cd "$SLURM_SUBMIT_DIR/model"
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
 python evaluate.py --data "${WF_DATA:-$HOME/scratch/wildfire/my}" --model ${MODELS:?set MODELS} --out "${OUT:?set OUT}" \
-       --device cuda ${EXTRA:-}
+       --device cuda ${RUNS_DIR:+--runs "$RUNS_DIR"} ${EXTRA:-}

@@ -28,6 +28,7 @@ else WT=1; TAG="wn"; BUILD="--workers 8"; RES="-c 8 --mem=64G -t 12:00:00"; fi
 case "$YEARS" in *-*) YEARS=$(seq -s, "${YEARS%-*}" "${YEARS#*-}");; esac
 step="${1:-all}"
 build_job=""
+queued() { squeue -h -u "$USER" -o %j 2>/dev/null | grep -qx "$1"; }      # is a job with this name waiting or running?
 
 if [ "$step" = setup ] || [ "$step" = all ]; then
   if [ ! -x "$WN" ]; then
@@ -42,6 +43,7 @@ fi
 
 if [ "$step" = build ] || [ "$step" = all ]; then
   [ -x "$WN" ] || { echo "run: bash scripts/ice_wind.sh setup"; exit 1; }
+  if queued "wf-$TAG" && [ "${FORCE:-0}" != 1 ]; then echo "!! a wf-$TAG build is already queued or running (two would overwrite each other's files): not submitted"; exit 1; fi
   build_job=$(sbatch --parsable -p ice-cpu --qos=coe-ice -N 1 $RES -o logs/wind-%j.out -J wf-$TAG \
       --wrap "module purge; export PATH=\$HOME/scratch/envs/wildfire/bin:\$PATH; echo \"code: \$(git log --oneline -1)\"; python pipeline/windninja_fields.py --data $DATA --wn $WN --years $YEARS $BUILD") || exit 1
   echo "wind response ($TAG) for $YEARS: job $build_job  (log: logs/wind-$build_job.out; resumable, built fires are skipped)"

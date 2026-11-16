@@ -17,12 +17,14 @@ set -uo pipefail
 cd "$(dirname "$0")/.."
 mkdir -p logs
 export WF_DATA="${WF_DATA:-$HOME/scratch/wildfire/my}"
+ORIG="$HOME/scratch/wildfire/my"            # the first dataset: every earlier model was scored on its test fires
 RUNS="$WF_DATA/runs"
 BAD="--exclude=atl1-1-03-014-16-0"
 WIND="${WIND:-1}"; FRAC="${FRAC:-1}"; TAG="${TAG:-}"
 WFILE=$([ "$WIND" = 1 ] && echo terrain_wind || echo "terrain_wind$WIND")
 step="${1:-status}"; shift || true
 
+queued() { squeue -h -u "$USER" -o %j 2>/dev/null | grep -qx "$1"; }      # is a job with this name waiting or running?
 count() { ls "$WF_DATA"/fires/*/"$1".npz 2>/dev/null | wc -l; }
 status() {
   local n; n=$(ls -d "$WF_DATA"/fires/*/ 2>/dev/null | wc -l)
@@ -33,8 +35,11 @@ case "$step" in
 build)
   if [ "$WIND" != 0 ]; then YEARS=2014-2025 MESH=$([ "$WIND" = 1 ] || echo "$WIND") bash scripts/ice_wind.sh build; fi
   if [ "$FRAC" = 1 ]; then
-    j=$(STAGES=fuelfrac sbatch --parsable -J wf-fuelfrac scripts/ice_fuelbuild.sbatch) && \
-      echo "fuel shares (30 m LANDFIRE, one request per fire, about a day): job $j  (log: logs/fuelbuild-$j.out; resumable: submit again after a timeout)"
+    if queued wf-fuelfrac; then echo "fuel shares: a build is already queued or running (not submitted again)"
+    else
+      j=$(STAGES=fuelfrac sbatch --parsable -J wf-fuelfrac scripts/ice_fuelbuild.sbatch) && \
+        echo "fuel shares (30 m LANDFIRE, one request per fire, about a day): job $j  (log: logs/fuelbuild-$j.out; resumable: submit again after a timeout)"
+    fi
   fi
   ;;
 status) status ;;
@@ -47,6 +52,7 @@ train)
   fi
   for s in "${@:-0}"; do
     N="unet3_all_v4${TAG}$([ "$s" = 0 ] || echo "s$s")"
+    if queued "wf-$N"; then echo "$N: already queued or running (not submitted again)"; continue; fi
     X="--width 64 --u3-time 1 --u3-attn 0 --fuel-moisture 1 --origin-lag 1 --wind-terrain $WIND --fuel-frac $FRAC --seed $s"
     prev=""; all=""
     if [ ! -f "$RUNS/$N.pt" ]; then
@@ -59,12 +65,26 @@ train)
     e1=$(MODELS=$N OUT=${N}_eval sbatch --parsable -J "wf-eval-$N" -t 4:00:00 $BAD ${all:+--dependency=afterany:$all} scripts/ice_eval.sbatch)
     e2=$(MODELS=$N OUT=${N}_lag12 EXTRA="--lag-h 12" sbatch --parsable -J "wf-eval-${N}_lag12" -t 4:00:00 $BAD ${all:+--dependency=afterany:$all} scripts/ice_eval.sbatch)
     echo "  evaluations: ${N}_eval $e1, ${N}_lag12 $e2"
+    if [ "$WF_DATA" != "$ORIG" ]; then      # trained on another fire set: also score it on the original test fires
+      o1=$(WF_DATA=$ORIG RUNS_DIR=$RUNS MODELS=$N OUT=${N}_orig sbatch --parsable -J "wf-eval-${N}_orig" -t 4:00:00 $BAD ${all:+--dependency=afterany:$all} scripts/ice_eval.sbatch)
+      o2=$(WF_DATA=$ORIG RUNS_DIR=$RUNS MODELS=$N OUT=${N}_orig_lag12 EXTRA="--lag-h 12" sbatch --parsable -J "wf-eval-${N}_orig_lag12" -t 4:00:00 $BAD ${all:+--dependency=afterany:$all} scripts/ice_eval.sbatch)
+      echo "  on the original test fires (like for like with every earlier model): ${N}_orig $o1, ${N}_orig_lag12 $o2"
+    fi
   done
   ;;
 results)
   export PATH="$HOME/scratch/envs/wildfire/bin:$PATH"
+  if [ "$WF_DATA" != "$ORIG" ]; then        # results on the original test fires sit beside the earlier models
+    for f in "$RUNS"/eval_*_orig*.json; do [ -f "$f" ] && ln -sf "$f" "$ORIG/runs/$(basename "$f")"; done
+    echo "== on the original test fires"
+    have=""
+    for n in $(cd "$RUNS" && ls eval_*_orig*.json 2>/dev/null | sed 's/^eval_//; s/\.json$//') $(cd "$ORIG/runs" && ls eval_unet3_all_v4*.json 2>/dev/null | grep -v _orig | sed 's/^eval_//; s/\.json$//') \
+             unet3_fm_v3_eval unet3_ops_v3_lag12; do [ -f "$ORIG/runs/eval_$n.json" ] && have="$have $n"; done
+    (cd model && python compare.py --data "$ORIG" $have 2>&1 | awk '/^## /{p = ($0 ~ /Test years|HRRR wind|growth|time gap/)} p')
+    echo "== on this dataset's own test fires (includes small fires and same-day windows)"
+  fi
   have=""
-  for n in $(cd "$RUNS" && ls eval_unet3_all_v4*.json 2>/dev/null | sed 's/^eval_//; s/\.json$//') \
+  for n in $(cd "$RUNS" && ls eval_unet3_all_v4*.json 2>/dev/null | grep -v _orig | sed 's/^eval_//; s/\.json$//') \
            unet3_fm_v3_eval unet3_fm_v3s1_eval unet3_fm_v3s2_eval unet3_time_v3_eval unet3_ops_v3_lag12 unet3_site_v3_lag12; do
     [ -f "$RUNS/eval_$n.json" ] && have="$have $n"
   done

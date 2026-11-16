@@ -412,6 +412,8 @@ def main():
     ap.add_argument("--test-years", default="2024,2025")
     ap.add_argument("--weather", default="observed", choices=["observed", "forecast"],
                     help="weather inputs; use what the model was trained with (forecast = only weather known at t_i)")
+    ap.add_argument("--runs", help="folder with the models (and where results are written). Default: <data>/runs. "
+                                   "Lets a model trained on one dataset folder be scored on another")
     ap.add_argument("--fuel-frac", type=int, choices=[0, 1],
                     help="fuels as shares per cell (fuelfrac.npz). Default: what the models were trained with")
     ap.add_argument("--wind-terrain", type=int,
@@ -430,7 +432,7 @@ def main():
     D.TEST_YEARS = {int(y) for y in a.test_years.split(",")}
     D.WEATHER_MODE = a.weather
     torch.manual_seed(0)
-    runs = Path(a.data) / "runs"
+    runs = Path(a.runs) if a.runs else Path(a.data) / "runs"
     trained = {sp: int(json.loads((runs / f"{sp.split(':')[0]}.json").read_text()).get("wind_terrain", 0) or 0)
                for sp in a.model if (runs / f"{sp.split(':')[0]}.json").exists()}
     if a.wind_terrain is None and len(set(trained.values())) > 1:

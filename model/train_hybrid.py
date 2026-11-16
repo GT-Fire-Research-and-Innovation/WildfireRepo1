@@ -46,8 +46,9 @@ def set_grid(cell_km):
 HIDE_P = 0.15                    # chance of hiding each optional group during training
 
 
-def excluded_fires(catalog):
-    """Fires rated bad by qc_fires.py (incl. the post-build satellite check) or dropped on the QC page."""
+def excluded_fires(catalog, shipped=True):
+    """Fires rated bad by qc_fires.py (incl. the post-build satellite check) or dropped on the QC page.
+    shipped=False for a rebuilt catalog: the list shipped with the code belongs to the first catalog."""
     import pandas as pd
     cat = Path(catalog)
     bad = set()
@@ -62,17 +63,28 @@ def excluded_fires(catalog):
     # shipped with the code: fires in the catalog twice (the same fire under two records, or a member fire
     # that is also inside its complex), and fires whose perimeters lost more than half their area on some
     # day because the perimeter was stored in pieces. Remove this list once the catalog is rebuilt.
-    shipped = Path(__file__).resolve().parent.parent / "pipeline" / "excluded_fires.csv"
-    if shipped.exists():
-        bad |= set(pd.read_csv(shipped)["fire_id"])
+    listed = Path(__file__).resolve().parent.parent / "pipeline" / "excluded_fires.csv"
+    if shipped and listed.exists():
+        bad |= set(pd.read_csv(listed)["fire_id"])
     return bad
+
+
+def dataset_catalog(root, catalog=None):
+    """(catalog folder, is it the first catalog). A dataset folder made by pipeline/expand_dataset.py names its
+    own catalog in catalog.txt; otherwise it is the folder next to the dataset, as before."""
+    if catalog:
+        return Path(catalog), True
+    note = Path(root) / "catalog.txt"
+    if note.exists():
+        return Path(note.read_text().strip()), False
+    return Path(root).parent / "catalog", True
 
 
 def load_fires(root, pca, max_fires=None, catalog=None):
     dirs = sorted(p.parent for p in Path(root, "fires").glob("*/labels.npz"))
     need = ["labels", "terrain", "weather", "viirs"]
     dirs = [d for d in dirs if all((d / f"{n}.npz").exists() for n in need)]
-    bad = excluded_fires(catalog or Path(root).parent / "catalog")
+    bad = excluded_fires(*dataset_catalog(root, catalog))
     if bad:
         n0 = len(dirs)
         dirs = [d for d in dirs if d.name not in bad]
