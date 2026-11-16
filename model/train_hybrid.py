@@ -387,6 +387,9 @@ def main():
                          "(half the samples start 0-36 h into the window; adds the perimeter's age as an input)")
     ap.add_argument("--weather", default="observed", choices=["observed", "forecast"],
                     help="forecast: only weather a forecaster has at forecast time (see data.WEATHER_MODE)")
+    ap.add_argument("--fuel-frac", type=int, default=0,
+                    help="1: fuels as the share of each cell in every fuel family, from 30 m LANDFIRE (fuelfrac.npz), "
+                         "in place of one picked pixel per cell")
     ap.add_argument("--wind-terrain", type=int, default=0,
                     help="HRRR winds reshaped by each fire's WindNinja terrain response (pipeline/windninja_fields.py): "
                          "1 = solved on the grid's terrain, 75 = solved on a 75 m mesh and averaged up (terrain_wind75.npz)")
@@ -415,6 +418,7 @@ def main():
     D.PHYSICS_V2 = a.mode in V2_MODES
     D.WEATHER_MODE = a.weather
     D.WIND_TERRAIN = D.wind_file(a.wind_terrain)
+    D.FUEL_FRAC = bool(a.fuel_frac)
     global CROP_KM
     CROP_KM = a.crop_km
     D.TEMPORAL = a.mode == "unet3" and bool(a.u3_time)
@@ -511,7 +515,7 @@ def main():
               f"burning {extra['effective_minutes_per_day']:.0f} min/day", flush=True)
     if arch:
         extra.update(arch=arch, width=a.width, params=sum(p.numel() for p in model.parameters()))
-    json.dump({"name": a.name, "mode": a.mode, "drop": a.drop, "origin": bool(a.origin_lag), "wind_terrain": int(a.wind_terrain), "fuel_moisture": bool(a.fuel_moisture), "fm_physics": bool(a.fm_physics), "data_version": D.DATA_VERSION, "input_version": D.INPUT_VERSION, "weather": D.WEATHER_MODE, "val": best[2], "test": mt, "history": hist,
+    json.dump({"name": a.name, "mode": a.mode, "drop": a.drop, "origin": bool(a.origin_lag), "wind_terrain": int(a.wind_terrain), "fuel_frac": bool(a.fuel_frac), "fuel_moisture": bool(a.fuel_moisture), "fm_physics": bool(a.fm_physics), "data_version": D.DATA_VERSION, "input_version": D.INPUT_VERSION, "weather": D.WEATHER_MODE, "val": best[2], "test": mt, "history": hist,
                "pairs": rows, **extra}, open(runs / f"{a.name}.json", "w"), indent=1)
     print(f"[{a.name}] TEST AP {mt['ap']:.3f} F1 {mt['f1']:.3f} IoU {mt['iou']:.3f} P {mt['precision']:.3f} "
           f"R {mt['recall']:.3f} area {mt['area_ratio']:.2f}  edge {mt.get('edge_km_mean', float('nan')):.2f} km "

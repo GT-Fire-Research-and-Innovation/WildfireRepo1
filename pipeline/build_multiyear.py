@@ -61,7 +61,7 @@ def set_resolution(res_m):
 DAYS_BEFORE, DAYS_AFTER = 14, 2
 STAGES = ["grid", "labels", "history", "viirs", "terrain", "weather", "landfire", "tessera", "suppression",
           "hrrr", "goes", "human"]
-EXTRA_STAGES = ["fuelwx", "green", "landfire2"]      # fuel-moisture inputs: only when named in --stages
+EXTRA_STAGES = ["fuelwx", "green", "landfire2", "fuelfrac"]      # only when named in --stages
 DATE_MAJOR = ["hrrr", "goes", "human", "fuelwx"]
 HIST_URL = ("https://services3.arcgis.com/T4QMspbfLg3qTGWY/arcgis/rest/services/"
             "InterAgencyFirePerimeterHistory_All_Years_View/FeatureServer/0")
@@ -575,9 +575,95 @@ def _landfire_per_cell(a, tr, g):
     return np.rint(out).reshape(5, H, W)
 
 
+FUEL_FAMILIES = [("NB", 91, 99), ("GR", 101, 109), ("GS", 121, 124), ("SH", 141, 149), ("TU", 161, 165),
+                 ("TL", 181, 189), ("SB", 201, 204)]          # as model/data.py
+FUELFRAC_TILE_DEG = 0.5      # larger fire boxes are requested from LANDFIRE in pieces of this size
+
+
+def fuel_shares(tiles, g, fallback=None):
+    """What each grid cell is made of, from fine LANDFIRE pixels (about 15 per 150 m cell at 30 m).
+    tiles: iterable of (array (5, h, w): FBFM40, CC, CH, CBH, CBD; affine transform in lon/lat).
+    Returns frac (7, H, W) uint8: share of the cell in each fuel family, 255 = all of it; fbfm40: the most
+    common fuel model; cc, ch, cbh, cbd: means; n: fine pixels per cell. The grid-size landfire.npz keeps one
+    picked pixel per cell, so a cell that is 80 % timber could be labelled grass and fuel breaks narrower than
+    a cell either vanish or fill the cell. fallback: landfire.npz arrays for cells with no fine pixel."""
+    H, W = g["height"], g["width"]
+    dx, _, x0, _, ey, y0 = g["transform"]
+    fam_of = np.full(256, -1, np.int8)
+    for k, (_, lo, hi) in enumerate(FUEL_FAMILIES):
+        fam_of[lo:hi + 1] = k
+    fam = np.zeros((len(FUEL_FAMILIES), H * W), np.int32)
+    hist = np.zeros((H * W, 256), np.uint16)                       # fine pixels per cell and fuel model
+    csum, ccnt = np.zeros((4, H * W)), np.zeros((4, H * W), np.int32)
+    for a, tr in tiles:
+        rows, cols = np.mgrid[0:a.shape[1], 0:a.shape[2]]
+        ci = np.floor((tr.c + (cols + 0.5) * tr.a - x0) / dx).astype(np.int64)
+        ri = np.floor((tr.f + (rows + 0.5) * tr.e - y0) / ey).astype(np.int64)
+        code = a[0].astype(np.int64)
+        ok = (ri >= 0) & (ri < H) & (ci >= 0) & (ci < W) & (code > 0) & (code < 256)
+        ok &= fam_of[np.clip(code, 0, 255)] >= 0
+        cell, code = (ri * W + ci)[ok], code[ok]
+        np.add.at(hist, (cell, code), 1)
+        for k in range(len(FUEL_FAMILIES)):
+            fam[k] += np.bincount(cell[fam_of[code] == k], minlength=H * W).astype(np.int32)
+        inside = (ri >= 0) & (ri < H) & (ci >= 0) & (ci < W)
+        for b in range(4):
+            v = a[b + 1].astype(np.float64)
+            m = inside & (v >= 0)
+            c = (ri * W + ci)[m]
+            csum[b] += np.bincount(c, weights=v[m], minlength=H * W)
+            ccnt[b] += np.bincount(c, minlength=H * W).astype(np.int32)
+    n = fam.sum(0)
+    frac = np.rint(255.0 * fam / np.maximum(n, 1)).astype(np.uint8)
+    fb = hist.argmax(1).astype(np.int16)
+    can = np.rint(np.where(ccnt > 0, csum / np.maximum(ccnt, 1), 0)).astype(np.int16)
+    empty = n == 0
+    if empty.any() and fallback is not None:                        # no fine pixel in the cell: the old picked pixel
+        old = fallback["fbfm40"].ravel()
+        fb[empty] = old[empty]
+        for k, (_, lo, hi) in enumerate(FUEL_FAMILIES):
+            frac[k, empty] = 255 * ((old[empty] >= lo) & (old[empty] <= hi))
+        for b, key in enumerate(("cc", "ch", "cbh", "cbd")):
+            can[b, ccnt[b] == 0] = fallback[key].ravel()[ccnt[b] == 0]
+    r = lambda x: x.reshape(H, W)  # noqa: E731
+    return dict(frac=frac.reshape(-1, H, W), fbfm40=r(fb), cc=r(can[0]), ch=r(can[1]), cbh=r(can[2]), cbd=r(can[3]),
+                n=r(np.minimum(n, 255).astype(np.uint8)))
+
+
+def st_fuelfrac(g, ctx):
+    """fuelfrac.npz: fuel shares per cell from LANDFIRE at 30 m (see fuel_shares), same version as landfire.npz.
+    The download is cut into pieces for large fires."""
+    import rasterio
+    import landfire_features as L
+    v = landfire_version(g["year"])
+    if v is None:
+        return dict(missing=np.array(True), version=np.array("none"))
+    w, s, e, n = g["bounds_lonlat"]
+    nx, ny = max(1, math.ceil((e - w) / FUELFRAC_TILE_DEG)), max(1, math.ceil((n - s) / FUELFRAC_TILE_DEG))
+    xs, ys = np.linspace(w, e, nx + 1), np.linspace(s, n, ny + 1)
+
+    def tiles():
+        for i in range(nx):
+            for j in range(ny):
+                tif = ctx["dir"] / f"fuelfrac_raw_{i}_{j}.tif"
+                L.fetch((xs[i], ys[j], xs[i + 1], ys[j + 1]), tif, resolution=30,
+                        layers=[f"{v}_{x}" for x in ("FBFM40", "CC", "CH", "CBH", "CBD")])
+                with rasterio.open(tif) as d:
+                    a, tr = d.read(), d.transform
+                tif.unlink()
+                yield a, tr
+
+    old = ctx["dir"] / "landfire.npz"
+    fb = dict(np.load(old)) if old.exists() else None
+    if fb is not None and bool(fb.get("missing", False)):
+        fb = None
+    out = fuel_shares(tiles(), g, fb)
+    return dict(**out, version=np.array(v), missing=np.array(False), source_m=np.array(30))
+
+
 FUNCS = {"labels": st_labels, "history": st_history, "viirs": st_viirs, "terrain": st_terrain,
          "weather": st_weather, "landfire": st_landfire, "tessera": st_tessera, "suppression": st_suppression,
-         "landfire2": st_landfire2, "green": st_green}
+         "landfire2": st_landfire2, "green": st_green, "fuelfrac": st_fuelfrac}
 
 
 # ---------------------------------------------------------------------------- shared resources (per process)

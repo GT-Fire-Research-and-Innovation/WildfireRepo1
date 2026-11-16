@@ -19,7 +19,7 @@ cd "$(dirname "$0")/.."
 mkdir -p logs
 ENVS="$HOME/scratch/envs"
 WN="$ENVS/windninja/bin/WindNinja_cli"
-DATA="$HOME/scratch/wildfire/my"
+DATA="${WF_DATA:-$HOME/scratch/wildfire/my}"
 BAD="--exclude=atl1-1-03-014-16-0"
 YEARS="${YEARS:-2023,2024,2025}"
 MESH="${MESH:-}"                              # empty: solve on the grid's own terrain

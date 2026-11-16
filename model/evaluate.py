@@ -412,6 +412,8 @@ def main():
     ap.add_argument("--test-years", default="2024,2025")
     ap.add_argument("--weather", default="observed", choices=["observed", "forecast"],
                     help="weather inputs; use what the model was trained with (forecast = only weather known at t_i)")
+    ap.add_argument("--fuel-frac", type=int, choices=[0, 1],
+                    help="fuels as shares per cell (fuelfrac.npz). Default: what the models were trained with")
     ap.add_argument("--wind-terrain", type=int,
                     help="HRRR winds reshaped by terrain (WindNinja): 0 off, 1 grid terrain, 75 the 75 m version. Default: what the models were trained with. "
                          "Giving it scores a model on winds it was not trained on: fair only for physics-only runs")
@@ -438,6 +440,14 @@ def main():
     off = [sp for sp, t in trained.items() if t != wt]
     if off:
         print(f"  !! {off} trained with --wind-terrain {trained[off[0]]}, scored with {wt}: an indication only", flush=True)
+    ffs = {sp: bool(json.loads((runs / f"{sp.split(':')[0]}.json").read_text()).get("fuel_frac", False))
+           for sp in a.model if (runs / f"{sp.split(':')[0]}.json").exists()}
+    if a.fuel_frac is None and len(set(ffs.values())) > 1:
+        raise SystemExit(f"these models were trained on different fuel inputs (--fuel-frac): {ffs}; score them separately")
+    D.FUEL_FRAC = bool(a.fuel_frac) if a.fuel_frac is not None else any(ffs.values())
+    off = [sp for sp, t in ffs.items() if t != D.FUEL_FRAC]
+    if off:
+        print(f"  !! {off} trained with --fuel-frac {int(ffs[off[0]])}, scored with {int(D.FUEL_FRAC)}: an indication only", flush=True)
     pca = TH.fit_pca(a.data, runs)
     fires = TH.load_fires(a.data, pca, None, a.catalog)
     split = {s: [f for f in fires if D.year_split(f.year) == s] for s in ("val", "test")}
@@ -457,7 +467,7 @@ def main():
     print(f"[{a.out}] {len(members)} model(s); val/test fires {len(split['val'])}/{len(split['test'])}; "
           f"calibration {'on' if calibrate else 'off'}", flush=True)
 
-    res = {"name": a.out, "models": a.model, "resolution_m": res_m, "data_version": D.DATA_VERSION, "input_version": D.INPUT_VERSION, "weather": D.WEATHER_MODE, "lag_h": LAG_H, "wind_terrain": wt}
+    res = {"name": a.out, "models": a.model, "resolution_m": res_m, "data_version": D.DATA_VERSION, "input_version": D.INPUT_VERSION, "weather": D.WEATHER_MODE, "lag_h": LAG_H, "wind_terrain": wt, "fuel_frac": D.FUEL_FRAC}
     print("  validation pass (thresholds)", flush=True)
     sv, cv, rows_v = run_split(members, split["val"], calibrate, a.max_pairs)
     thr = {v: TH.metrics(sv[v], cv["y"])["thr"] for v in sv}
@@ -497,6 +507,10 @@ def main():
             r.pop(k, None)
     res["pairs"] = rows
     path = runs / f"eval_{a.out}.json"
+    if D.FUEL_FRAC:
+        res["fuel_frac_missing"] = sorted(D.FF_MISSING)
+        print(f"  fuel shares: {len(D.FF_MISSING)} fires had no fuelfrac.npz and kept the picked pixel"
+              + (f": {sorted(D.FF_MISSING)[:8]}" if D.FF_MISSING else ""), flush=True)
     if D.WIND_TERRAIN:
         res["wind_terrain_missing"] = sorted(D.TW_MISSING)
         print(f"  terrain wind: {len(D.TW_MISSING)} fires had no {D.WIND_TERRAIN}.npz and kept the plain HRRR wind"

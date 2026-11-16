@@ -14,5 +14,5 @@ module purge
 export PATH="$HOME/scratch/envs/wildfire/bin:$PATH"
 cd "$SLURM_SUBMIT_DIR/model"
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
-python train_hybrid.py --data "$HOME/scratch/wildfire/my" --name "${NAME:-hybrid}" --mode "${MODE:-hybrid}" \
+python train_hybrid.py --data "${WF_DATA:-$HOME/scratch/wildfire/my}" --name "${NAME:-hybrid}" --mode "${MODE:-hybrid}" \
        --device cuda --workers 6 ${EXTRA:-}

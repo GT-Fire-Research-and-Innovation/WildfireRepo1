@@ -55,6 +55,9 @@ V2_GROUPS = ["crownspot"]    # left out unless PHYSICS_V2 (keeps v1 models and c
 T3_GROUPS = ["hrrr_seq", "seq"]  # left out unless TEMPORAL (unet3 with its time dimension)
 FM_GROUPS = ["fmoist", "green"]   # left out unless the model was trained with --fuel-moisture
 FM_ON = False                # set when a loaded model uses the fuel-moisture groups (they cost time to compute)
+FUEL_FRAC = False            # --fuel-frac: fuels from fuelfrac.npz when it exists: the share of each cell in every fuel family
+                             #   (not one picked pixel), the most common fuel model for the physics, mean canopy
+FF_MISSING = set()           # fires asked for fuel shares that have no usable fuelfrac.npz (they keep the picked pixel)
 FUEL_V2 = False              # --fuel-moisture: also read landfire2.npz (the right fuel map for the fire's year) when it exists
 FM_PHYSICS = False           # --fm-physics: the spread equations use the hourly, slope-aware fine fuel moisture (driest in the window)
 O_GROUPS = ["origin"]        # left out unless the model was trained with --origin-lag (forecasts from an ageing perimeter)
@@ -326,12 +329,18 @@ class Fire:
                                  ter["rough"][sl].astype(np.float32) / 50])
 
         lf = (self.z("landfire2") if FUEL_V2 and self.has("landfire2") else None) or self.z("landfire")
+        ff = self.z("fuelfrac") if FUEL_FRAC else None
+        if FUEL_FRAC and (ff is None or bool(ff.get("missing", True))):
+            ff = None
+            if lf is not None and not bool(lf.get("missing", True)):
+                FF_MISSING.add(self.fid)             # fuels exist but not the shares: said out loud by evaluate
+        lf = ff or lf
         fuels = np.zeros((12, h, w), np.float32)
         fb = None
         if lf is not None and not bool(lf.get("missing", True)) and "fuels" not in hide:
             fb = lf["fbfm40"][sl]
             for k, (_, a, b) in enumerate(FUEL_FAMILIES):
-                fuels[k] = (fb >= a) & (fb <= b)
+                fuels[k] = lf["frac"][k][sl] / 255.0 if ff is not None else (fb >= a) & (fb <= b)
             fuels[7] = np.clip(lf["cc"][sl], 0, 100) / 100
             fuels[8] = np.clip(lf["ch"][sl], 0, 500) / 500
             fuels[9] = np.clip(lf["cbh"][sl], 0, 100) / 100
