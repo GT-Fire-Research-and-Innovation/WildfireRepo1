@@ -19,6 +19,8 @@ dependencies:
   - netcdf4
   - zarr
   - pygrib
+  - h5py
+  - pyhdf
   - osmium-tool
   - aria2
   - matplotlib

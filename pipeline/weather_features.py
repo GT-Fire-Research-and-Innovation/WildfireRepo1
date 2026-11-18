@@ -99,8 +99,8 @@ def gridmet_fire(datasets, fire, days):
 
 # ---------------------------------------------------------------------------- HRRR
 
-def _ranges(sess, url):
-    """Byte ranges of the wanted fields in a HRRR file, from its .idx."""
+def _ranges(sess, url, fields=None):
+    """Byte ranges of the wanted fields in a HRRR file, from its .idx (first message matching each key)."""
     r = sess.get(url + ".idx", timeout=60)
     if r.status_code != 200:
         return None
@@ -108,19 +108,20 @@ def _ranges(sess, url):
     starts = [int(l.split(":")[1]) for l in lines]
     rng = {}
     for i, l in enumerate(lines):
-        for name, key in HRRR_FIELDS:
+        for name, key in fields or HRRR_FIELDS:
             if key in l and name not in rng:
                 end = starts[i + 1] - 1 if i + 1 < len(lines) else None
                 rng[name] = (starts[i], end)
     return rng
 
 
-def hrrr_fetch(sess, url):
-    """{field: 2-D array} for one HRRR file (CONUS grid), or None if unavailable."""
+def hrrr_fetch(sess, url, fields=None):
+    """{field: 2-D array} for one HRRR file (CONUS grid), or None if unavailable. fields: [(name, .idx key)],
+    default HRRR_FIELDS."""
     import pygrib
     for tries in range(4):
         try:
-            rng = _ranges(sess, url)
+            rng = _ranges(sess, url, fields)
             if not rng:
                 return None
             out = {}

@@ -50,7 +50,7 @@ def test_channels_skip_fires_without_data():
     old, new = fire(year=2014, first="2014-08-01 00:00+00:00", last="2014-08-20 00:00+00:00"), \
         fire(year=2021, first="2021-07-14 00:00+00:00", last="2021-08-20 00:00+00:00")
     assert all(RC.applies(c, CAMP) is None for c in RC.CHANNELS)
-    assert {c for c in RC.CHANNELS if RC.applies(c, old)} == {"suppression", "landfire", "tessera", "goes"}
+    assert {c for c in RC.CHANNELS if RC.applies(c, old)} == {"suppression", "landfire", "tessera", "goes", "lulc"}
     assert {c for c in RC.CHANNELS if RC.applies(c, new)} == {"ics209"}
     assert RC.applies("hrrr", fire(year=2014, first="2014-06-01 00:00+00:00", last="2014-06-20 00:00+00:00"))
     assert RC.landfire_version(2017) == "LF2016" and RC.landfire_version(2024) == "LF2023" and RC.landfire_version(2016) is None

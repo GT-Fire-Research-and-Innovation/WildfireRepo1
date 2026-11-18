@@ -11,6 +11,8 @@ xarray
 netCDF4
 zarr
 pygrib
+h5py
+pyhdf
 huggingface_hub
 torch
 matplotlib

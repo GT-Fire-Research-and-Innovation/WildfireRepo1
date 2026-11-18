@@ -12,7 +12,7 @@ then run live on current fires.
 | `pipeline/` | Training-data builders: NIFC perimeter labels, suppression layers, OSM human features, GRIDMET + HRRR weather, VIIRS bands, LANDFIRE fuels, dataset assembly |
 | `pipeline/train.py` | Two-branch gated U-Net (the plan's "plain U-Net" baseline), distance/logistic baselines, evaluation |
 | `pipeline/analyze.py` | Error analysis by gap, distance from front, active fire, fire size, plus example maps |
-| `pipeline/raw_grab.py`, `raw_channels.py` | Upstream raw data of every fire (NIFC records, FIRMS, GOES, HRRR, GRIDMET, DEM, LANDFIRE, suppression, ICS-209, OSM), one channel at a time, uploaded to a Hugging Face repo; run on Kaggle with `notebooks/kaggle_data_grab.ipynb` |
+| `pipeline/raw_grab.py`, `raw_channels.py`, `earthdata.py` | Upstream raw data of every fire (NIFC records, FIRMS, GOES, HRRR, GRIDMET, DEM, LANDFIRE, suppression, ICS-209, OSM, plus TS-SatFire's inputs: VIIRS L1B swaths, VNP13A1, MCD12Q1, Esri 10 m land cover), one channel at a time, uploaded to a Hugging Face repo; run on Kaggle with `notebooks/kaggle_data_grab.ipynb` |
 
 | `physics/rothermel.py` | Differentiable Rothermel surface spread in PyTorch (Scott & Burgan 40 fuel models, dynamic curing, BehavePlus wind adjustment, wind + slope vectors, elliptical shape). Matches the pyretechnics reference to 0.013 % on 400 random cases |
 | `physics/solver.py` | Differentiable arrival-time solver: 16-neighbour minimum travel time with an exact adjoint backward pass (memory does not grow with iterations) |
@@ -55,7 +55,10 @@ python pipeline/raw_grab.py --links --hf-repo you/wildfire-raw-2014-2025        
 python pipeline/raw_grab.py --channel goes --ids F2003403265 --dry-run --work /tmp/raw  # one fire, no upload
 ```
 Channels: history, perimeters, firms, gridmet, ics209, suppression, tessera (reference only), terrain, landfire,
-goes, hrrr, osm. Each fire is cut to the built dataset's box and dates on the source's own grid. Batches are
+lulc, landcover, vegetation, goes, hrrr, hrrr_next, osm, viirs. lulc, landcover, vegetation, hrrr_next, viirs and
+gridmet's pr / tmmn / sph / pdsi carry every input TS-SatFire has (its VIIRS_Day / VIIRS_Night bands, FirePred
+bands and ESRI_LULC map); viirs, vegetation and landcover need a free `EARTHDATA_TOKEN`
+(https://urs.earthdata.nasa.gov, Generate Token). Each fire is cut to the built dataset's box and dates on the source's own grid. Batches are
 uploaded and then deleted locally. Each fire gets one folder, `fires/<id>/`, with a subfolder per channel and a
 `LINKS.md` that links every file and its upstream source. `notebooks/kaggle_data_grab.ipynb` runs all channels
 on Kaggle. Repo layout and sources: `docs/RAW_DATA_CARD.md`.

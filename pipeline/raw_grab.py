@@ -28,7 +28,8 @@ Target repo layout
   manifest/<channel>/<batch>.csv     fire_id, status, files, bytes, sources, fetched_utc, error
   shared/ics209/...                  source files used by many fires, stored once
 
-Needs HF_TOKEN (write access) unless --dry-run, and FIRMS_MAP_KEY for firms. No other keys.
+Needs HF_TOKEN (write access) unless --dry-run, FIRMS_MAP_KEY for firms, and EARTHDATA_TOKEN (free Earthdata
+Login token) for viirs, vegetation and landcover. No other keys.
 """
 import argparse
 import io
@@ -101,12 +102,18 @@ def read_manifests(api, repo, channel=None):
     return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(columns=MANIFEST_COLS)
 
 
-def done_ids(manifest):
-    """Fires finished in a channel: the latest row per fire has a final status (errors are retried)."""
+def done_ids(manifest, channel=None):
+    """Fires finished in a channel: the latest row per fire has a final status (errors are retried). With a
+    channel that lists expected files (raw_channels.expected_files), an 'ok' row must name all of them."""
     if manifest is None or not len(manifest):
         return set()
     last = manifest.sort_values("fetched_utc").groupby("fire_id").tail(1)
-    return set(last.loc[last.status.isin(DONE), "fire_id"])
+    done = last.status.isin(DONE)
+    need = RC.expected_files(channel) if channel else None
+    if need:
+        listed = last["files"].fillna("").astype(str).map(lambda s: set(s.split(";")))
+        done &= (last.status != "ok") | listed.map(need.issubset)
+    return set(last.loc[done, "fire_id"])
 
 
 # ------------------------------------------------------------------------------------- batches
@@ -288,7 +295,7 @@ def run(a):
     if not a.dry_run:
         ensure_repo(api, a.hf_repo, a.private, a.source_repo, work / "source")
     manifest = read_manifests(api, a.hf_repo, ch) if (a.hf_repo and not a.redo) else None
-    done = done_ids(manifest)
+    done = done_ids(manifest, ch)
     todo = [f for f in fires if f["fire_id"] not in done]
     if a.limit:
         todo = todo[:a.limit]
@@ -493,7 +500,7 @@ def main(argv=None):
     ap.add_argument("--batch-fires", type=int, default=100)
     ap.add_argument("--min-free-gb", type=float, default=5.0, help="upload early when free disk falls below this")
     ap.add_argument("--max-hours", type=float, help="stop cleanly before this many hours (Kaggle: 11.5)")
-    ap.add_argument("--threads", type=int, default=16, help="parallel downloads for goes / hrrr")
+    ap.add_argument("--threads", type=int, default=16, help="parallel downloads for goes / hrrr / hrrr_next; viirs uses up to 8 worker processes")
     ap.add_argument("--private", action="store_true", help="create the target repo private")
     ap.add_argument("--redo", action="store_true", help="ignore manifests: fetch every fire again")
     ap.add_argument("--dry-run", action="store_true", help="no upload; batches are kept under WORK/batch")
@@ -506,7 +513,7 @@ def main(argv=None):
     if a.check:
         from huggingface_hub import HfApi
         who = check_hf(HfApi(token=os.environ.get("HF_TOKEN") or None), a.hf_repo)
-        keys = {k: ("set" if os.environ.get(k) else "missing (channel skipped)") for k in ("FIRMS_MAP_KEY",)}
+        keys = {k: ("set" if os.environ.get(k) else "missing (channel skipped)") for k in ("FIRMS_MAP_KEY", "EARTHDATA_TOKEN")}
         print(f"OK: HF_TOKEN can write as '{who}' to {a.hf_repo}; {keys}", flush=True)
         return 0
     if a.status:
