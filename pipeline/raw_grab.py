@@ -6,13 +6,20 @@ Built for Kaggle (notebooks/kaggle_data_grab.ipynb) but runs anywhere with inter
   python pipeline/raw_grab.py --channel goes  --hf-repo you/wildfire-raw-2014-2025 --max-hours 11.5
   python pipeline/raw_grab.py --status --hf-repo you/wildfire-raw-2014-2025
   python pipeline/raw_grab.py --links  --hf-repo you/wildfire-raw-2014-2025          # per-fire links files
+  python pipeline/raw_grab.py --extents --hf-repo you/wildfire-raw-2014-2025         # after firms: windows, ignition
   python pipeline/raw_grab.py --channel history --ids F2003403265 --dry-run --work /tmp/raw   # local test
 
 How a run works
   1. The fire list comes from the built dataset (--source-repo): its catalog rows, and by default only fires
-     that have a built folder (1,841). Each fire's box and windows are the build's own (make_grid, days_of).
+     that have a built folder (1,841). Each fire's region is the box around all its perimeters pushed out
+     32 km on every side (raw_channels.area), so any 64 km tile centred anywhere in the fire can be cut from
+     the files. Its time window is the perimeter days stretched over the FIRMS activity that leads into and
+     out of them, plus a day on each side: run firms first, then --extents, which writes
+     catalog/fire_extents.csv (window, ignition point, region); the time-dependent channels (gridmet, goes,
+     hrrr, hrrr_next, gfs, vegetation, viirs) read it.
   2. Resume: fires already in manifest/<channel>/*.csv of the target repo (ok / empty / n/a) are skipped;
-     errors are retried.
+     errors are retried. A row also has to match the fire's current window and region (columns window,
+     region), so widening either sends the fire back to the queue.
   3. Each fire is fetched into a staging folder, then moved into the current batch. A batch is uploaded as one
      commit when it reaches --batch-gb or --batch-fires, when disk runs low, or before the deadline, together
      with its manifest file; the local copy is deleted right after. A failed upload keeps the batch on disk.
@@ -23,13 +30,16 @@ Target repo layout
   README.md                          dataset card (docs/RAW_DATA_CARD.md)
   catalog/fires.csv, qc_fires.csv    copied from the built dataset
   catalog/raw_index.csv              --links: one row per fire and channel (status, files, bytes)
+  catalog/fire_extents.csv           --extents: each fire's time window, ignition point and region
   fires/<fire_id>/<channel>/...      raw files
   fires/<fire_id>/links.json, LINKS.md   --links: every channel of the fire, its files here and its upstream URLs
-  manifest/<channel>/<batch>.csv     fire_id, status, files, bytes, sources, fetched_utc, error
+  manifest/<channel>/<batch>.csv     fire_id, status, files, bytes, sources, fetched_utc, error, window, region
   shared/ics209/...                  source files used by many fires, stored once
 
-Needs HF_TOKEN (write access) unless --dry-run, FIRMS_MAP_KEY for firms, and EARTHDATA_TOKEN (free Earthdata
-Login token) for viirs, vegetation and landcover. No other keys.
+Needs HF_TOKEN (write access) unless --dry-run, FIRMS_MAP_KEY for firms, EARTHDATA_TOKEN (free Earthdata
+Login token) for viirs, vegetation and landcover, and Google Earth Engine access for gfs (GEE_SERVICE_ACCOUNT_KEY,
+the service account's JSON key, or `earthengine authenticate` on this machine; GEE_PROJECT, the Cloud project
+registered for Earth Engine). No other keys.
 """
 import argparse
 import io
@@ -50,13 +60,15 @@ import raw_channels as RC  # noqa: E402
 SOURCE_REPO = "Javyn123/wildfire-spread-2014-2025"
 DONE = {"ok", "empty", "n/a"}
 SEP = " | "                      # between source URLs in a manifest cell (URLs may hold ';' and ',')
-MANIFEST_COLS = ["fire_id", "name", "year", "channel", "status", "n_files", "bytes", "files", "sources", "fetched_utc", "error"]
+MANIFEST_COLS = ["fire_id", "name", "year", "channel", "status", "n_files", "bytes", "files", "sources", "fetched_utc", "error",
+                 "window", "region"]  # the days / box the channel covered (raw_channels.window_label / region_label)
 
 
 # ------------------------------------------------------------------------------------- fire list
 
 def load_fires(source_repo, which="built", ids=None, cache=None):
-    """Fires as dicts: fire_id, incident, name, year, first, last, bounds (build grid box), rating."""
+    """Fires as dicts: fire_id, incident, name, year, first, last, bounds (build grid box), grid_transform,
+    perim_bounds (the perimeters' own box), rating."""
     import pandas as pd
     from huggingface_hub import HfApi, hf_hub_download
     import build_multiyear as BM
@@ -76,8 +88,29 @@ def load_fires(source_repo, which="built", ids=None, cache=None):
         g = BM.make_grid(row)
         fires.append(dict(fire_id=row.fire_id, incident=str(row.incident), name=str(row["name"]), year=int(row.year),
                           first=str(row["first"]), last=str(row["last"]), bounds=list(g["bounds_lonlat"]),
+                          grid_transform=list(g["transform"]),
+                          perim_bounds=[float(row[k]) for k in ("west", "south", "east", "north")]
+                          if all(k in row and pd.notna(row[k]) for k in ("west", "south", "east", "north")) else None,
                           rating=str(row.rating)))
     return fires
+
+
+def load_extents(api, repo, cache=None, path=None):
+    """{fire_id: row} of catalog/fire_extents.csv (from a local file, or the target repo), or None if absent."""
+    import pandas as pd
+    if path is None:
+        if not repo:
+            return None
+        from huggingface_hub import hf_hub_download
+        try:
+            path = hf_hub_download(repo, RC.EXTENTS_FILE, repo_type="dataset", token=api.token,
+                                   local_dir=str(cache) if cache else None)
+        except Exception as ex:  # noqa: BLE001  (not written yet)
+            if "404" in str(ex) or "EntryNotFound" in type(ex).__name__ or "RepositoryNotFound" in type(ex).__name__:
+                return None
+            raise
+    t = pd.read_csv(path, dtype=str, keep_default_na=False)
+    return {r["fire_id"]: r for r in t.to_dict("records")}
 
 
 # ------------------------------------------------------------------------------------- manifests
@@ -102,9 +135,13 @@ def read_manifests(api, repo, channel=None):
     return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(columns=MANIFEST_COLS)
 
 
-def done_ids(manifest, channel=None):
+def done_ids(manifest, channel=None, fires=None):
     """Fires finished in a channel: the latest row per fire has a final status (errors are retried). With a
-    channel that lists expected files (raw_channels.expected_files), an 'ok' row must name all of them."""
+    channel that lists expected files (raw_channels.expected_files), an 'ok' row must name all of them. Given
+    the fires, the row must also have been fetched for the fire's current window (time-dependent channels) and
+    region (channels cut to the region): rows from before these rules, or for a window or region since
+    widened, count as not done."""
+    import pandas as pd
     if manifest is None or not len(manifest):
         return set()
     last = manifest.sort_values("fetched_utc").groupby("fire_id").tail(1)
@@ -113,6 +150,11 @@ def done_ids(manifest, channel=None):
     if need:
         listed = last["files"].fillna("").astype(str).map(lambda s: set(s.split(";")))
         done &= (last.status != "ok") | listed.map(need.issubset)
+    for col, chans, label in (("window", RC.WINDOW_CHANNELS, RC.window_label), ("region", RC.REGION_CHANNELS, RC.region_label)):
+        if channel in chans and fires is not None:
+            want = {f["fire_id"]: label(channel, f) for f in fires}
+            have = last[col].fillna("").astype(str) if col in last else pd.Series("", index=last.index)
+            done &= have == last["fire_id"].map(want)
     return set(last.loc[done, "fire_id"])
 
 
@@ -165,7 +207,8 @@ class Batcher:
                               status=status, n_files=len(files), bytes=nbytes, files=";".join(files),
                               sources=SEP.join(RC.redact(s) for s in sources),
                               fetched_utc=datetime.now(timezone.utc).isoformat(timespec="seconds"),
-                              error=RC.redact(error)[:500]))       # manifests are published: no keys, no email
+                              error=RC.redact(error)[:500],        # manifests are published: no keys, no email
+                              window=RC.window_label(self.channel, fire), region=RC.region_label(self.channel, fire)))
         self.bytes += nbytes
         self.totals[status if status in self.totals else "error"] += 1
         self.totals["bytes"] += nbytes
@@ -292,10 +335,20 @@ def run(a):
 
     fires = load_fires(a.source_repo, a.fires, a.ids, work / "source")
     print(f"{len(fires)} fires ({a.fires}{', ' + str(len(a.ids)) + ' ids' if a.ids else ''})", flush=True)
+    if ch in RC.WINDOW_CHANNELS and ch != "firms":
+        extents = load_extents(api, a.hf_repo, work / "target", a.extents_file)
+        if extents is None:
+            msg = (f"{RC.EXTENTS_FILE} not found: run the firms channel, then raw_grab.py --extents, so {ch} "
+                   "covers the days the fire was active (not only its perimeter days)")
+            if not a.dry_run:
+                raise SystemExit(msg)
+            print(f"warning: {msg}; using the perimeter days +- 1", flush=True)
+        RC.attach_extents(fires, extents)
+        print(f"time window: {sum('window' in f for f in fires)} of {len(fires)} fires from {RC.EXTENTS_FILE}", flush=True)
     if not a.dry_run:
         ensure_repo(api, a.hf_repo, a.private, a.source_repo, work / "source")
     manifest = read_manifests(api, a.hf_repo, ch) if (a.hf_repo and not a.redo) else None
-    done = done_ids(manifest, ch)
+    done = done_ids(manifest, ch, fires)
     todo = [f for f in fires if f["fire_id"] not in done]
     if a.limit:
         todo = todo[:a.limit]
@@ -391,7 +444,10 @@ def fire_links(fire, rows, repo, source_repo=SOURCE_REPO):
             e["note"] = r["error"]
         chans[ch] = e
     return {"fire_id": fid, "name": fire["name"], "year": fire["year"], "irwin_incident": RC.norm_irwin(fire["incident"]),
-            "first_perimeter_utc": fire["first"], "last_perimeter_utc": fire["last"], "bbox_lonlat": fire["bounds"],
+            "first_perimeter_utc": fire["first"], "last_perimeter_utc": fire["last"],
+            "time_window_utc": [t.isoformat() for t in RC.span(fire)],
+            "region_lonlat": [round(v, 5) for v in RC.area(fire)], "build_box_lonlat": fire["bounds"],
+            "ignition": dict(zip(("lat", "lon", "time_utc", "method"), fire["ignition"])) if fire.get("ignition") else None,
             "folder": f"{base}/tree/main/fires/{fid}",
             "built_dataset": f"https://huggingface.co/datasets/{source_repo}/tree/main/fires/{fid}",
             "channels": chans}
@@ -399,10 +455,13 @@ def fire_links(fire, rows, repo, source_repo=SOURCE_REPO):
 
 def links_markdown(L):
     """LINKS.md: the same as links.json, readable on the Hugging Face file page."""
-    w, s, e, n = L["bbox_lonlat"]
+    w, s, e, n = L["region_lonlat"]
+    t0, t1 = L["time_window_utc"]
+    ig = L.get("ignition")
     out = [f"# {L['name']} ({L['year']}) · `{L['fire_id']}`", "",
            f"IRWIN `{L['irwin_incident']}` · perimeters {str(L['first_perimeter_utc'])[:16]} → {str(L['last_perimeter_utc'])[:16]} UTC · "
-           f"box W {w:.4f} S {s:.4f} E {e:.4f} N {n:.4f}", "",
+           f"files cover {t0[:16]} → {t1[:16]} UTC over region W {w:.4f} S {s:.4f} E {e:.4f} N {n:.4f}"
+           + (f" · ignition {ig['lat']:.4f}, {ig['lon']:.4f} at {ig['time_utc']} ({ig['method']})" if ig else ""), "",
            f"[This fire's folder]({L['folder']}) · [Built dataset layers]({L['built_dataset']})", "",
            "| channel | status | files | upstream sources |", "|---|---|---|---|"]
     for ch, c in L["channels"].items():
@@ -433,6 +492,7 @@ def build_links(a):
     if not a.dry_run:
         check_hf(api, a.hf_repo)
     fires = load_fires(a.source_repo, a.fires, a.ids, work / "source")
+    RC.attach_extents(fires, load_extents(api, a.hf_repo, work / "target", a.extents_file))
     if a.local_manifests:
         files = glob.glob(str(Path(a.local_manifests) / "**" / "manifest" / "*" / "*.csv"), recursive=True)
         m = pd.concat([pd.read_csv(f, dtype=str, keep_default_na=False) for f in files], ignore_index=True) if files \
@@ -465,6 +525,85 @@ def build_links(a):
     return 0
 
 
+def first_perimeters(source_repo, fires, cache):
+    """{fire_id: (time, lat, lon)} of each fire's first mapped perimeter, from the built dataset's labels.npz
+    (arrival index per cell) on the fire's build grid. Fires without labels are left out."""
+    import numpy as np
+    from huggingface_hub import snapshot_download
+    snapshot_download(source_repo, repo_type="dataset", local_dir=str(cache),
+                      allow_patterns=[f"fires/{f['fire_id']}/labels.npz" for f in fires])
+    out = {}
+    for f in fires:
+        p = Path(cache) / "fires" / f["fire_id"] / "labels.npz"
+        if p.exists() and f.get("grid_transform"):
+            with np.load(p, allow_pickle=False) as z:
+                pt = RC.first_perimeter_point(z["arrival"], f["grid_transform"], z["times"])
+            if pt is not None:
+                out[f["fire_id"]] = pt
+    return out
+
+
+def build_extents(a):
+    """catalog/fire_extents.csv: each fire's time window, ignition point and region (raw_channels.fire_extent)
+    from its firms files, read from the target repo (or local --dry-run batches with --local-manifests), and
+    its first perimeter from the built dataset. Rows of fires not in this run (--ids) are kept."""
+    import glob
+    import pandas as pd
+    from huggingface_hub import HfApi, snapshot_download
+    api = HfApi(token=os.environ.get("HF_TOKEN") or None)
+    work = Path(a.work)
+    if not a.dry_run:
+        check_hf(api, a.hf_repo)
+    fires = load_fires(a.source_repo, a.fires, a.ids, work / "source")
+    if not fires:
+        print("no fires matched (--fires / --ids): nothing to do", flush=True)
+        return 1
+    if a.local_manifests:
+        files = glob.glob(str(Path(a.local_manifests) / "**" / "manifest" / "firms" / "*.csv"), recursive=True)
+        m = pd.concat([pd.read_csv(f, dtype=str, keep_default_na=False) for f in files], ignore_index=True) if files \
+            else pd.DataFrame(columns=MANIFEST_COLS)
+        roots = [Path(p) for p in glob.glob(str(Path(a.local_manifests) / "**" / "fires"), recursive=True)]
+    else:
+        m = read_manifests(api, a.hf_repo, "firms")
+        dl = work / "firms_files"
+        snapshot_download(a.hf_repo, repo_type="dataset", local_dir=str(dl), token=api.token,
+                          allow_patterns=[f"fires/{f['fire_id']}/firms/*" for f in fires] if a.ids else ["fires/*/firms/*"])
+        roots = [dl / "fires"]
+    current = done_ids(m, "firms", fires)
+    stale = [f["fire_id"] for f in fires if f["fire_id"] not in current]
+    firsts = first_perimeters(a.source_repo, fires, work / "source")
+    rows = []
+    for f in fires:
+        paths = [p for r in roots for p in (r / f["fire_id"] / "firms").glob("*.csv.gz")]
+        df = pd.concat([pd.read_csv(p) for p in paths], ignore_index=True) if paths else None
+        rows.append(RC.fire_extent(f, df, firsts.get(f["fire_id"])))
+    new = pd.DataFrame(rows)
+    old = load_extents(api, None if a.dry_run else a.hf_repo, work / "target")
+    if old and a.ids:
+        keep = pd.DataFrame([r for fid, r in old.items() if fid not in set(new.fire_id)])
+        new = pd.concat([keep, new], ignore_index=True)
+    new = new.sort_values("fire_id")
+    out = work / "extents" / RC.EXTENTS_FILE
+    out.parent.mkdir(parents=True, exist_ok=True)
+    new.to_csv(out, index=False)
+    before = (pd.to_numeric(new.active_days_before) > 0).sum()
+    after = (pd.to_numeric(new.active_days_after) > 0).sum()
+    print(f"{len(new)} fires: {before} windows start before the first perimeter, {after} end after the last "
+          f"(activity), {(new.window_rule == 'perimeters').sum()} without FIRMS data; ignition from "
+          + ", ".join(f"{k} {v}" for k, v in new.ignition_method.value_counts().items()), flush=True)
+    if stale:
+        print(f"warning: {len(stale)} fires have no firms row for the current FIRMS days "
+              f"({RC.FIRMS_BEFORE} before / {RC.FIRMS_AFTER} after the perimeters), e.g. {stale[:3]}: rerun the firms "
+              "channel, then --extents again, or their windows miss activity outside the old span", flush=True)
+    if a.dry_run:
+        print(f"[dry-run] kept {out}", flush=True)
+    else:
+        api.upload_file(path_or_fileobj=str(out), path_in_repo=RC.EXTENTS_FILE, repo_id=a.hf_repo, repo_type="dataset",
+                        commit_message=f"Fire extents: window, ignition, region ({len(new)} fires)")
+        print(f"uploaded {RC.EXTENTS_FILE}", flush=True)
+    return 0
+
+
 def status(a):
     import pandas as pd
     from huggingface_hub import HfApi
@@ -489,7 +628,10 @@ def main(argv=None):
     ap.add_argument("--links", action="store_true",
                     help="write fires/<id>/links.json + LINKS.md (every channel's files and sources) from the manifests")
     ap.add_argument("--links-chunk", type=int, default=500, help="fires per commit for --links")
-    ap.add_argument("--local-manifests", help="--links: read manifests from local --dry-run batches under this folder")
+    ap.add_argument("--extents", action="store_true",
+                    help=f"write {RC.EXTENTS_FILE} (each fire's time window, ignition point, region) from the firms files; run after firms")
+    ap.add_argument("--extents-file", help=f"read the extents from this local file instead of {RC.EXTENTS_FILE} in --hf-repo")
+    ap.add_argument("--local-manifests", help="--links / --extents: read manifests (and firms files) from local --dry-run batches under this folder")
     ap.add_argument("--hf-repo", help="target dataset repo, e.g. you/wildfire-raw-2014-2025")
     ap.add_argument("--source-repo", default=SOURCE_REPO, help="built dataset the fire list comes from")
     ap.add_argument("--work", default="raw_work", help="local scratch (staging, batches, one-time downloads)")
@@ -500,7 +642,7 @@ def main(argv=None):
     ap.add_argument("--batch-fires", type=int, default=100)
     ap.add_argument("--min-free-gb", type=float, default=5.0, help="upload early when free disk falls below this")
     ap.add_argument("--max-hours", type=float, help="stop cleanly before this many hours (Kaggle: 11.5)")
-    ap.add_argument("--threads", type=int, default=16, help="parallel downloads for goes / hrrr / hrrr_next; viirs uses up to 8 worker processes")
+    ap.add_argument("--threads", type=int, default=16, help="parallel downloads for goes / hrrr / hrrr_next / gfs; viirs uses up to 8 worker processes")
     ap.add_argument("--private", action="store_true", help="create the target repo private")
     ap.add_argument("--redo", action="store_true", help="ignore manifests: fetch every fire again")
     ap.add_argument("--dry-run", action="store_true", help="no upload; batches are kept under WORK/batch")
@@ -513,7 +655,8 @@ def main(argv=None):
     if a.check:
         from huggingface_hub import HfApi
         who = check_hf(HfApi(token=os.environ.get("HF_TOKEN") or None), a.hf_repo)
-        keys = {k: ("set" if os.environ.get(k) else "missing (channel skipped)") for k in ("FIRMS_MAP_KEY", "EARTHDATA_TOKEN")}
+        keys = {k: ("set" if os.environ.get(k) else "missing (channel skipped)")
+                for k in ("FIRMS_MAP_KEY", "EARTHDATA_TOKEN", "GEE_SERVICE_ACCOUNT_KEY", "GEE_PROJECT")}
         print(f"OK: HF_TOKEN can write as '{who}' to {a.hf_repo}; {keys}", flush=True)
         return 0
     if a.status:
@@ -524,6 +667,10 @@ def main(argv=None):
         if not a.hf_repo and not a.dry_run:
             ap.error("--links needs --hf-repo (or --dry-run)")
         return build_links(a)
+    if a.extents:
+        if not a.hf_repo and not a.local_manifests:
+            ap.error("--extents needs --hf-repo (or --local-manifests with --dry-run)")
+        return build_extents(a)
     if not a.channel:
         ap.error("--channel is required")
     if not a.hf_repo and not a.dry_run:

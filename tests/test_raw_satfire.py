@@ -54,7 +54,7 @@ def test_grown_channel_refetches_only_fires_missing_new_files():
 def test_hrrr_next_runs_reach_the_next_afternoon_as_far_as_hrrr_ran():
     t = RC.hrrr_next_times(CAMP)
     runs = sorted({r for r, _ in t})
-    assert len(runs) == 18 and len(t) == 18 * 12                 # HRRRv3: 3..36 h every 3 h
+    assert len(runs) == 19 and len(t) == 19 * 12                 # HRRRv3: 3..36 h every 3 h
     assert runs[0] == pd.Timestamp("2018-11-08 12:00", tz="UTC") and max(h for _, h in t) == 36
     v1 = RC.hrrr_next_times(fire(year=2016, first="2016-07-07 00:00+00:00", last="2016-07-08 00:00+00:00"))
     v2 = RC.hrrr_next_times(fire(year=2017, first="2017-07-07 00:00+00:00", last="2017-07-08 00:00+00:00"))
@@ -267,7 +267,7 @@ def test_viirs_granule_is_cropped_on_the_swath_for_each_fire(tmp_path, monkeypat
     assert res["far"][0] == "empty" and res[near["fire_id"]][0] == "ok" and res[near["fire_id"]][1] == [entry["02IMG"]]
 
     out = tmp_path / "stage" / near["fire_id"] / "viirs" / "SNPP_2018-11-10T2048_day.nc"
-    mw = ED.swath_window(mlat, mlon, near["bounds"])
+    mw = ED.swath_window(mlat, mlon, RC.area(near))
     mr0, mr1, mc0, mc1 = RC._grow(mw, 1, (32, 40))
     ir0, ir1, ic0, ic1 = ED.m_to_i((mr0, mr1, mc0, mc1), (64, 80))
     with netCDF4.Dataset(out) as ds:
@@ -281,7 +281,8 @@ def test_viirs_granule_is_cropped_on_the_swath_for_each_fire(tmp_path, monkeypat
         assert (ds["M11"][:] == np.arange(32 * 40).reshape(32, 40)[mr0:mr1, mc0:mc1] + 1000).all() and "M10" not in ds.variables
         assert (ds["m_latitude"][:] == mlat[mr0:mr1, mc0:mc1].astype("f4")).all()
         lat = ds["latitude"][:]
-        assert lat.min() <= near["bounds"][1] + 0.07 and lat.max() >= near["bounds"][3] - 0.07
+        reg = RC.area(near)                                        # cut to the fire's region, not the build's box
+        assert lat.min() <= reg[1] + 0.07 and lat.max() >= reg[3] - 0.07
         assert ds.day_night == "Day" and ds.source_DayNightFlag == "Day" and ds.i_window_rows_cols == f"{ir0}:{ir1},{ic0}:{ic1}"
 
 

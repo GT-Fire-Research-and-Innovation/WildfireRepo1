@@ -1,10 +1,12 @@
 """
 Upstream raw data for one fire, one channel at a time (driven by raw_grab.py).
 
-"Raw" means the source's own records, values and grid, cut to the fire: the same box (perimeter union
-+ 9.6 km) and time windows the built dataset uses (build_multiyear.make_grid / days_of / _fire_span), so a
-raw file and the built layer of the same fire line up. Whole-CONUS sources (HRRR, GOES, DEM, OSM) are
-cropped on their native grid with untouched values; every file's source URL is logged in the manifest.
+"Raw" means the source's own records, values and grid, cut to the fire's region: the box around all its
+perimeters pushed out 32 km on every side (area), so any 64 km tile centred anywhere in the fire, on its
+ignition point or on its front on any day, can be cut from these files without fetching again. Over a time
+window that also holds the days the fire was active before its first perimeter and after its last (FIRMS, see
+span / fire_extent), plus a day on each side. Whole-CONUS sources (HRRR, GFS, GOES, DEM, OSM) are cropped on
+their native grid with untouched values; every file's source URL is logged in the manifest.
 
 Channels (cheap -> heavy) and what each writes into fires/<fire_id>/<channel>/:
   history      Interagency Fire Perimeter History, every prior fire in the box   history.geojson
@@ -22,16 +24,19 @@ Channels (cheap -> heavy) and what each writes into fires/<fire_id>/<channel>/:
   goes         GOES-16/17/18/19 ABI L2 FDCC, hourly scan, fixed-grid crop        goes_<sat>.nc
   hrrr         HRRR gust/u10/v10/rh2, 3-hourly analyses + 12z+9h forecasts       hrrr_ana.nc, hrrr_fc.nc
   hrrr_next    HRRR 12z run every 3 h out to 36 h: + t2/q2/apcp                  hrrr_next.nc
+  gfs          NOAA GFS 0.25 deg 12z run every 3 h out to 10 days (Earth Engine)   gfs.nc
   osm          OpenStreetMap 1 January snapshot of the fire's year, full extract osm_<YYYY>-01-01.osm.pbf
   viirs        VIIRS L1B swaths day + night: I1-I5, M11, geolocation (Earthdata) <SAT>_<date>T<HHMM>_<day|night>.nc
 
-lulc, landcover, vegetation, hrrr_next and viirs bring in what TS-SatFire (Zhao et al. 2024) has and the other
-channels lacked: its VIIRS_Day / VIIRS_Night bands, its FirePred bands (NDVI, EVI2, gridMET pr / tmmn / sph /
-pdsi, MODIS LC_Type1, GFS-style next-day forecasts) and its ESRI_LULC map.
+lulc, landcover, vegetation, hrrr_next, gfs and viirs bring in what TS-SatFire (Zhao et al. 2024) has and the
+other channels lacked: its VIIRS_Day / VIIRS_Night bands, its FirePred bands (NDVI, EVI2, gridMET pr / tmmn /
+sph / pdsi, MODIS LC_Type1, GFS forecasts: TS-SatFire's own source in gfs, at 3 km and hourly in hrrr_next) and
+its ESRI_LULC map.
 
 Per-fire channels: grab_<channel>(fire, out_dir, ctx) -> (status, sources), status "ok" or "empty".
-Group channels (goes, hrrr, hrrr_next, osm, viirs) share downloads across fires: grab_<channel>_many(fires, ctx)
-yields (fire, status, sources, error). Secrets (FIRMS map key, Earthdata token, HF token) never reach the manifest.
+Group channels (goes, hrrr, hrrr_next, gfs, osm, viirs) share downloads across fires: grab_<channel>_many(fires, ctx)
+yields (fire, status, sources, error). Secrets (FIRMS map key, Earthdata token, Earth Engine key, HF token) never
+reach the manifest.
 """
 import gzip
 import json
@@ -49,11 +54,20 @@ sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(HERE.parent))
 
 CHANNELS = ["history", "perimeters", "firms", "gridmet", "ics209", "suppression", "tessera", "terrain",
-            "landfire", "lulc", "landcover", "vegetation", "goes", "hrrr", "hrrr_next", "osm", "viirs"]
-GROUP = {"goes", "hrrr", "hrrr_next", "osm", "viirs"}
+            "landfire", "lulc", "landcover", "vegetation", "goes", "hrrr", "hrrr_next", "gfs", "osm", "viirs"]
+GROUP = {"goes", "hrrr", "hrrr_next", "gfs", "osm", "viirs"}
 EARTHDATA_CHANNELS = {"landcover", "vegetation", "viirs"}        # need EARTHDATA_TOKEN
+# Channels whose files depend on the fire's time window. A manifest row records the window it was fetched for
+# (window_label); when the window changes (catalog/fire_extents.csv), done_ids sends the fire back to the queue.
+WINDOW_CHANNELS = {"firms", "gridmet", "goes", "hrrr", "hrrr_next", "gfs", "vegetation", "viirs"}
+# Channels cut to the fire's region (area). perimeters keeps the build's box (it keeps only the fire's own
+# records, which all lie in it) and ics209 matches incidents by the build's box (a wider one would match
+# neighbours); the manifest records the region, so a region change sends the fire back to the queue.
+REGION_CHANNELS = {"history", "firms", "gridmet", "suppression", "tessera", "terrain", "landfire", "lulc", "landcover",
+                   "vegetation", "goes", "hrrr", "hrrr_next", "gfs", "osm", "viirs"}
 GOES_VARS = ("Mask", "Power", "Area", "Temp", "DQF")
 HRRR_START = "2014-08-01"            # first HRRR files on AWS used by the build
+GFS_START = "2015-07-01"             # first NOAA/GFS0P25 image in Earth Engine
 GOES_START = "2017-06-01"
 TESSERA_FIRST_YEAR = 2017
 LULC_FIRST_YEAR, LULC_LAST_YEAR = 2017, 2023      # io-lulc-annual-v02 maps on Planetary Computer
@@ -83,18 +97,223 @@ def _ts(v):
     return t.tz_localize("UTC") if t.tzinfo is None else t.tz_convert("UTC")
 
 
+# ------------------------------------------------------------------------------------- time window
+# A fire often burns before its first mapped perimeter, and on after its last. The raw window therefore runs
+# from the earlier of the first perimeter day and the first FIRMS-active day that leads into it, to the later
+# of the last perimeter day and the last active day that follows it, plus one day on each side. FIRMS itself
+# is fetched over a fixed span around the perimeter days (firms_days), so the window never depends on itself.
+
+REGION_BUFFER_KM = 32.0              # half a 64 km tile: the region reaches this far past the perimeters' box
+FIRMS_BEFORE, FIRMS_AFTER = 14, 14   # FIRMS days fetched around the perimeter days
+ACTIVE_MIN_DETECTIONS = 2            # an active day: at least this many detections that are not low confidence
+ACTIVE_MAX_GAP_DAYS = 2              # activity joins the fire across at most this many quiet days (clouds, gaps)
+ACTIVE_PAD_DEG = 0.01                # around the perimeters' own box (~1 km: a 375 m pixel centre can sit outside)
+WINDOW_PAD_DAYS = 1                  # added on both sides
+EXTENTS_FILE = "catalog/fire_extents.csv"
+IGNITION_OVERPASS_MIN = 15           # detections this close to the earliest one belong to the same overpass
+
+
+def buffer_box(bounds, km):
+    """bounds (lon/lat) pushed out km on every side; longitudes are widened for the latitude farthest from the
+    equator, so the margin is at least km everywhere in the box."""
+    w, s, e, n = bounds
+    dlat = km / 110.574
+    far = min(max(abs(s - dlat), abs(n + dlat)), 89.0)
+    dlon = km / (111.320 * math.cos(math.radians(far)))
+    return [w - dlon, s - dlat, e + dlon, n + dlat]
+
+
+def area(fire):
+    """The region every spatial channel is cut to (lon/lat box): the perimeters' own box, grown by the
+    detection margin (ACTIVE_PAD_DEG, so an ignition point found from FIRMS lies inside it) and then by
+    REGION_BUFFER_KM on every side, and never smaller than the build's box. A tile of 2 x REGION_BUFFER_KM
+    centred anywhere in the fire lies inside it. Depends on the perimeters only, so it is known before any
+    channel runs."""
+    g = fire["bounds"]
+    base = fire.get("perim_bounds") or g
+    p = ACTIVE_PAD_DEG
+    w, s, e, n = buffer_box([base[0] - p, base[1] - p, base[2] + p, base[3] + p], REGION_BUFFER_KM)
+    return [min(w, g[0]), min(s, g[1]), max(e, g[2]), max(n, g[3])]
+
+
+def region_label(channel, fire):
+    """The region a channel's files cover, as the manifest records it ('' for channels on the build's box)."""
+    return ",".join(f"{v:.4f}" for v in area(fire)) if channel in REGION_CHANNELS else ""
+
+
+def perimeter_days(fire):
+    """(first, last) perimeter day as naive UTC midnights."""
+    return _ts(fire["first"]).tz_convert(None).normalize(), _ts(fire["last"]).tz_convert(None).normalize()
+
+
 def span(fire):
-    """build_multiyear._fire_span: one day before the first perimeter to the last (hour ceiling), UTC."""
+    """The fire's time window, UTC: 00:00 of its first day to 23:00 of its last. The days come from
+    fire["window"] (catalog/fire_extents.csv, already padded); without one, the perimeter days alone, one
+    day added on each side."""
     import pandas as pd
-    return _ts(fire["first"]).floor("D") - pd.Timedelta(days=1), _ts(fire["last"]).ceil("h")
+    w = fire.get("window")
+    if w:
+        d0, d1 = pd.Timestamp(w[0]), pd.Timestamp(w[1])
+    else:
+        d0, d1 = perimeter_days(fire)
+        d0, d1 = d0 - pd.Timedelta(days=WINDOW_PAD_DAYS), d1 + pd.Timedelta(days=WINDOW_PAD_DAYS)
+    return d0.tz_localize("UTC"), d1.tz_localize("UTC") + pd.Timedelta(hours=23)
 
 
 def days(fire, before=14, after=2):
-    """build_multiyear.days_of: calendar days from first - 14 to last + 2."""
+    """Calendar days of the daily channels (gridmet): `before` days before the first perimeter day to `after`
+    days after the last (14 / 2, as the build's days_of), moved out as far as span() is."""
     import pandas as pd
-    d0 = _ts(fire["first"]).tz_convert(None).normalize() - pd.Timedelta(days=before)
-    d1 = _ts(fire["last"]).tz_convert(None).normalize() + pd.Timedelta(days=after)
+    t0, t1 = span(fire)
+    d0 = t0.tz_convert(None).normalize() - pd.Timedelta(days=before - WINDOW_PAD_DAYS)
+    d1 = t1.tz_convert(None).normalize() + pd.Timedelta(days=after - WINDOW_PAD_DAYS)
     return pd.date_range(d0, d1)
+
+
+def firms_days(fire):
+    """Days the firms channel fetches: FIRMS_BEFORE before the first perimeter day to FIRMS_AFTER after the
+    last. Fixed by the perimeters, since the window is computed from what FIRMS finds here."""
+    import pandas as pd
+    d0, d1 = perimeter_days(fire)
+    return pd.date_range(d0 - pd.Timedelta(days=FIRMS_BEFORE), d1 + pd.Timedelta(days=FIRMS_AFTER))
+
+
+def active_days(df, bounds, pad=ACTIVE_PAD_DEG, min_n=ACTIVE_MIN_DETECTIONS):
+    """Sorted UTC days (naive midnights) with at least min_n FIRMS detections inside bounds (+ pad) that are
+    neither low confidence nor, where the source says so, a static land source or offshore (type 2 / 3)."""
+    import pandas as pd
+    if df is None or not len(df):
+        return []
+    m = _fire_detections(df, bounds, pad)
+    count = pd.to_datetime(df.loc[m, "acq_date"]).dt.normalize().value_counts()
+    return sorted(count[count >= min_n].index)
+
+
+def _fire_detections(df, bounds, pad=ACTIVE_PAD_DEG):
+    """Mask of detections that count for the fire: inside bounds (+ pad), not low confidence, not a static
+    land source or offshore (type 2 / 3) where the source has a type column."""
+    import pandas as pd
+    w, s, e, n = bounds
+    m = df["latitude"].between(s - pad, n + pad) & df["longitude"].between(w - pad, e + pad)
+    if "confidence" in df:
+        m &= ~df["confidence"].astype(str).str.lower().str.startswith("l")
+    if "type" in df:
+        m &= ~pd.to_numeric(df["type"], errors="coerce").isin([2, 3])
+    return m
+
+
+def first_perimeter_point(arrival, transform, times):
+    """(time, lat, lon) of the first mapped perimeter: the centre of the cells the build's labels give the
+    earliest arrival (arrival = index into times, -1 unburned), or None."""
+    import numpy as np
+    import pandas as pd
+    a = np.asarray(arrival)
+    if not (a >= 0).any():
+        return None
+    k = int(a[a >= 0].min())
+    r, c = np.nonzero(a == k)
+    dx, _, x0, _, dy, y0 = transform
+    return pd.Timestamp(int(times[k]), tz="UTC"), float(y0 + (r.mean() + 0.5) * dy), float(x0 + (c.mean() + 0.5) * dx)
+
+
+def ignition_point(fire, firms_df=None, active=(), first_perimeter=None):
+    """(lat, lon, time UTC, method): the fire's earliest observation, known at its start, as the centre a
+    tile can be cut around without seeing the future. The earlier of: the first VIIRS overpass that saw it
+    (detections of the fire within IGNITION_OVERPASS_MIN minutes of the first one, on the first active day of
+    its chained window: 'firms'; on any day of the perimeter span when no day is active: 'firms_single'), and
+    its first mapped perimeter ('first_perimeter', from the build's labels). Without either, the centre of the
+    perimeters' box ('perimeter_box_centre': uses the final extent, so not leak-free)."""
+    import pandas as pd
+    cands = []
+    bounds = fire.get("perim_bounds") or fire["bounds"]
+    if firms_df is not None and len(firms_df):
+        d = firms_df[_fire_detections(firms_df, bounds)]
+        day = pd.to_datetime(d["acq_date"]).dt.normalize()
+        hhmm = pd.to_numeric(d["acq_time"], errors="coerce").fillna(0).astype(int) if "acq_time" in d \
+            else pd.Series(0, index=d.index)
+        t = (day + pd.to_timedelta(hhmm // 100, unit="h") + pd.to_timedelta(hhmm % 100, unit="min")).dt.tz_localize("UTC")
+        p0, p1 = perimeter_days(fire)
+        a0, a1 = activity_window(p0, p1, list(active))
+        sel, method = day.isin(set(active)) & day.between(a0, a1), "firms"
+        if not sel.any():
+            sel, method = day.between(p0 - pd.Timedelta(days=1), p1), "firms_single"
+        if sel.any():
+            t0 = t[sel].min()
+            g = sel & (t <= t0 + pd.Timedelta(minutes=IGNITION_OVERPASS_MIN))
+            cands.append((t0, float(d.loc[g, "latitude"].mean()), float(d.loc[g, "longitude"].mean()), method))
+    if first_perimeter is not None:
+        cands.append((*first_perimeter, "first_perimeter"))
+    if cands:
+        t0, lat, lon, method = min(cands, key=lambda c: c[0])
+        return lat, lon, t0, method
+    w, s, e, n = bounds
+    return (s + n) / 2, (w + e) / 2, _ts(fire["first"]), "perimeter_box_centre"
+
+
+def activity_window(first_day, last_day, active, max_gap=ACTIVE_MAX_GAP_DAYS):
+    """(start, end): the perimeter days, stretched over active days that chain onto them with at most
+    max_gap quiet days between links (activity weeks away belongs to another fire or a false alarm)."""
+    import pandas as pd
+    step = pd.Timedelta(days=max_gap + 1)
+    s, e = first_day, last_day
+    for d in sorted((d for d in active if d < first_day), reverse=True):
+        if s - d > step:
+            break
+        s = d
+    for d in sorted(d for d in active if d > last_day):
+        if d - e > step:
+            break
+        e = d
+    return s, e
+
+
+def fire_extent(fire, firms_df=None, first_perimeter=None):
+    """One row of catalog/fire_extents.csv: the fire's time window, ignition point and region. firms_df: the
+    fire's FIRMS detections (None when it has none); first_perimeter: (time, lat, lon) of its first mapped
+    perimeter (first_perimeter_point) or None. The activity test uses the perimeters' own box (perim_bounds),
+    not the padded grid box, so a neighbour burning in the margin does not stretch this fire's window."""
+    import pandas as pd
+    p0, p1 = perimeter_days(fire)
+    act = active_days(firms_df, fire.get("perim_bounds") or fire["bounds"])
+    a0, a1 = activity_window(p0, p1, act)
+    pad = pd.Timedelta(days=WINDOW_PAD_DAYS)
+    lat, lon, t0, how = ignition_point(fire, firms_df, act, first_perimeter)
+    w, s, e, n = area(fire)
+    return {"fire_id": fire["fire_id"], "start_day": (a0 - pad).date().isoformat(), "end_day": (a1 + pad).date().isoformat(),
+            "first_perimeter_day": p0.date().isoformat(), "last_perimeter_day": p1.date().isoformat(),
+            "active_days_before": (p0 - a0).days, "active_days_after": (a1 - p1).days, "active_days": len(act),
+            "window_rule": "perimeters+firms" if firms_df is not None else "perimeters",
+            "ignition_lat": round(lat, 5), "ignition_lon": round(lon, 5),
+            "ignition_time_utc": t0.strftime("%Y-%m-%dT%H:%MZ"), "ignition_method": how,
+            "region_west": round(w, 5), "region_south": round(s, 5), "region_east": round(e, 5), "region_north": round(n, 5)}
+
+
+def attach_extents(fires, table):
+    """Put each fire's (start_day, end_day) from a fire_extents table ({fire_id: row}) on fire["window"] and
+    its ignition point on fire["ignition"] (lat, lon, time, method)."""
+    for f in fires:
+        r = table.get(f["fire_id"]) if table else None
+        if r is not None:
+            f["window"] = (str(r["start_day"]), str(r["end_day"]))
+            if str(r.get("ignition_lat", "")) not in ("", "nan"):
+                f["ignition"] = (float(r["ignition_lat"]), float(r["ignition_lon"]), str(r["ignition_time_utc"]),
+                                 str(r["ignition_method"]))
+    return fires
+
+
+def window_label(channel, fire):
+    """The days a channel's files cover for this fire, as the manifest records them ('' for channels whose
+    files do not depend on time)."""
+    if channel == "firms":
+        d = firms_days(fire)
+    elif channel == "gridmet":
+        d = days(fire)
+    elif channel in WINDOW_CHANNELS:
+        t0, t1 = span(fire)
+        return f"{t0.date().isoformat()}/{t1.date().isoformat()}"
+    else:
+        return ""
+    return f"{d[0].date().isoformat()}/{d[-1].date().isoformat()}"
 
 
 def landfire_version(year):
@@ -123,20 +342,22 @@ def applies(channel, fire):
         return "GOES-16 fire product starts 2017-06-01"
     if channel in ("hrrr", "hrrr_next") and t1 < pd.Timestamp(HRRR_START, tz="UTC"):
         return "HRRR archive starts 2014-08"
+    if channel == "gfs" and t1 < pd.Timestamp(GFS_START, tz="UTC"):
+        return "GFS 0.25 deg in Earth Engine starts 2015-07-01"
     if channel == "lulc" and y < LULC_FIRST_YEAR:
         return "Esri 10 m land cover starts 2017"
     if channel == "osm":
         import human_features as HF
         try:
-            HF.region_file({"bounds_lonlat": fire["bounds"]})
+            HF.region_file({"bounds_lonlat": area(fire)})
         except RuntimeError as ex:
             return str(ex)
     return None
 
 
 def firms_calls(fire):
-    """(source, first day, n days) for the standard-product requests: 5-day calls over days()."""
-    ds = days(fire)
+    """(source, first day, n days) for the standard-product requests: 5-day calls over firms_days()."""
+    ds = firms_days(fire)
     srcs = ["VIIRS_SNPP_SP"] + (["VIIRS_NOAA20_SP"] if int(fire["year"]) >= 2018 else [])
     out = []
     for src in srcs:
@@ -192,7 +413,7 @@ def goes_hours(fire):
 
 
 SECRET_NAMES = {"FIRMS_MAP_KEY": "{MAP_KEY}", "LANDFIRE_EMAIL": "{EMAIL}", "HF_TOKEN": "{HF_TOKEN}",
-                "EARTHDATA_TOKEN": "{EARTHDATA_TOKEN}"}
+                "EARTHDATA_TOKEN": "{EARTHDATA_TOKEN}", "GEE_SERVICE_ACCOUNT_KEY": "{GEE_KEY}"}
 
 
 def _secret_values():
@@ -224,6 +445,8 @@ def redact(text):
     text = re.sub(r"(/api/area/csv/)[^/\s]+/", r"\1{MAP_KEY}/", text)
     text = re.sub(r"([?&])Email=[^&\s]*&?", r"\1", text)
     text = re.sub(r"(Bearer\s+)[A-Za-z0-9._\-]+", r"\1{EARTHDATA_TOKEN}", text)
+    text = re.sub(r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----", "{GEE_KEY}", text, flags=re.S)
+    text = re.sub(r'("private_key(?:_id)?"\s*:\s*")[^"]*"', r'\1{GEE_KEY}"', text)
     text = re.sub(r"(?<=[?&])(st|se|sp|sv|sr|skoid|sktid|skt|ske|sks|skv|sig|X-Amz-[A-Za-z]+)=[^&\s]*&?", "", text)  # signed URLs
     return re.sub(r"[?&]+(?=\s|$)", "", text)
 
@@ -293,6 +516,13 @@ def requirements(channel):
         ED.token()                                   # SystemExit with instructions when missing
     if channel in ("vegetation", "viirs"):
         import h5py  # noqa: F401
+    if channel == "gfs":
+        try:
+            import ee  # noqa: F401
+        except ImportError:
+            raise SystemExit("gfs reads NOAA/GFS0P25 from Google Earth Engine: pip install earthengine-api")
+        if not (os.environ.get("GEE_SERVICE_ACCOUNT_KEY") or (Path.home() / ".config" / "earthengine" / "credentials").exists()):
+            raise SystemExit(GEE_HELP)
     if channel == "landcover":
         try:
             import pyhdf.SD  # noqa: F401
@@ -395,9 +625,9 @@ def _box_query(ctx, url, bbox):
 def grab_history(fire, out, ctx):
     import build_multiyear as BM
     where = f"FIRE_YEAR_INT < {int(fire['year'])}"
-    feats = arcgis_box_features(ctx.sess, BM.HIST_URL, fire["bounds"], where=where, chunk=100)
+    feats = arcgis_box_features(ctx.sess, BM.HIST_URL, area(fire), where=where, chunk=100)
     _write_geojson(out / "history.geojson", feats)
-    return ("ok" if feats else "empty"), [arcgis_query_url(BM.HIST_URL, fire["bounds"], where=where)]
+    return ("ok" if feats else "empty"), [arcgis_query_url(BM.HIST_URL, area(fire), where=where)]
 
 
 def _perimeter_layers(ctx, year):
@@ -441,15 +671,15 @@ def grab_firms(fire, out, ctx):
 
     def call(src, day, k):
         ctx.throttle(0.15)                              # 5000 transactions / 10 min per key
-        df = firms.get(src, fire["bounds"], k, day)
-        bbox = ",".join(f"{v:.4f}" for v in fire["bounds"])
+        df = firms.get(src, area(fire), k, day)
+        bbox = ",".join(f"{v:.4f}" for v in area(fire))
         sources.append(redact(firms.API.format(key="KEY", src=src, bbox=bbox, days=k) + f"/{day}"))
         if len(df):
             frames.setdefault(src, []).append(df)
 
     for src, day, k in firms_calls(fire):
         call(src, day, k)
-    ds = days(fire)
+    ds = firms_days(fire)
     if int(fire["year"]) >= 2024:
         sp = [pd.Timestamp(d["acq_date"].max()) for fs in frames.values() for d in fs]
         start = (max(sp) + pd.Timedelta(days=1)) if sp else ds[0]
@@ -515,7 +745,7 @@ def grab_gridmet(fire, out, ctx):
     sources = []
     for short, var in gridmet_vars().items():
         d0 = ds[0] - pd.Timedelta(days=GRIDMET_LEAD_DAYS.get(short, 0))
-        url = gridmet_url(short, var, fire["bounds"], d0, ds[-1], WF.PAD_DEG)
+        url = gridmet_url(short, var, area(fire), d0, ds[-1], WF.PAD_DEG)
         data = http_get(ctx, url)
         if not (data[:3] == b"CDF" or data[:4] == b"\x89HDF"):
             raise RuntimeError(f"GRIDMET {short}: reply is not netCDF: {data[:120]!r}")
@@ -565,7 +795,7 @@ def grab_suppression(fire, out, ctx):
     GDB_FROM_DATE / GDB_TO_DATE), for each archive year the fire burned in."""
     import nifc_perimeters as NP
     import suppression_layers as SL
-    bbox = tuple(fire["bounds"])
+    bbox = tuple(area(fire))
     lines, polys, sources = [], [], []
     for y in [y for y in _years(fire) if y >= 2018]:
         layers = ctx.memo(("supp", y), lambda y=y: SL.discover_archive_layers(ctx.sess, [y]).get(y, []))
@@ -584,7 +814,7 @@ def grab_suppression(fire, out, ctx):
 
 def grab_tessera(fire, out, ctx):
     ref = {"fire_id": fire["fire_id"], "fire_year": int(fire["year"]), "embedding_year": int(fire["year"]) - 1,
-           "bbox_lonlat": list(fire["bounds"]), "dataset": "GeoTessera v1.1 (128-d annual embeddings, 10 m)",
+           "bbox_lonlat": list(area(fire)), "dataset": "GeoTessera v1.1 (128-d annual embeddings, 10 m)",
            "access": "from geotessera.store import GeoTesseraZarr; GeoTesseraZarr().iter_region(tuple(bbox_lonlat), embedding_year)",
            "links": ["https://github.com/ucam-eo/geotessera", "https://data.source.coop/tessera/tessera",
                      "https://registry.opendata.aws/tessera/"],
@@ -599,7 +829,7 @@ def grab_terrain(fire, out, ctx):
     import rasterio
     from rasterio.merge import merge
     import build_dataset as B
-    w, s, e, n = fire["bounds"]
+    w, s, e, n = area(fire)
     srcs, sources = [], []
     with rasterio.Env(GDAL_DISABLE_READDIR_ON_OPEN="EMPTY_DIR", CPL_VSIL_CURL_ALLOWED_EXTENSIONS=".tif"):
         for lat in range(math.floor(s), math.floor(n) + 1):
@@ -674,7 +904,7 @@ def grab_landfire(fire, out, ctx):
                                                                 params={"f": "json"}, timeout=60).json())
         if "extent" not in info:
             raise RuntimeError(f"LANDFIRE {v}_{layer}: service info unavailable: {str(info)[:150]}")
-        url = landfire_export_url(v, layer, fire["bounds"], info)
+        url = landfire_export_url(v, layer, area(fire), info)
         data = http_get(ctx, url, timeout=600)
         if data[:4] not in (b"II*\x00", b"MM\x00*", b"II+\x00"):
             raise RuntimeError(f"LANDFIRE {v}_{layer}: reply is not a GeoTIFF: {data[:150]!r}")
@@ -869,7 +1099,7 @@ def grab_lulc(fire, out, ctx):
     from rasterio.windows import Window
     yr = lulc_year(fire["year"])
     r = ctx.sess.post(f"{PC_STAC}/search", timeout=120,
-                      json={"collections": [LULC_COLLECTION], "bbox": list(fire["bounds"]), "limit": 100,
+                      json={"collections": [LULC_COLLECTION], "bbox": list(area(fire)), "limit": 100,
                             "datetime": f"{yr}-01-01T00:00:00Z/{yr}-12-31T23:59:59Z"})
     r.raise_for_status()
     sources = []
@@ -880,7 +1110,7 @@ def grab_lulc(fire, out, ctx):
         with rasterio.Env(GDAL_DISABLE_READDIR_ON_OPEN="EMPTY_DIR", GDAL_HTTP_MAX_RETRY="5", GDAL_HTTP_RETRY_DELAY="5"):
             with rasterio.open(f"/vsicurl/{href}?{_pc_token(ctx, LULC_COLLECTION)}") as src:
                 win = pixel_window(src.transform, src.width, src.height,
-                                   transform_bounds(4326, src.crs, *fire["bounds"], densify_pts=21))
+                                   transform_bounds(4326, src.crs, *area(fire), densify_pts=21))
                 if win is None:
                     continue
                 r0, r1, c0, c1 = win
@@ -907,8 +1137,8 @@ def grab_landcover(fire, out, ctx):
     import earthdata as ED
     from pyhdf.SD import SD, SDC
     yr = int(fire["year"]) - 1
-    win = ED.sinu_window(fire["bounds"])
-    grans = [g for g in ED.cmr_granules(ctx.sess, "MCD12Q1", f"{yr}-01-01", f"{yr}-12-31T23:59:59", fire["bounds"])
+    win = ED.sinu_window(area(fire))
+    grans = [g for g in ED.cmr_granules(ctx.sess, "MCD12Q1", f"{yr}-01-01", f"{yr}-12-31T23:59:59", area(fire))
              if ED.granule_parts(g["url"])[1] == f"A{yr}001" and ED.tile_part(win, *ED.tile_hv(g["name"]))]
     tok = ED.token()
     m, sources = SinuMosaic(win), []
@@ -956,8 +1186,8 @@ def grab_vegetation(fire, out, ctx):
     import pandas as pd
     import earthdata as ED
     t0, t1 = span(fire)
-    win = ED.sinu_window(fire["bounds"])
-    grans = [g for g in ED.cmr_granules(ctx.sess, VEG_PRODUCT, t0 - pd.Timedelta(days=16), t1, fire["bounds"])
+    win = ED.sinu_window(area(fire))
+    grans = [g for g in ED.cmr_granules(ctx.sess, VEG_PRODUCT, t0 - pd.Timedelta(days=16), t1, area(fire))
              if ED.tile_part(win, *ED.tile_hv(g["name"]))]
     dates = sorted({ED.granule_parts(g["url"])[1] for g in grans})
     if not dates:
@@ -1139,7 +1369,7 @@ def grab_goes_many(fires, ctx, chunk=25):
                             fid = f["fire_id"]
                             k = (fid, sat)
                             if k not in series:
-                                win = _window(lat, lon, f["bounds"])
+                                win = _window(lat, lon, area(f))
                                 if win is None:
                                     series[k] = None
                                 else:
@@ -1211,7 +1441,7 @@ def grab_hrrr_many(fires, ctx, chunk=25, step_h=3):
             ana, fc = hrrr_times(f, step_h)
             ana = [t for t in ana if t >= _ts(HRRR_START)]
             fc = [t for t in fc if t >= _ts(HRRR_START)]
-            wins[fid] = WF.hrrr_window(lat, lon, f["bounds"])
+            wins[fid] = WF.hrrr_window(lat, lon, area(f))
             left[fid], got_n[fid] = len(ana) + len(fc), []
             for t in ana:
                 need.setdefault((t, 0), []).append((f, "ana"))
@@ -1258,7 +1488,7 @@ def grab_osm_many(fires, ctx):
     import human_features as HF
     groups = {}
     for f in fires:
-        groups.setdefault((HF.region_file({"bounds_lonlat": f["bounds"]}), int(f["year"])), []).append(f)
+        groups.setdefault((HF.region_file({"bounds_lonlat": area(f)}), int(f["year"])), []).append(f)
     for (region, year), group in sorted(groups.items()):
         if ctx.expired():
             return
@@ -1284,7 +1514,7 @@ def grab_osm_many(fires, ctx):
         for f in group:
             if ctx.expired():
                 break
-            w, s, e, n = f["bounds"]
+            w, s, e, n = area(f)
             dst = ctx.stage(f["fire_id"]) / f"osm_{year}-01-01.osm.pbf"
             r = subprocess.run(["osmium", "extract", "--overwrite", "-s", "smart", "-b", f"{w},{s},{e},{n}", str(snap), "-o", str(dst)],
                                capture_output=True, text=True)
@@ -1331,7 +1561,7 @@ def grab_hrrr_next_many(fires, ctx, chunk=25):
         for f in group:
             fid = f["fire_id"]
             keys = [(run, h) for run, h in hrrr_next_times(f) if run >= _ts(HRRR_START)]
-            wins[fid] = WF.hrrr_window(lat, lon, f["bounds"])
+            wins[fid] = WF.hrrr_window(lat, lon, area(f))
             left[fid], got_n[fid] = len(keys), []
             if not keys:
                 yield f, "empty", [], None
@@ -1374,6 +1604,250 @@ def grab_hrrr_next_many(fires, ctx, chunk=25):
                 ctx.drop_stage(fid)
             return
 
+# ------------------------------------------------------------------------------------- GFS (Earth Engine)
+
+GFS_COLLECTION = "NOAA/GFS0P25"
+GFS_LEADS = tuple(range(3, 241, 3))          # every 3 h out to 10 days
+# Leads the collection holds (catalog page): 3-hourly to 36 h until 2017-07-09; from then hourly to 120 h,
+# 3-hourly to 240 h (and on to 384 h, 12-hourly until 2021-06-11, 3-hourly after).
+GFS_MAX_LEAD = (("2015-07-01", 36), ("2017-07-09", 240))
+GFS_MAX_BANDS = 990                          # bands per Earth Engine request (22 per image since 2025-01-15)
+GFS_MAX_CELLS = 2500                         # 0.25 deg cells per request: fires of one run share a request
+GFS_UNITS = {
+    "temperature_2m_above_ground": "degC", "dew_point_temperature_2m_above_ground": "degC",
+    "maximum_temperature_2m_above_ground": "degC", "minimum_temperature_2m_above_ground": "degC",
+    "specific_humidity_2m_above_ground": "kg kg-1", "relative_humidity_2m_above_ground": "%",
+    "u_component_of_wind_10m_above_ground": "m s-1", "v_component_of_wind_10m_above_ground": "m s-1",
+    "u_component_of_wind_planetary_boundary_layer": "m s-1", "v_component_of_wind_planetary_boundary_layer": "m s-1",
+    "gust": "m s-1", "total_precipitation_surface": "kg m-2", "precipitation_rate": "kg m-2 s-1",
+    "precipitable_water_entire_atmosphere": "kg m-2", "total_cloud_cover_entire_atmosphere": "%",
+    "downward_shortwave_radiation_flux": "W m-2", "downward_longwave_radiation_flux": "W m-2",
+    "upward_shortwave_radiation_flux": "W m-2", "upward_longwave_radiation_flux": "W m-2",
+    "planetary_boundary_layer_height": "m", "haines_index": "1", "ventilation_rate": "m2 s-1"}
+GEE_HELP = """gfs reads NOAA/GFS0P25 from Google Earth Engine (free for research and non-commercial use):
+  1. Register a Google Cloud project for Earth Engine: https://code.earthengine.google.com/register
+  2. Either create a service account in that project, give it the 'Earth Engine Resource Viewer' role and put
+     its JSON key in GEE_SERVICE_ACCOUNT_KEY (a Kaggle secret of that name), or run `earthengine authenticate`
+     on this machine.
+  3. Set GEE_PROJECT to the project id."""
+
+
+def gfs_max_lead(run):
+    import pandas as pd
+    return [h for d, h in GFS_MAX_LEAD if _ts(run) >= pd.Timestamp(d, tz="UTC")][-1]
+
+
+def gfs_times(fire):
+    """[(12z run, lead hours)]: each day of span() the 12z run's forecasts every 3 h, out to 10 days where
+    the collection has them (36 h before 2017-07-09)."""
+    _, fc = hrrr_times(fire)
+    return [(run, h) for run in fc if run >= _ts(GFS_START) for h in GFS_LEADS if h <= gfs_max_lead(run)]
+
+
+def gee_init():
+    """Earth Engine on its high-volume endpoint: a service account's JSON key (GEE_SERVICE_ACCOUNT_KEY) or this
+    machine's `earthengine authenticate` credentials, in GEE_PROJECT (default: the key's own project)."""
+    import ee
+    key = os.environ.get("GEE_SERVICE_ACCOUNT_KEY")
+    project = os.environ.get("GEE_PROJECT") or None
+    url = "https://earthengine-highvolume.googleapis.com"
+    if key:
+        info = json.loads(key)
+        cred, project = ee.ServiceAccountCredentials(info["client_email"], key_data=key), project or info.get("project_id")
+    else:
+        cred = "persistent"
+    try:
+        ee.Initialize(cred, project=project, url=url)             # earthengine-api 1.x
+    except TypeError:
+        ee.Initialize(cred, project=project, opt_url=url)         # 0.1.x
+    return ee
+
+
+def gfs_grid(ee):
+    """(crs, crs_transform (a, b, c, d, e, f), width, height) of the collection's native 0.25 deg grid."""
+    band = ee.ImageCollection(GFS_COLLECTION).first().getInfo()["bands"][0]
+    w, h = band["dimensions"]
+    return band["crs"], tuple(float(v) for v in band["crs_transform"]), int(w), int(h)
+
+
+def _east_lon(transform, width):
+    """True when the grid's longitudes run 0..360 (then fire longitudes are shifted to match)."""
+    a, _, c, *_ = transform
+    return c > -90 and c + a * width > 270
+
+
+def grid_window(transform, width, height, bounds):
+    """(r0, r1, c0, c1) of the cells covering bounds (lon/lat) on a regular lon/lat grid, snapped outward."""
+    from affine import Affine
+    w, s, e, n = bounds
+    if _east_lon(transform, width):
+        w, e = w % 360, e % 360
+    return pixel_window(Affine(*transform), width, height, (w, s, e, n))
+
+
+def grid_latlon(transform, width, win):
+    """Cell-centre lat / lon (2-D, longitudes in -180..180) of a window."""
+    import numpy as np
+    a, _, c, _, e, f = transform
+    r0, r1, c0, c1 = win
+    lon = c + a * (np.arange(c0, c1) + 0.5)
+    lon = np.where(lon > 180, lon - 360, lon)
+    lat = f + e * (np.arange(r0, r1) + 0.5)
+    return np.meshgrid(lat, lon, indexing="ij")
+
+
+def _union(w1, w2):
+    return min(w1[0], w2[0]), max(w1[1], w2[1]), min(w1[2], w2[2]), max(w1[3], w2[3])
+
+
+def gfs_clusters(wins, max_cells=GFS_MAX_CELLS):
+    """[(union window, [fire_id])]: fires (fire_id -> window) grouped greedily, west to east, so one request
+    covers each group and no group's window exceeds max_cells."""
+    groups = []
+    for fid, w in sorted(wins.items(), key=lambda kv: (kv[1][2], kv[1][0], kv[0])):
+        for g in groups:
+            u = _union(g[0], w)
+            if (u[1] - u[0]) * (u[3] - u[2]) <= max_cells:
+                g[0] = u
+                g[1].append(fid)
+                break
+        else:
+            groups.append([w, [fid]])
+    return [(tuple(g[0]), g[1]) for g in groups]
+
+
+def gfs_fetch(ee, run, leads, win, grid):
+    """{lead: {band: 2-D array}} of one run over win (rows / cols of the native grid), one computePixels
+    request: every band each image has, values as Earth Engine stores them. Leads the collection lacks are
+    absent; a run it lacks gives {}."""
+    crs, (a, b, c, d, e, f), _, _ = grid
+    r0, r1, c0, c1 = win
+    coll = (ee.ImageCollection(GFS_COLLECTION)
+            .filter(ee.Filter.eq("creation_time", int(run.value // 10**6)))
+            .filter(ee.Filter.inList("forecast_hours", list(leads))))
+
+    def tag(im):        # band -> f<lead>__band, so toBands' own prefix (the image id) does not matter
+        pre = ee.String("f").cat(ee.Number(im.get("forecast_hours")).int().format("%03d")).cat("__")
+        return im.rename(im.bandNames().map(lambda bn: pre.cat(ee.String(bn))))
+
+    req = {"expression": coll.map(tag).toBands(), "fileFormat": "NUMPY_NDARRAY",
+           "grid": {"dimensions": {"width": c1 - c0, "height": r1 - r0}, "crsCode": crs,
+                    "affineTransform": {"scaleX": a, "shearX": b, "translateX": c + c0 * a,
+                                        "shearY": d, "scaleY": e, "translateY": f + r0 * e}}}
+    for attempt in range(6):
+        try:
+            arr = ee.data.computePixels(req)
+            break
+        except Exception as ex:  # noqa: BLE001
+            msg = str(ex).lower()
+            if "no bands" in msg or "zero bands" in msg:
+                return {}
+            if attempt == 5 or not any(k in msg for k in ("429", "too many", "quota", "503", "500", "timed out", "deadline")):
+                raise
+            time.sleep(5 * 2 ** attempt)
+    out = {}
+    for name in arr.dtype.names or ():
+        m = re.search(r"f(\d{3})__(\w+)$", name)
+        if m:
+            out.setdefault(int(m.group(1)), {}).setdefault(m.group(2), arr[name])
+    return out
+
+
+def _lead_chunks(leads, max_bands=GFS_MAX_BANDS, per_image=len(GFS_UNITS)):
+    k = max(1, max_bands // per_image)
+    return [tuple(leads[i:i + k]) for i in range(0, len(leads), k)]
+
+
+def grab_gfs_many(fires, ctx, chunk=200):
+    """NOAA GFS 0.25 deg (TS-SatFire's forecast source) from Earth Engine's NOAA/GFS0P25: for each day of
+    span() the 12z run's forecasts every 3 h out to 10 days (gfs_times), every band each image has, on the
+    native grid (no resampling; values as Earth Engine serves them, temperatures in degC), one series per fire:
+    gfs.nc with time = valid time, lead_h and run_time per step. Fires of the same run share requests."""
+    import numpy as np
+    import pandas as pd
+    from concurrent.futures import ThreadPoolExecutor
+    ee = ctx.memo("gee", gee_init)
+    grid = ctx.memo("gfs_grid", lambda: gfs_grid(ee))
+    crs, tr, width, height = grid
+
+    for group in _chunks(fires, chunk):
+        if ctx.expired():
+            return
+        need, left, wins, series, got_n, by_id, errs = {}, {}, {}, {}, {}, {}, {}
+        for f in group:
+            fid = f["fire_id"]
+            runs = sorted({r for r, _ in gfs_times(f)})
+            wins[fid] = grid_window(tr, width, height, area(f))
+            if not runs or wins[fid] is None:
+                yield f, "empty", [], None
+                continue
+            by_id[fid], left[fid], got_n[fid], errs[fid] = f, len(runs), [], []
+            for r in runs:
+                need.setdefault(r, []).append(fid)
+
+        def fetch(run):
+            leads = [h for h in GFS_LEADS if h <= gfs_max_lead(run)]
+            out = []
+            for cwin, ids in gfs_clusters({fid: wins[fid] for fid in need[run]}):
+                data, err = {}, None
+                try:
+                    for lc in _lead_chunks(leads):
+                        for h, bands in gfs_fetch(ee, run, lc, cwin, grid).items():
+                            data.setdefault(h, {}).update(bands)
+                except Exception as ex:  # noqa: BLE001  (reported for the fires of this run; the others go on)
+                    data, err = {}, redact(f"{run:%Y-%m-%dT%HZ}: {type(ex).__name__}: {ex}")[:300]
+                out.append((cwin, ids, data, err))
+            return run, out
+
+        stopped = False
+        with ThreadPoolExecutor(ctx.threads) as ex:
+            for run, out in _windowed_map(ex, fetch, sorted(need), 2 * ctx.threads):
+                src = f"ee:{GFS_COLLECTION} creation_time={run.strftime('%Y-%m-%dT%H:%MZ')}"
+                for cwin, ids, data, err in out:
+                    for fid in ids:
+                        if err:
+                            errs[fid].append(err)
+                        r0, r1, c0, c1 = wins[fid]
+                        sub = (slice(r0 - cwin[0], r1 - cwin[0]), slice(c0 - cwin[2], c1 - cwin[2]))
+                        if data and fid not in series:
+                            lat, lon = grid_latlon(tr, width, wins[fid])
+                            series[fid] = NcSeries(
+                                ctx.stage(fid) / "gfs.nc", lat, lon,
+                                {"title": f"NOAA GFS 0.25 deg, 12z run, forecasts every 3 h out to 10 days, cropped to {fid}",
+                                 "fire_id": fid, "source": f"Google Earth Engine {GFS_COLLECTION} (NOAA NCEP GFS)",
+                                 "crs": crs, "crs_transform": " ".join(f"{v:g}" for v in tr),
+                                 "window_rows_cols": f"{r0}:{r1},{c0}:{c1}",
+                                 "total_precipitation_surface": "accumulated over the last ((lead_h - 1) % 6) + 1 hours "
+                                                                "(Earth Engine catalog); sum the 6-hourly leads for totals",
+                                 "note": "values as Earth Engine serves them (temperatures in degC); bands added to the "
+                                         "collection on 2025-01-15 appear from then on"})
+                        for h in sorted(data):
+                            valid = run + pd.Timedelta(hours=h)
+                            series[fid].append(
+                                valid.value, f"{src} forecast_hours={h}",
+                                {b: (np.asarray(v)[sub], np.asarray(v).dtype, {"units": GFS_UNITS.get(b, "")})
+                                 for b, v in sorted(data[h].items())},
+                                extra={"lead_h": (h, "i2", {"long_name": "forecast lead", "units": "hours"}),
+                                       "run_time": (run.value, "i8", {"long_name": "model run (initialisation) time",
+                                                                      "units": "nanoseconds since 1970-01-01 00:00:00 UTC"})})
+                        if data:
+                            got_n[fid].append(src)
+                        left[fid] -= 1
+                        if left[fid] == 0:
+                            if fid in series:
+                                series.pop(fid).close()
+                            e = errs[fid]
+                            note = f"{len(e)} run(s) failed: {e[0]}" if e else None
+                            yield by_id[fid], ("ok" if got_n[fid] else "error" if e else "empty"), sorted(got_n[fid]), note
+                if ctx.expired():
+                    stopped = True
+                    break
+        if stopped:
+            for fid, s in series.items():
+                s.close()
+                ctx.drop_stage(fid)
+            return
+
 
 # ------------------------------------------------------------------------------------- VIIRS swaths
 
@@ -1399,7 +1873,7 @@ def viirs_granules(sess, fire):
         if t1 < pd.Timestamp(first, tz="UTC"):
             continue
         for prod in VIIRS_PRODUCTS:
-            for g in ED.cmr_granules(sess, prefix + prod, t0, t1, fire["bounds"]):
+            for g in ED.cmr_granules(sess, prefix + prod, t0, t1, area(fire)):
                 _, a, hhmm, _ = ED.granule_parts(g["url"])
                 e = out.setdefault((sat, a, hhmm), {"sat": sat})
                 e[prod] = g["url"]
@@ -1559,7 +2033,7 @@ def grab_viirs_many(fires, ctx, chunk=25):
                 left[fid], written[fid], srcs[fid], failed[fid] = len(grans), [], [], []
                 for k, e in grans.items():
                     need.setdefault(k, (e, []))[1].append(f)
-        jobs = [(k, e, [(f["fire_id"], f["bounds"]) for f in fs])
+        jobs = [(k, e, [(f["fire_id"], area(f)) for f in fs])
                 for k, (e, fs) in sorted(need.items(), key=lambda kv: (str(kv[1][0].get("start")), kv[0]))]
         if jobs:
             print(f"  viirs: {len(jobs)} granules for {len(left)} fires", flush=True)
@@ -1594,5 +2068,5 @@ def grab_viirs_many(fires, ctx, chunk=25):
             return
 
 
-GROUP_FUNCS = {"goes": grab_goes_many, "hrrr": grab_hrrr_many, "hrrr_next": grab_hrrr_next_many, "osm": grab_osm_many,
-               "viirs": grab_viirs_many}
+GROUP_FUNCS = {"goes": grab_goes_many, "hrrr": grab_hrrr_many, "hrrr_next": grab_hrrr_next_many, "gfs": grab_gfs_many,
+               "osm": grab_osm_many, "viirs": grab_viirs_many}

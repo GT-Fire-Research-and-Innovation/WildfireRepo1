@@ -29,3 +29,4 @@ dependencies:
   - pip
   - pip:
       - geotessera
+      - earthengine-api

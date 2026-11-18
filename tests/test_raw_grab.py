@@ -1,4 +1,4 @@
-"""Raw-data grab (pipeline/raw_grab.py, raw_channels.py), offline: time windows match the build, channels
+"""Raw-data grab (pipeline/raw_grab.py, raw_channels.py), offline: time windows hold the build's, channels
 skip fires they have no data for, secrets never reach the manifest, dirty IRWIN keys still match, resume
 reads manifests right, and a batch is deleted only after its upload worked.
 Run: python -m pytest tests/test_raw_grab.py -q"""
@@ -25,32 +25,34 @@ def fire(**kw):
 
 # ------------------------------------------------------------------------------------- windows
 
-def test_firms_calls_cover_build_window_in_5_day_steps():
+def test_firms_calls_cover_two_weeks_around_the_perimeters_in_5_day_steps():
     calls = RC.firms_calls(CAMP)
-    days = RC.days(CAMP)
-    assert (days[0].date().isoformat(), days[-1].date().isoformat()) == ("2018-10-26", "2018-11-27")
+    days = RC.firms_days(CAMP)
+    assert (days[0].date().isoformat(), days[-1].date().isoformat()) == ("2018-10-26", "2018-12-09")
+    g = RC.days(CAMP)                                    # gridmet keeps the build's days_of without activity
+    assert (g[0].date().isoformat(), g[-1].date().isoformat()) == ("2018-10-26", "2018-11-27")
     for src in ("VIIRS_SNPP_SP", "VIIRS_NOAA20_SP"):
         mine = [(d, k) for s, d, k in calls if s == src]
-        assert mine[0] == ("2018-10-26", 5) and mine[-1] == ("2018-11-25", 3)
+        assert mine[0] == ("2018-10-26", 5) and mine[-1] == ("2018-12-05", 5)
         assert sum(k for _, k in mine) == len(days)
     assert {s for s, _, _ in RC.firms_calls(fire(year=2016))} == {"VIIRS_SNPP_SP"}   # NOAA-20 from 2018
 
 
-def test_hrrr_and_goes_times_match_build_stages():
-    ana, fc = RC.hrrr_times(CAMP)
-    assert (len(ana), len(fc)) == (143, 18)
-    assert ana[0] == pd.Timestamp("2018-11-08 00:00", tz="UTC") and ana[-1] == pd.Timestamp("2018-11-25 18:00", tz="UTC")
+def test_hrrr_and_goes_times_cover_the_window_a_day_past_each_end():
+    ana, fc = RC.hrrr_times(CAMP)                        # perimeters 2018-11-09 .. 11-25 -> 11-08 00:00 .. 11-26 23:00
+    assert (len(ana), len(fc)) == (152, 19)
+    assert ana[0] == pd.Timestamp("2018-11-08 00:00", tz="UTC") and ana[-1] == pd.Timestamp("2018-11-26 21:00", tz="UTC")
     hours = RC.goes_hours(CAMP)
-    assert len(hours) == 428
+    assert len(hours) == 456
     g17 = [t for t, sats in hours if any(s == "G17" for s, _ in sats)]
-    assert g17[0] == pd.Timestamp("2018-11-15 00:00", tz="UTC") and len(g17) == 260
+    assert g17[0] == pd.Timestamp("2018-11-15 00:00", tz="UTC") and len(g17) == 288
 
 
 def test_channels_skip_fires_without_data():
     old, new = fire(year=2014, first="2014-08-01 00:00+00:00", last="2014-08-20 00:00+00:00"), \
         fire(year=2021, first="2021-07-14 00:00+00:00", last="2021-08-20 00:00+00:00")
     assert all(RC.applies(c, CAMP) is None for c in RC.CHANNELS)
-    assert {c for c in RC.CHANNELS if RC.applies(c, old)} == {"suppression", "landfire", "tessera", "goes", "lulc"}
+    assert {c for c in RC.CHANNELS if RC.applies(c, old)} == {"suppression", "landfire", "tessera", "goes", "lulc", "gfs"}
     assert {c for c in RC.CHANNELS if RC.applies(c, new)} == {"ics209"}
     assert RC.applies("hrrr", fire(year=2014, first="2014-06-01 00:00+00:00", last="2014-06-20 00:00+00:00"))
     assert RC.landfire_version(2017) == "LF2016" and RC.landfire_version(2024) == "LF2023" and RC.landfire_version(2016) is None

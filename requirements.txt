@@ -13,6 +13,7 @@ zarr
 pygrib
 h5py
 pyhdf
+earthengine-api
 huggingface_hub
 torch
 matplotlib
