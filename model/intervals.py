@@ -13,26 +13,47 @@ first one that did. For a forecast that starts at perimeter i, every cell gets, 
 Every later perimeter inside the horizon supervises the sample, not only the next one. A cell whose interval runs
 past the horizon (the model's hazard stops there) contributes "had not ignited by t_lo" (= lo[L]), so windows longer than the
 horizon are kept, not dropped; a sample whose next perimeter is already past the horizon carries no information. Perimeter times that are uncertain (database edit times, bare dates) widen the
-bounds outward by TIME_SLACK, so a label never claims more precision than the stamp has.
+bounds by slack() on the side the stamp is uncertain on, so a label never claims more precision than it has.
 """
 import numpy as np
 
 HORIZON_H = 72.0
-# (hours the true mapping time may be BEFORE the stamp, hours it may be AFTER), by time source (labels.npz
-# time_sources). An edit-time stamp is typically the 04-06 upload of a 21-23 flight (data.EDIT_LAG_H = 8):
-# allow up to 12 h earlier. A bare date: +-12 h. Unknown: +-8 h. ASSUMPTION, to be confirmed against the catalog.
-TIME_SLACK = {"mapped": (0.0, 0.0), "edit": (12.0, 0.0), "date_only": (12.0, 12.0), "unknown": (8.0, 8.0)}
+# How far a perimeter's true mapping time can be from its stamp, by time source (labels.npz time_sources). Settings
+# (train_hazard.py --mapped-slack-h / --edit-slack-h); the edit value should come from pipeline/measure_edit_delay.py.
+#   mapped     the mapping time itself: +-MAPPED_SLACK_H (rounding; 0 by default)
+#   edit       a database edit time: the map was made AT OR BEFORE it, by an unknown amount. Only the earlier side
+#              moves: [stamp - EDIT_SLACK_H, stamp]. Widening the later side would tell the model a cell might have
+#              burned after a map already showed it burned.
+#   date_only  mapped sometime that local day: [local midnight, next local midnight] (Fire.time_bounds handles the
+#              two ways a bare date was stored; on its own the stamp is taken as local midnight)
+#   unknown    no record of the source: earlier side as an edit time, later side UNKNOWN_AFTER_H
+MAPPED_SLACK_H = 0.0
+EDIT_SLACK_H = 16.0          # until measured: too little slack teaches wrong timing, too much costs a little precision
+UNKNOWN_AFTER_H = 8.0
 
 
-def perimeter_bounds(times_h, sources=None, slack=None):
-    """Earliest and latest possible true time of every perimeter (hours, same origin as times_h)."""
-    slack = TIME_SLACK if slack is None else slack
+def slack(source, day_extra_h=0.0):
+    """(hours the true time may be BEFORE the stamp, hours it may be AFTER) for one perimeter."""
+    s = str(source)
+    if s == "mapped":
+        return MAPPED_SLACK_H, MAPPED_SLACK_H
+    if s == "edit":
+        return EDIT_SLACK_H, 0.0
+    if s == "date_only":
+        return 0.0, 24.0 + day_extra_h
+    return EDIT_SLACK_H, UNKNOWN_AFTER_H
+
+
+def perimeter_bounds(times_h, sources=None, day_extra_h=None):
+    """Earliest and latest possible true time of every perimeter (hours, same origin as times_h).
+    day_extra_h: per perimeter, hours to add to the end of a bare date's day (a date stored as 00:00 UTC whose local
+    day ends later than 24 h after it)."""
     t = np.asarray(times_h, np.float64)
     if sources is None:
         return t.copy(), t.copy()
-    before = np.array([slack.get(str(s), slack["unknown"])[0] for s in sources])
-    after = np.array([slack.get(str(s), slack["unknown"])[1] for s in sources])
-    return t - before, t + after
+    extra = np.zeros(len(t)) if day_extra_h is None else np.asarray(day_extra_h, np.float64)
+    sl = np.array([slack(s, e) for s, e in zip(sources, extra)]).reshape(len(t), 2)
+    return t - sl[:, 0], t + sl[:, 1]
 
 
 def interval_labels(arrival, i, lo, hi, horizon_h=HORIZON_H, bad=None, exclude=None):

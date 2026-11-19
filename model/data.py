@@ -602,7 +602,13 @@ class Fire:
         """Earliest / latest true time of every perimeter, hours from perimeter i's stamp."""
         import intervals as IV
         rel = (self.times - self.times[i]).total_seconds().values / 3600
-        return IV.perimeter_bounds(rel, getattr(self, "time_src", None))
+        src = getattr(self, "time_src", None)
+        # a bare date is stored either as 00:00 UTC on the date (NIFS) or as local midnight converted to UTC (GeoMAC).
+        # Both start the bound at the stamp (for 00:00 UTC that is earlier than local midnight: wide, never wrong);
+        # for 00:00 UTC the local day ends -lon/15 h after stamp + 24 h.
+        utc0 = (self.times.hour == 0) & (self.times.minute == 0) & (self.times.second == 0)
+        extra = np.where(utc0, max(0.0, -self.g["transform"][2] / 15), 0.0)
+        return IV.perimeter_bounds(rel, src, extra)
 
     def intervals(self, i, win, horizon_h=72.0, qc=True):
         """Interval-censored burn times (intervals.py) for a forecast from perimeter i, inside window win.

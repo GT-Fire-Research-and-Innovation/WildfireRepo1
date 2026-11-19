@@ -27,6 +27,7 @@ sys.path.insert(0, str(HERE.parent))
 sys.path.insert(0, str(HERE))
 import data as D  # noqa: E402
 import hazard as HZ  # noqa: E402
+import intervals as IV  # noqa: E402
 import train_hybrid as TH  # noqa: E402
 
 HORIZON = HZ.N_BINS * HZ.BIN_H
@@ -180,7 +181,12 @@ def main():
     ap.add_argument("--fuel-moisture", type=int, default=1)
     ap.add_argument("--fuel-frac", type=int, default=0)
     ap.add_argument("--wind-terrain", type=int, default=0)
+    ap.add_argument("--edit-slack-h", type=float, default=IV.EDIT_SLACK_H,
+                    help="an edit-time stamp may be this many hours after the real mapping (only the earlier bound moves); "
+                         "use about the 90th percentile from pipeline/measure_edit_delay.py")
+    ap.add_argument("--mapped-slack-h", type=float, default=IV.MAPPED_SLACK_H, help="rounding of real mapping times (+-)")
     a = ap.parse_args()
+    IV.EDIT_SLACK_H, IV.MAPPED_SLACK_H = a.edit_slack_h, a.mapped_slack_h      # set before the loader workers start
     runs = Path(a.data) / "runs"
     runs.mkdir(parents=True, exist_ok=True)
     ck = runs / f"{a.name}.ckpt"
@@ -193,7 +199,8 @@ def main():
         split = {"train": split["train"][:max(1, k * 3 // 5)], "val": split["val"][:max(1, k // 5)], "test": split["test"][:max(1, k // 5)]}
     from collections import Counter
     src = Counter(t for f in fires for t in getattr(f, "time_src", []))
-    print("  perimeter time sources (bounds widen for all but 'mapped', intervals.TIME_SLACK): "
+    print(f"  slack: edit stamps up to {IV.EDIT_SLACK_H:g} h after mapping, mapped +-{IV.MAPPED_SLACK_H:g} h, bare dates the whole local day; "
+          "perimeter time sources: "
           + ", ".join(f"{k} {v}" for k, v in src.most_common()), flush=True)
     D.PHYSICS_V2 = True                                  # unet3 uses the crown-fire / ember group
     D.WIND_TERRAIN = D.wind_file(a.wind_terrain)
@@ -253,7 +260,8 @@ def main():
             "fuel_frac": bool(a.fuel_frac), "fuel_moisture": bool(a.fuel_moisture), "fm_physics": False,
             "data_version": D.DATA_VERSION, "input_version": D.INPUT_VERSION, "weather": D.WEATHER_MODE,
             "arch": {"time": D.TEMPORAL, "attn": bool(a.u3_attn)}, "width": a.width, "hidden": a.hidden,
-            "n_bins": HZ.N_BINS, "bin_h": HZ.BIN_H, "val": best[2], "test": mt, "history": hist, "pairs": rows,
+            "n_bins": HZ.N_BINS, "bin_h": HZ.BIN_H,
+            "edit_slack_h": IV.EDIT_SLACK_H, "mapped_slack_h": IV.MAPPED_SLACK_H, "val": best[2], "test": mt, "history": hist, "pairs": rows,
             "params": sum(p.numel() for p in model.parameters())}
     json.dump(meta, open(runs / f"{a.name}.json", "w"), indent=1, default=float)
     print(f"[{a.name}] TEST AP {mt['ap']:.3f} F1 {mt['f1']:.3f} area {mt['area_ratio']:.2f} (old-style, next perimeter)  interval NLL {mt['interval_nll']:.4f}  "

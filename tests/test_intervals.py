@@ -73,18 +73,57 @@ def test_horizon_and_last_perimeter_censoring():
     assert v[s6].all() and np.allclose(a[s6], 0) and np.allclose(b[s6], 40)          # (80, 120] is (0, 40] from 80 h
 
 
-def test_uncertain_times_widen_the_bounds_outward():
+@pytest.fixture
+def slack12():
+    keep = IV.EDIT_SLACK_H, IV.MAPPED_SLACK_H
+    IV.EDIT_SLACK_H, IV.MAPPED_SLACK_H = 12.0, 0.0
+    yield
+    IV.EDIT_SLACK_H, IV.MAPPED_SLACK_H = keep
+
+
+def test_uncertain_times_widen_only_the_uncertain_side(slack12):
     T, arr = known_fire()
     src = ["mapped", "date_only", "edit", "mapped", "mapped", "mapped", "mapped"]
     lo, hi = IV.perimeter_bounds(TIMES, src)
     t_lo, t_hi, valid = IV.interval_labels(arr, 0, lo, hi)
-    assert np.allclose(t_hi[arr == 1], 5 + 12)        # bare date: could be 12 h later
-    assert np.allclose(t_lo[arr == 2], 0)             # ... or 12 h earlier (clipped at the start)
-    assert np.allclose(t_hi[arr == 2], 26)            # edit time: never later than the stamp
-    assert np.allclose(t_lo[arr == 3], 26 - 12)       # ... but up to 12 h earlier
-    rel = T
-    ev = valid & np.isfinite(t_hi)
-    assert (t_lo[ev] < rel[ev]).all() and (rel[ev] <= t_hi[ev]).all()
+    assert np.allclose(t_hi[arr == 1], 5 + 24)        # bare date stamped at local midnight: any time that day ...
+    assert np.allclose(t_lo[arr == 2], 5)             # ... but never before the day began
+    assert np.allclose(t_hi[arr == 2], 26)            # edit time: the map existed by the stamp, so "burned by" holds
+    assert np.allclose(t_lo[arr == 3], 26 - 12)       # ... and "not burned at that map" moves earlier
+    lo2, hi2 = IV.perimeter_bounds(TIMES, src, day_extra_h=[0, 8, 0, 0, 0, 0, 0])
+    assert np.isclose(hi2[1], 5 + 32) and np.isclose(lo2[1], 5)      # date stored as 00:00 UTC at lon -120
+    IV.MAPPED_SLACK_H = 1.0
+    lo3, hi3 = IV.perimeter_bounds(TIMES, ["mapped"] * len(TIMES))
+    assert np.allclose(hi3 - TIMES, 1) and np.allclose(TIMES - lo3, 1)
+
+
+@pytest.mark.parametrize("seed", range(5))
+def test_true_burn_time_stays_inside_when_stamps_are_wrong(seed, slack12):
+    """True mapping times differ from the stamps the way each source allows: an edit stamp comes 0-12 h AFTER the
+    real map, a bare date is any hour of its day. Arrival comes from the TRUE times, labels from the stamps."""
+    rng = np.random.default_rng(seed)
+    T, _ = known_fire()
+    true = np.concatenate([[0.0], np.cumsum(rng.uniform(3, 30, 6))])
+    src = ["mapped"] + list(rng.choice(["mapped", "edit", "date_only"], 6))
+    stamp = true.copy()
+    for k, s_ in enumerate(src):
+        if s_ == "edit":
+            stamp[k] = true[k] + rng.uniform(0, 12)
+        elif s_ == "date_only":
+            stamp[k] = true[k] - rng.uniform(0, 24)        # the stamp is the day's midnight, before the real map
+    stamp[0], src[0] = 0.0, "mapped"
+    arr = np.full(T.shape, -1, np.int64)
+    for k in range(len(true) - 1, -1, -1):
+        arr[T <= true[k]] = k
+    for i in range(len(true) - 1):
+        lo, hi = IV.perimeter_bounds(stamp - stamp[i], src)
+        t_lo, t_hi, valid = IV.interval_labels(arr, i, lo, hi)
+        # hours from the start as the model sees it. An edit-stamped START map is older than its stamp, so some cells
+        # truly burned before t_i; the hazard starts at 0, so for them the right label is (0, t_hi]
+        rel = np.maximum(T - stamp[i], 0.0)
+        ev, cen = valid & np.isfinite(t_hi), valid & np.isinf(t_hi)
+        assert (t_lo[ev] <= rel[ev] + 1e-6).all() and (rel[ev] <= t_hi[ev] + 1e-6).all(), (seed, i, src)
+        assert (rel[cen] >= t_lo[cen] - 1e-6).all(), (seed, i, src)
 
 
 def test_untrusted_burns_keep_only_not_burned_before():
@@ -197,4 +236,5 @@ def test_fire_without_time_sources_is_widened_as_unknown(tmp_path, clean):
     f = make_fire(tmp_path)                       # no time_sources in labels.npz, no catalog: every stamp "unknown"
     t_lo, t_hi, _ = f.intervals(0, (0, H, 0, W), 72.0)
     assert set(f.time_src) == {"unknown"}
-    assert np.allclose(t_hi[f.arrival == 1], 6 + 8) and np.allclose(t_lo[f.arrival == 3], 30 - 8)
+    assert np.allclose(t_hi[f.arrival == 1], 6 + IV.UNKNOWN_AFTER_H)
+    assert np.allclose(t_lo[f.arrival == 3], max(30 - IV.EDIT_SLACK_H, 0))
