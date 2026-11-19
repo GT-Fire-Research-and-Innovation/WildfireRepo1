@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fah"
+version = "1.0.0"
+description = "Raw upstream data of every fire in the wildfire spread dataset, fetched one channel at a time into a Hugging Face repo"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["numpy", "pandas", "requests", "huggingface_hub>=0.24"]
+
+[project.optional-dependencies]
+channels = ["affine", "earthengine-api", "geopandas", "h5py", "netCDF4", "pygrib", "pyhdf", "pyogrio", "pyproj",
+            "rasterio", "shapely"]
+dev = ["pytest", "ruff"]
+
+[project.scripts]
+fah = "fah.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["fah*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "--import-mode=importlib"
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["E501"]           # test data: whole URLs and expected strings read better unsplit

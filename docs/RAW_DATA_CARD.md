@@ -10,7 +10,7 @@ This repo holds the upstream data behind the built dataset
 Each fire gets the original records, values and grids of every source, cut to its region (the box around all
 its perimeters pushed out 32 km on every side) over its time window (below). Nothing is regridded or derived:
 this is a raw layer to cut training tiles from, never to train on as it stands.
-Made by `pipeline/raw_grab.py` on the `data_grab_satfire` branch of
+Made by the `fah` package (`python -m fah`) on the `data_grab_satfire` branch of
 https://github.com/GT-Fire-Research-and-Innovation/WildfireRepo1, one channel at a time
 (`notebooks/kaggle_data_grab.ipynb`).
 
