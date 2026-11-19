@@ -344,3 +344,119 @@ def test_ncseries_keeps_packed_values(tmp_path):
         v.set_auto_maskandscale(True)
         assert v[0][0, 1] == 1.0 and np.ma.is_masked(v[0][1, 1])
         assert list(ds.variables["time"][:]) == [10, 20] and ds.variables["source"][1] == "s3://b/k2"
+
+
+# ------------------------------------------------------------------------------------- goes: damaged files
+
+def _fdcc(path, n=40, seed=0):
+    """A small FDCC-like file: the fire variables packed in zlib chunks, the ABI fixed-grid x / y, the projection."""
+    import netCDF4
+    import numpy as np
+    rng = np.random.default_rng(seed)
+    with netCDF4.Dataset(path, "w") as ds:
+        ds.createDimension("y", n)
+        ds.createDimension("x", n)
+        for nm, vals in (("x", np.linspace(-0.1, 0.1, n)), ("y", np.linspace(0.1, -0.1, n))):
+            v = ds.createVariable(nm, "i2", (nm,))
+            v.scale_factor, v.add_offset = 1e-5, 0.0
+            v[:] = vals
+        ds.createVariable("goes_imager_projection", "i4").longitude_of_projection_origin = -75.0
+        for nm, dt in (("Mask", "i2"), ("Power", "f4"), ("Area", "u2"), ("Temp", "u2"), ("DQF", "u1")):
+            v = ds.createVariable(nm, dt, ("y", "x"), zlib=True, chunksizes=(20, 20))
+            v[:] = rng.integers(0, 100, (n, n)).astype(dt)
+    return Path(path).read_bytes()
+
+
+def _break_chunks(data, tmp_path):
+    """The same file with Mask's compressed chunks overwritten: it still opens, reading Mask fails."""
+    h5py = pytest.importorskip("h5py")
+    p = tmp_path / "probe.nc"
+    p.write_bytes(data)
+    with h5py.File(p, "r") as f:
+        m = f["Mask"].id
+        chunks = [m.get_chunk_info(i) for i in range(m.get_num_chunks())]
+    b = bytearray(data)
+    for c in chunks:
+        b[c.byte_offset:c.byte_offset + c.size] = b"\xff" * c.size
+    return bytes(b)
+
+
+class _Resp:
+    def __init__(self, content, headers=None):
+        self.content, self.headers, self.text = content, headers or {}, content.decode("latin-1")
+
+    def raise_for_status(self):
+        pass
+
+
+class _S3:
+    """Bucket listings, and objects with their ETag (MD5); garble[key] = how many times it arrives cut short."""
+
+    def __init__(self, objs, garble=None):
+        self.objs, self.garble, self.got = objs, dict(garble or {}), []
+
+    def get(self, url, params=None, timeout=None):
+        import hashlib
+        if params:
+            return _Resp("".join(f"<Key>{k}</Key>" for k in sorted(self.objs) if k.startswith(params["prefix"])).encode())
+        key = url.split(".amazonaws.com/")[1]
+        self.got.append(key)
+        data = self.objs[key]
+        etag = hashlib.md5(data).hexdigest()
+        if self.garble.get(key):
+            self.garble[key] -= 1
+            data = data[:len(data) // 2]
+        return _Resp(data, {"ETag": f'"{etag}"'})
+
+
+class _GoesCtx:
+    def __init__(self, root, sess):
+        self.root, self.sess, self.threads = root, sess, 2
+
+    def stage(self, fid):
+        p = self.root / "stage" / fid / "goes"
+        p.mkdir(parents=True, exist_ok=True)
+        return p
+
+    def tmp(self):
+        p = self.root / "tmp"
+        p.mkdir(parents=True, exist_ok=True)
+        return p
+
+    def drop_stage(self, fid):
+        pass
+
+    def expired(self):
+        return False
+
+
+def test_goes_skips_a_damaged_scan_instead_of_stopping_the_channel(tmp_path, monkeypatch):
+    netCDF4 = pytest.importorskip("netCDF4")
+    import numpy as np
+    import build_multiyear as BM
+    good, good2 = _fdcc(tmp_path / "a.nc", seed=1), _fdcc(tmp_path / "b.nc", seed=2)
+    bad = _break_chunks(good, tmp_path)
+    with netCDF4.Dataset("mem", memory=bad) as ds:          # the Kaggle failure: opens, then the read fails
+        with pytest.raises(RuntimeError, match="HDF error"):
+            ds.variables["Mask"][:]
+    hours = [pd.Timestamp("2018-11-09 00:00", tz="UTC") + pd.Timedelta(hours=h) for h in range(3)]
+
+    def key(t, minute):
+        return (f"ABI-L2-FDCC/{t.year}/{t.dayofyear:03d}/{t.hour:02d}/"
+                f"OR_ABI-L2-FDCC-M6_G16_s{t.year}{t.dayofyear:03d}{t.hour:02d}{minute:02d}171_e0_c0.nc")
+    objs = {key(hours[0], 1): bad, key(hours[0], 6): good2, key(hours[0], 11): good,   # nearest corrupt in bucket
+            key(hours[1], 1): good, key(hours[1], 6): good2,                            # nearest garbled once in transit
+            key(hours[2], 1): bad, key(hours[2], 6): bad}                               # nothing readable that hour
+    s3 = _S3(objs, garble={key(hours[1], 1): 1})
+    lat, lon = np.meshgrid(np.linspace(44, 36, 40), np.linspace(-125, -117, 40), indexing="ij")
+    monkeypatch.setattr(BM, "_goes_latlon", lambda ds: (lat.astype("f4"), lon.astype("f4")))
+    monkeypatch.setattr(RC, "goes_hours", lambda f: [(t, [("G16", "bkt")]) for t in hours])
+    monkeypatch.setattr(RC.time, "sleep", lambda s: None)
+
+    out = list(RC.grab_goes_many([CAMP], _GoesCtx(tmp_path / "w", s3)))
+
+    assert [(f["fire_id"], status) for f, status, _, _ in out] == [(CAMP["fire_id"], "ok")]
+    assert s3.got.count(key(hours[1], 1)) == 2                                         # downloaded again after the MD5 check
+    with netCDF4.Dataset(tmp_path / "w" / "stage" / CAMP["fire_id"] / "goes" / "goes_G16.nc") as ds:
+        assert list(ds.variables["source"][:]) == [f"s3://bkt/{key(hours[0], 6)}", f"s3://bkt/{key(hours[1], 1)}"]
+        assert ds.variables["Mask"].shape[0] == 2 and ds.variables["Mask"][:].mask.sum() == 0
