@@ -7,6 +7,7 @@ Built for Kaggle (notebooks/kaggle_data_grab.ipynb) but runs anywhere with inter
   python pipeline/raw_grab.py --status --hf-repo you/wildfire-raw-2014-2025
   python pipeline/raw_grab.py --links  --hf-repo you/wildfire-raw-2014-2025          # per-fire links files
   python pipeline/raw_grab.py --extents --hf-repo you/wildfire-raw-2014-2025         # after firms: windows, ignition
+  python pipeline/raw_grab.py --repack --channel perimeters --hf-repo you/wildfire-raw-2014-2025  # gzip old GeoJSON
   python pipeline/raw_grab.py --channel history --ids F2003403265 --dry-run --work /tmp/raw   # local test
 
 How a run works
@@ -23,7 +24,11 @@ How a run works
   3. Each fire is fetched into a staging folder, then moved into the current batch. A batch is uploaded as one
      commit when it reaches --batch-gb or --batch-fires, when disk runs low, or before the deadline, together
      with its manifest file; the local copy is deleted right after. A failed upload keeps the batch on disk.
-  4. One-time shared downloads (archive geodatabases, ICS-209-PLUS, OSM snapshots) are deleted when the
+     A fire fetched again replaces its folder: the same commit deletes the channel's older files of that fire.
+  4. Files: GeoJSON is gzipped with a fixed header (.geojson.gz); viirs is one viirs.nc per fire. Rows that
+     list the older names (plain .geojson) count as not done; --repack gzips such files in place instead of
+     fetching again (perimeters: it keeps the build box, so the region change does not refetch it).
+  5. One-time shared downloads (archive geodatabases, ICS-209-PLUS, OSM snapshots) are deleted when the
      channel ends (OSM: after each region-year).
 
 Target repo layout
@@ -148,7 +153,8 @@ def done_ids(manifest, channel=None, fires=None):
     done = last.status.isin(DONE)
     need = RC.expected_files(channel) if channel else None
     if need:
-        listed = last["files"].fillna("").astype(str).map(lambda s: set(s.split(";")))
+        col = last["files"] if "files" in last else pd.Series("", index=last.index)
+        listed = col.fillna("").astype(str).map(lambda s: set(s.split(";")))
         done &= (last.status != "ok") | listed.map(need.issubset)
     for col, chans, label in (("window", RC.WINDOW_CHANNELS, RC.window_label), ("region", RC.REGION_CHANNELS, RC.region_label)):
         if channel in chans and fires is not None:
@@ -171,6 +177,7 @@ class Batcher:
         self.dry_run, self.keep = dry_run, keep or dry_run
         self.uploaded_shared = set(uploaded_shared)
         self.rows, self.bytes, self.dir, self.k = [], 0, None, 0
+        self.replace = []           # fires/<id>/<channel>/* of the fires in this batch: older files are deleted
         self.totals = {"ok": 0, "empty": 0, "n/a": 0, "error": 0, "bytes": 0, "batches": 0}
 
     def _open(self):
@@ -190,7 +197,8 @@ class Batcher:
         self.bytes += dst.stat().st_size
         self.uploaded_shared.add(repo_path)
 
-    def add(self, fire, status, stage_dir=None, sources=(), error=""):
+    def add(self, fire, status, stage_dir=None, sources=(), error="", labels=None):
+        """labels: (window, region) to record instead of the fire's current ones (--repack keeps the old)."""
         files, nbytes = [], 0
         if stage_dir is not None and Path(stage_dir).exists():
             dst = self._open() / "fires" / fire["fire_id"] / self.channel
@@ -208,7 +216,10 @@ class Batcher:
                               sources=SEP.join(RC.redact(s) for s in sources),
                               fetched_utc=datetime.now(timezone.utc).isoformat(timespec="seconds"),
                               error=RC.redact(error)[:500],        # manifests are published: no keys, no email
-                              window=RC.window_label(self.channel, fire), region=RC.region_label(self.channel, fire)))
+                              **dict(zip(("window", "region"), labels or (RC.window_label(self.channel, fire),
+                                                                          RC.region_label(self.channel, fire))))))
+        if status in ("ok", "empty"):            # a new result: whatever this fire had in the channel before goes
+            self.replace.append(f"fires/{fire['fire_id']}/{self.channel}/*")
         self.bytes += nbytes
         self.totals[status if status in self.totals else "error"] += 1
         self.totals["bytes"] += nbytes
@@ -231,7 +242,8 @@ class Batcher:
         if not self.dry_run:
             for attempt in range(6):
                 try:
-                    self.api.upload_folder(repo_id=self.repo, folder_path=str(self.dir), repo_type="dataset", commit_message=msg)
+                    self.api.upload_folder(repo_id=self.repo, folder_path=str(self.dir), repo_type="dataset",
+                                           commit_message=msg, delete_patterns=self.replace or None)
                     break
                 except Exception as ex:  # noqa: BLE001  (rate limits, transient 5xx)
                     if attempt == 5:
@@ -243,7 +255,7 @@ class Batcher:
         self.totals["batches"] += 1
         if not self.keep:
             shutil.rmtree(self.dir, ignore_errors=True)
-        self.dir, self.rows, self.bytes = None, [], 0
+        self.dir, self.rows, self.bytes, self.replace = None, [], 0, []
         self.k += 1
 
 
@@ -620,6 +632,64 @@ def status(a):
     return 0
 
 
+# ------------------------------------------------------------------------------------- repack in place
+
+REPACK_CHANNELS = ("perimeters", "history", "suppression")
+
+
+def repack(a):
+    """Gzip a channel's plain .geojson files already in the repo (fires whose latest row is 'ok' and lists only
+    .geojson files): download each, write <name>.geojson.gz with the fixed header, commit it in place of the old
+    file with a new manifest row (same sources; window / region of the old row; note: when it was fetched).
+    For channels the next run does not fetch again anyway: perimeters keeps the build box."""
+    import pandas as pd
+    from huggingface_hub import HfApi, hf_hub_download
+    ch = a.channel or "perimeters"
+    if ch not in REPACK_CHANNELS:
+        raise SystemExit(f"--repack works on {', '.join(REPACK_CHANNELS)}, not {ch}")
+    api = HfApi(token=os.environ.get("HF_TOKEN") or None)
+    if not a.dry_run:
+        check_hf(api, a.hf_repo)
+    work = Path(a.work)
+    m = read_manifests(api, a.hf_repo, ch)
+    if not len(m):
+        print(f"repack {ch}: no manifest rows", flush=True)
+        return 0
+    last = m.sort_values("fetched_utc").groupby("fire_id").tail(1)
+    if a.ids:
+        last = last[last.fire_id.isin(set(a.ids))]
+    names = last["files"].fillna("").astype(str).map(lambda x: [f for f in x.split(";") if f])
+    todo = last[(last.status == "ok") & names.map(lambda fs: bool(fs) and all(f.endswith(".geojson") for f in fs))]
+    if a.limit:
+        todo = todo.head(a.limit)
+    print(f"repack {ch}: {len(todo)} of {len(last)} fires have plain .geojson", flush=True)
+    b = Batcher(api, a.hf_repo, ch, work, a.batch_gb, a.batch_fires, a.min_free_gb, a.dry_run, a.keep)
+    dl, t0 = work / "repack_download", time.time()
+    for k, r in enumerate(todo.to_dict("records"), 1):
+        stage = work / "repack_stage" / r["fire_id"] / ch
+        shutil.rmtree(stage, ignore_errors=True)
+        stage.mkdir(parents=True)
+        try:
+            for name in r["files"].split(";"):
+                src = hf_hub_download(a.hf_repo, f"fires/{r['fire_id']}/{ch}/{name}", repo_type="dataset",
+                                      token=api.token, local_dir=str(dl))
+                RC.gzip_copy(src, stage / f"{name}.gz")
+                Path(src).unlink()
+        except Exception as ex:  # noqa: BLE001  (left as it is; the next --repack tries again)
+            shutil.rmtree(stage, ignore_errors=True)
+            print(f"[{k}/{len(todo)}] {r['fire_id']}: skipped, {RC.redact(str(ex))[:150]}", flush=True)
+            continue
+        fire = {"fire_id": r["fire_id"], "name": r.get("name", ""), "year": r.get("year", "")}
+        b.add(fire, "ok", stage, [x for x in str(r.get("sources") or "").split(SEP) if x],
+              f"gzip of the files fetched {r['fetched_utc']}", labels=(r.get("window", ""), r.get("region", "")))
+        print(f"[{k}/{len(todo)}] {r['fire_id']} {r.get('name', '')}: repacked  ({(time.time() - t0) / 60:.0f} min)", flush=True)
+    b.upload()
+    shutil.rmtree(dl, ignore_errors=True)
+    t = b.totals
+    print(f"repack {ch}: {t['ok']} fires, {t['bytes'] / 1e9:.2f} GB in {t['batches']} batch(es)", flush=True)
+    return 0
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--channel", choices=RC.CHANNELS)
@@ -630,6 +700,8 @@ def main(argv=None):
     ap.add_argument("--links-chunk", type=int, default=500, help="fires per commit for --links")
     ap.add_argument("--extents", action="store_true",
                     help=f"write {RC.EXTENTS_FILE} (each fire's time window, ignition point, region) from the firms files; run after firms")
+    ap.add_argument("--repack", action="store_true",
+                    help=f"gzip the plain .geojson files already in --hf-repo for --channel ({', '.join(REPACK_CHANNELS)}; default perimeters)")
     ap.add_argument("--extents-file", help=f"read the extents from this local file instead of {RC.EXTENTS_FILE} in --hf-repo")
     ap.add_argument("--local-manifests", help="--links / --extents: read manifests (and firms files) from local --dry-run batches under this folder")
     ap.add_argument("--hf-repo", help="target dataset repo, e.g. you/wildfire-raw-2014-2025")
@@ -671,6 +743,10 @@ def main(argv=None):
         if not a.hf_repo and not a.local_manifests:
             ap.error("--extents needs --hf-repo (or --local-manifests with --dry-run)")
         return build_extents(a)
+    if a.repack:
+        if not a.hf_repo:
+            ap.error("--repack needs --hf-repo")
+        return repack(a)
     if not a.channel:
         ap.error("--channel is required")
     if not a.hf_repo and not a.dry_run:

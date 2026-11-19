@@ -258,32 +258,52 @@ def test_viirs_granule_is_cropped_on_the_swath_for_each_fire(tmp_path, monkeypat
               ("02MOD", (32, 40), mlat, mlon), ("03MOD", (32, 40), mlat, mlon))}
     entry = {"sat": "SNPP", "daynight": "Day", "start": "2018-11-10T20:48:00.000Z",
              **{p: f"https://data.laadsdaac.earthdatacloud.nasa.gov/prod-lads/VNP{p}/VNP{p}.A2018314.2048.002.x.nc" for p in files}}
-    key = ("SNPP", "A2018314", "2048")
+    key, key2 = ("SNPP", "A2018314", "2048"), ("SNPP", "A2018314", "0930")
+    entry2 = {**entry, "daynight": "Night", "start": "2018-11-10T09:30:00.000Z",
+              **{p: u.replace(".2048.", ".0930.") for p, u in entry.items() if p in files}}
     monkeypatch.setattr(ED, "open_remote", lambda sess, url, token=None: open(files[url.split("/VNP")[1][:5]], "rb"))
-    monkeypatch.setattr(RC, "viirs_granules", lambda sess, f: {key: entry} if f["fire_id"] != "far" else {})
+    monkeypatch.setattr(RC, "viirs_granules", lambda sess, f: {key: entry, key2: entry2} if f["fire_id"] != "far" else {})
     monkeypatch.setattr(RC, "VIIRS_POOL", "thread")
     near, far = fire(), fire(fire_id="far", bounds=[0, 0, 1, 1])
     res = {f["fire_id"]: (s, src, err) for f, s, src, err in RC.grab_viirs_many([near, far], Ctx(tmp_path))}
-    assert res["far"][0] == "empty" and res[near["fire_id"]][0] == "ok" and res[near["fire_id"]][1] == [entry["02IMG"]]
+    assert res["far"][0] == "empty" and res[near["fire_id"]][0] == "ok"
+    assert sorted(res[near["fire_id"]][1]) == sorted([entry["02IMG"], entry2["02IMG"]])
 
-    out = tmp_path / "stage" / near["fire_id"] / "viirs" / "SNPP_2018-11-10T2048_day.nc"
+    stage = tmp_path / "stage" / near["fire_id"] / "viirs"
+    assert sorted(p.name for p in stage.iterdir()) == ["viirs.nc"]               # one file per fire, no .part left
     mw = ED.swath_window(mlat, mlon, RC.area(near))
     mr0, mr1, mc0, mc1 = RC._grow(mw, 1, (32, 40))
     ir0, ir1, ic0, ic1 = ED.m_to_i((mr0, mr1, mc0, mc1), (64, 80))
-    with netCDF4.Dataset(out) as ds:
-        for v in ds.variables.values():
+    w, s_, e, n = RC.buffer_box(RC.area(near), RC.VIIRS_MASK_PAD_KM)
+    la, lo = ilat[ir0:ir1, ic0:ic1], ilon[ir0:ir1, ic0:ic1]
+    out_i = ~((la >= s_) & (la <= n) & (lo >= w) & (lo <= e))
+    mla, mlo = mlat[mr0:mr1, mc0:mc1], mlon[mr0:mr1, mc0:mc1]
+    out_m = ~((mla >= s_) & (mla <= n) & (mlo >= w) & (mlo <= e))
+    assert out_i.any() and (~out_i).any()                                      # the window reaches past the region
+    with netCDF4.Dataset(stage / "viirs.nc") as ds:
+        assert list(ds["granule"][:]) == ["SNPP_2018-11-10T0930_night", "SNPP_2018-11-10T2048_day"]   # in time order
+        assert list(ds["day_night"][:]) == ["Night", "Day"] and ds.n_granules == 2 and ds.fire_id == near["fire_id"]
+        luts = ds.groups["luts"].variables
+        assert len(luts) == 1 and next(iter(luts.values())).shape == (65536,)  # one table for both granules
+        g = ds.groups["SNPP_2018-11-10T2048_day"]
+        assert ds[g.I04_brightness_temperature_lut].source_name == "I04_brightness_temperature_lut"
+        assert ds.groups["SNPP_2018-11-10T0930_night"].I04_brightness_temperature_lut == g.I04_brightness_temperature_lut
+        for v in g.variables.values():
             v.set_auto_maskandscale(False)
-        src = np.arange(64 * 80).reshape(64, 80)
-        assert (ds["I01"][:] == src[ir0:ir1, ic0:ic1]).all() and (ds["I04"][:] == src[ir0:ir1, ic0:ic1] + 3000).all()
-        assert ds["I04"]._FillValue == 65535 and ds["I04"].scale_factor == np.float32(2e-5)
-        assert ds["I04_brightness_temperature_lut"].shape == (65536,) and "I05_quality_flags" in ds.variables
-        assert (ds["latitude"][:] == ilat[ir0:ir1, ic0:ic1].astype("f4")).all() and ds["sensor_zenith"].scale_factor == np.float32(0.01)
-        assert (ds["M11"][:] == np.arange(32 * 40).reshape(32, 40)[mr0:mr1, mc0:mc1] + 1000).all() and "M10" not in ds.variables
-        assert (ds["m_latitude"][:] == mlat[mr0:mr1, mc0:mc1].astype("f4")).all()
-        lat = ds["latitude"][:]
+        src = np.arange(64 * 80).reshape(64, 80)[ir0:ir1, ic0:ic1]
+        i01, i04 = g["I01"][:], g["I04"][:]
+        assert (i01[~out_i] == src[~out_i]).all() and (i01[out_i] == 65535).all()     # outside the region: fill
+        assert (i04[~out_i] == src[~out_i] + 3000).all() and g.blanked_pixels_i == int(out_i.sum())
+        assert g["I04"]._FillValue == 65535 and g["I04"].scale_factor == np.float32(2e-5) and "I05_quality_flags" in g.variables
+        assert (g["latitude"][:] == la.astype("f4")).all() and g["sensor_zenith"].scale_factor == np.float32(0.01)
+        m11 = g["M11"][:]
+        msrc = np.arange(32 * 40).reshape(32, 40)[mr0:mr1, mc0:mc1] + 1000
+        assert (m11[~out_m] == msrc[~out_m]).all() and (m11[out_m] == 65535).all() and "M10" not in g.variables
+        assert (g["m_latitude"][:] == mla.astype("f4")).all()
+        lat = g["latitude"][:]
         reg = RC.area(near)                                        # cut to the fire's region, not the build's box
         assert lat.min() <= reg[1] + 0.07 and lat.max() >= reg[3] - 0.07
-        assert ds.day_night == "Day" and ds.source_DayNightFlag == "Day" and ds.i_window_rows_cols == f"{ir0}:{ir1},{ic0}:{ic1}"
+        assert g.day_night == "Day" and g.source_DayNightFlag == "Day" and g.i_window_rows_cols == f"{ir0}:{ir1},{ic0}:{ic1}"
 
 
 def test_viirs_granule_failures_are_notes_unless_all_fail(tmp_path, monkeypatch):

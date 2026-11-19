@@ -9,12 +9,12 @@ span / fire_extent), plus a day on each side. Whole-CONUS sources (HRRR, GFS, GO
 their native grid with untouched values; every file's source URL is logged in the manifest.
 
 Channels (cheap -> heavy) and what each writes into fires/<fire_id>/<channel>/:
-  history      Interagency Fire Perimeter History, every prior fire in the box   history.geojson
-  perimeters   NIFC GeoMAC / NIFS / Operational Data Archive records of the fire  records.geojson
+  history      Interagency Fire Perimeter History, every prior fire in the box   history.geojson.gz
+  perimeters   NIFC GeoMAC / NIFS / Operational Data Archive records of the fire  records.geojson.gz
   firms        NASA FIRMS VIIRS active fire (SP, + NRT fill 2024+)               <SOURCE>.csv.gz
   gridmet      GRIDMET daily, 13 variables incl. pr/tmmn/sph/pdsi (THREDDS NCSS) gridmet_<var>.nc
   ics209       ICS-209-PLUS incident + sitrep rows (fires <= 2020)              incidents.csv, sitreps.csv
-  suppression  NIFS / ODA EventLine + EventPolygon, every archived version (2018+) event_lines.geojson, event_polygons.geojson
+  suppression  NIFS / ODA EventLine + EventPolygon, every archived version (2018+) event_lines.geojson.gz, event_polygons.geojson.gz
   tessera      GeoTessera v1.1 reference only (no embedding data)                tessera_ref.json
   terrain      Copernicus GLO-30 DEM, native 1 arc-second window                 dem_glo30.tif
   landfire     LANDFIRE image services, native 30 m EPSG:5070 (fires 2017+)      landfire_<version>_<layer>.tif
@@ -26,7 +26,10 @@ Channels (cheap -> heavy) and what each writes into fires/<fire_id>/<channel>/:
   hrrr_next    HRRR 12z run every 3 h out to 36 h: + t2/q2/apcp                  hrrr_next.nc
   gfs          NOAA GFS 0.25 deg 12z run every 3 h out to 10 days (Earth Engine)   gfs.nc
   osm          OpenStreetMap 1 January snapshot of the fire's year, full extract osm_<YYYY>-01-01.osm.pbf
-  viirs        VIIRS L1B swaths day + night: I1-I5, M11, geolocation (Earthdata) <SAT>_<date>T<HHMM>_<day|night>.nc
+  viirs        VIIRS L1B swaths day + night: I1-I5, M11, geolocation (Earthdata) viirs.nc (a group per granule)
+
+GeoJSON is gzipped with a fixed header (same features, same bytes): json.load(gzip.open(p)) or
+geopandas.read_file('/vsigzip/' + p).
 
 lulc, landcover, vegetation, hrrr_next, gfs and viirs bring in what TS-SatFire (Zhao et al. 2024) has and the
 other channels lacked: its VIIRS_Day / VIIRS_Night bands, its FirePred bands (NDVI, EVI2, gridMET pr / tmmn /
@@ -38,6 +41,7 @@ Group channels (goes, hrrr, hrrr_next, gfs, osm, viirs) share downloads across f
 yields (fire, status, sources, error). Secrets (FIRMS map key, Earthdata token, Earth Engine key, HF token) never
 reach the manifest.
 """
+import contextlib
 import gzip
 import hashlib
 import json
@@ -531,13 +535,19 @@ def requirements(channel):
             raise SystemExit("landcover reads MCD12Q1 HDF4 tiles: pip install pyhdf")
 
 
+# Files that replaced an older layout: rows that list the old names (plain .geojson, one file per VIIRS granule)
+# are fetched again, or converted in place by raw_grab.py --repack.
+EXPECTED_FILES = {"history": {"history.geojson.gz"}, "perimeters": {"records.geojson.gz"},
+                  "suppression": {"event_lines.geojson.gz", "event_polygons.geojson.gz"}, "viirs": {"viirs.nc"}}
+
+
 def expected_files(channel):
     """Files an 'ok' fire must list in its manifest row to count as done (None: any 'ok' row counts). When a
     channel grows new files (gridmet gained pr / tmmn / sph / pdsi), its next run fetches again just the
     fires that miss them."""
     if channel == "gridmet":
         return {f"gridmet_{v}.nc" for v in gridmet_vars()}
-    return None
+    return EXPECTED_FILES.get(channel)
 
 
 def shared_files(channel, ctx):
@@ -550,8 +560,28 @@ def shared_files(channel, ctx):
 
 # ------------------------------------------------------------------------------------- helpers
 
+GZIP_LEVEL = 6
+
+
+@contextlib.contextmanager
+def gzip_writer(path):
+    """A gzip stream with no file name or time in its header, so the same content always gives the same bytes
+    (a rerun that finds nothing new uploads nothing new)."""
+    with open(path, "wb") as raw, gzip.GzipFile(filename="", mode="wb", fileobj=raw, compresslevel=GZIP_LEVEL,
+                                                mtime=0) as gz:
+        yield gz
+
+
+def gzip_copy(src, dst):
+    """dst = gzip of src, streamed, with gzip_writer's fixed header."""
+    with open(src, "rb") as fi, gzip_writer(dst) as fo:
+        shutil.copyfileobj(fi, fo, 1 << 20)
+
+
 def _write_geojson(path, feats):
-    with open(path, "w") as fh:
+    """A FeatureCollection as <name>.geojson.gz (gzip_writer)."""
+    import io
+    with gzip_writer(path) as gz, io.TextIOWrapper(gz, encoding="utf-8") as fh:
         json.dump({"type": "FeatureCollection", "features": feats}, fh, default=str)
 
 
@@ -627,7 +657,7 @@ def grab_history(fire, out, ctx):
     import build_multiyear as BM
     where = f"FIRE_YEAR_INT < {int(fire['year'])}"
     feats = arcgis_box_features(ctx.sess, BM.HIST_URL, area(fire), where=where, chunk=100)
-    _write_geojson(out / "history.geojson", feats)
+    _write_geojson(out / "history.geojson.gz", feats)
     return ("ok" if feats else "empty"), [arcgis_query_url(BM.HIST_URL, area(fire), where=where)]
 
 
@@ -660,7 +690,7 @@ def grab_perimeters(fire, out, ctx):
                     f["properties"] = dict(f.get("properties") or {}, _source_layer=NP.layer_label(url), _source_kind=kind)
                     keep.append(f)
     shutil.rmtree(ctx.tmp(), ignore_errors=True)
-    _write_geojson(out / "records.geojson", keep)
+    _write_geojson(out / "records.geojson.gz", keep)
     return ("ok" if keep else "empty"), sources
 
 
@@ -808,8 +838,8 @@ def grab_suppression(fire, out, ctx):
                 f["properties"] = dict(f.get("properties") or {}, _source_layer=NP.layer_label(url))
                 (lines if kind == "line" else polys).append(f)
     shutil.rmtree(ctx.tmp(), ignore_errors=True)
-    _write_geojson(out / "event_lines.geojson", lines)
-    _write_geojson(out / "event_polygons.geojson", polys)
+    _write_geojson(out / "event_lines.geojson.gz", lines)
+    _write_geojson(out / "event_polygons.geojson.gz", polys)
     return ("ok" if lines or polys else "empty"), sources
 
 
@@ -1901,6 +1931,8 @@ VIIRS_PRODUCTS = ("02IMG", "03IMG", "02MOD", "03MOD")
 VIIRS_I_BANDS = ("I01", "I02", "I03", "I04", "I05")     # with their _quality_flags, _uncert_index, LUTs
 VIIRS_M_BANDS = ("M11",)
 VIIRS_GEO = ("latitude", "longitude", "sensor_zenith", "solar_zenith")
+VIIRS_FILE = "viirs.nc"          # one per fire: a group per granule, look-up tables once in /luts
+VIIRS_MASK_PAD_KM = 2.0          # pixels up to this far outside the region are kept (edge resampling); beyond: fill
 VIIRS_POOL = "process"        # h5py serialises reads within a process: granules go to worker processes
 VIIRS_WORKERS = 8
 
@@ -2000,18 +2032,67 @@ def _viirs_read(job):
             f.close()
 
 
-def viirs_file_name(key, e):
+def viirs_group_name(key, e):
+    """A granule's group in viirs.nc: <SAT>_<YYYY-MM-DD>T<HHMM>_<day|night>."""
     import pandas as pd
     sat, a, hhmm = key
     day = (pd.Timestamp(f"{a[1:5]}-01-01") + pd.Timedelta(days=int(a[5:8]) - 1)).strftime("%Y-%m-%d")
-    return f"{sat}_{day}T{hhmm}_{(e.get('daynight') or 'unknown').lower()}.nc"
+    return f"{sat}_{day}T{hhmm}_{(e.get('daynight') or 'unknown').lower()}"
 
 
-def _viirs_write(path, fid, key, e, c):
-    """One granule's crop: I grid (iy, ix) with I01-I05 (+ flags), latitude, longitude, zeniths; M grid
-    (my, mx) with M11 (+ flags) and m_latitude etc.; look-up tables whole. Values as stored in the source."""
+def _viirs_mask(c, bounds):
+    """Blank every pixel of a crop whose latitude / longitude lies outside bounds, to the source's own
+    _FillValue, in each 2-D variable that has one. The swath window is a rectangle in scan coordinates, so it
+    reaches past the region at the swath edges and on tilted passes; blanked pixels compress to almost nothing.
+    Variables without a fill value (quality flags, uncertainty indices) are kept whole. -> {grid: pixels blanked}."""
+    import numpy as np
+    w, s, e, n = bounds
+    out = {}
+    for grid, la, lo in (("i", "latitude", "longitude"), ("m", "m_latitude", "m_longitude")):
+        vs = c.get(grid) or {}
+        if la not in vs or lo not in vs:
+            continue
+        lat, lon = (np.asarray(vs[k][0], dtype="f8") for k in (la, lo))
+        outside = ~((lat >= s) & (lat <= n) & (lon >= w) & (lon <= e))
+        out[grid] = int(outside.sum())
+        if not out[grid]:
+            continue
+        for name, (arr, attrs) in list(vs.items()):
+            fill = fill_value(attrs, arr.dtype)
+            if arr.ndim == 2 and arr.shape == outside.shape and fill is not None:
+                vs[name] = (np.where(outside, fill, arr).astype(arr.dtype), attrs)
+    return out
+
+
+def _viirs_lut(luts, name, arr, attrs):
+    """A look-up table stored once per file in /luts, named by its content: -> its path. The tables only change
+    with the calibration, so a fire's hundreds of granules share two or three of them."""
+    import hashlib
+    import numpy as np
+    key = f"{name}_{hashlib.sha1(np.ascontiguousarray(arr).tobytes()).hexdigest()[:12]}"
+    if key not in luts.variables:
+        luts.createDimension(f"{key}_n", arr.shape[0])
+        v = luts.createVariable(key, arr.dtype, (f"{key}_n",), zlib=True, complevel=4,
+                                fill_value=fill_value(attrs, arr.dtype))
+        v.set_auto_maskandscale(False)
+        v.setncatts({**clean_attrs(attrs), "source_name": name})
+        v[:] = arr
+    return f"/luts/{key}"
+
+
+def _viirs_write(path, fid, key, e, c, bounds=None):
+    """Add one granule's crop to the fire's packed file as its own group (viirs_group_name): I grid (iy, ix) with
+    I01-I05 (+ flags), latitude, longitude, zeniths; M grid (my, mx) with M11 (+ flags) and m_latitude etc.
+    Values as stored in the source; with bounds, pixels outside them are blanked (_viirs_mask). Look-up tables
+    go to /luts once (_viirs_lut): the group's attribute named after the table gives its path. -> group name."""
     import netCDF4
-    with netCDF4.Dataset(path, "w") as ds:
+    name = viirs_group_name(key, e)
+    blanked = _viirs_mask(c, bounds) if bounds else {}
+    with netCDF4.Dataset(path, "a" if Path(path).exists() else "w") as ds:
+        if name in ds.groups:
+            return name
+        luts = ds.groups.get("luts") or ds.createGroup("luts")
+        g = ds.createGroup(name)
         r0, r1, c0, c1 = c["i_win"]
         at = {"title": f"VIIRS {key[0]} L1B granule {key[1]}.{key[2]} cropped to {fid}", "fire_id": fid,
               "satellite": key[0], "day_night": e.get("daynight") or "", "granule_start": e.get("start") or "",
@@ -2020,23 +2101,52 @@ def _viirs_write(path, fid, key, e, c):
         if c.get("m_win"):
             mr0, mr1, mc0, mc1 = c["m_win"]
             at["m_window_rows_cols"] = f"{mr0}:{mr1},{mc0}:{mc1}"
-        ds.setncatts({**{f"source_{k}": v for k, v in c["glob"].items()}, **at})
+        if bounds:
+            at["blanked_outside_lonlat"] = ",".join(f"{b:.5f}" for b in bounds)
+            at.update({f"blanked_pixels_{k}": v for k, v in blanked.items()})
+        g.setncatts({**{f"source_{k}": v for k, v in c["glob"].items()}, **at})
         for grid, dims in (("i", ("iy", "ix")), ("m", ("my", "mx"))):
             if not c.get(grid):
                 continue
             made = False
-            for name, (arr, attrs) in c[grid].items():
-                if arr.ndim == 2 and not made:
-                    ds.createDimension(dims[0], arr.shape[0])
-                    ds.createDimension(dims[1], arr.shape[1])
-                    made = True
-                dd = dims if arr.ndim == 2 else (f"{name}_n",)
+            for vname, (arr, attrs) in c[grid].items():
                 if arr.ndim == 1:
-                    ds.createDimension(dd[0], arr.shape[0])
-                v = ds.createVariable(name, arr.dtype, dd, zlib=True, complevel=4, fill_value=fill_value(attrs, arr.dtype))
+                    g.setncattr(vname, _viirs_lut(luts, vname, arr, attrs))
+                    continue
+                if not made:
+                    g.createDimension(dims[0], arr.shape[0])
+                    g.createDimension(dims[1], arr.shape[1])
+                    made = True
+                v = g.createVariable(vname, arr.dtype, dims, zlib=True, complevel=4, fill_value=fill_value(attrs, arr.dtype))
                 v.set_auto_maskandscale(False)
                 v.setncatts(clean_attrs(attrs))
                 v[:] = arr
+    return name
+
+
+def _viirs_finish(part, fid, region):
+    """Index the packed file (one row per granule group, in time order) and give it its final name, so a crash
+    never leaves a half-written viirs.nc behind."""
+    import netCDF4
+    import numpy as np
+    with netCDF4.Dataset(part, "a") as ds:
+        gs = ds.groups
+        names = sorted((k for k in gs if k != "luts"), key=lambda k: (str(getattr(gs[k], "granule_start", "")), k))
+        ds.createDimension("granule", len(names))
+        for var, attr in (("granule", None), ("granule_start", "granule_start"), ("satellite", "satellite"),
+                          ("day_night", "day_night")):
+            v = ds.createVariable(var, str, ("granule",))
+            v[:] = np.array([k if attr is None else str(getattr(gs[k], attr, "")) for k in names], dtype=object)
+        ds.setncatts({"title": f"VIIRS L1B swath granules cropped to {fid}", "fire_id": fid, "n_granules": len(names),
+                      "region_lonlat": ",".join(f"{b:.5f}" for b in region), "blanked_pad_km": VIIRS_MASK_PAD_KM,
+                      "layout": "one group per granule, named as in the granule variable (I grid iy/ix, M grid my/mx); "
+                                "/luts holds each look-up table once, and a group's attribute named after a table "
+                                "(e.g. I04_brightness_temperature_lut) gives that table's path",
+                      "blanking": "pixels farther than blanked_pad_km outside region_lonlat hold the source's _FillValue "
+                                  "in every variable that has one"})
+    final = Path(part).with_name(VIIRS_FILE)
+    Path(part).rename(final)
+    return final
 
 
 def grab_viirs_many(fires, ctx, chunk=25):
@@ -2045,8 +2155,9 @@ def grab_viirs_many(fires, ctx, chunk=25):
     at 375 m and M11 at 750 m as stored (scaled integers, quality flags, the brightness-temperature look-up
     tables of I4 / I5), with each pixel's latitude, longitude and sensor / solar zenith. Remote files are
     read by byte range (a fire's part of a 250 MB granule is a few MB); each granule is read once for every
-    fire on it. One file per granule: <SAT>_<YYYY-MM-DD>T<HHMM>_<day|night>.nc. Granules that fail are
-    named in the manifest note; a fire is an error only when all of them fail."""
+    fire on it. One file per fire, viirs.nc: a group per granule (<SAT>_<YYYY-MM-DD>T<HHMM>_<day|night>), the
+    look-up tables once, pixels beyond the region + VIIRS_MASK_PAD_KM blanked. Granules that fail are named in
+    the manifest note; a fire is an error only when all of them fail."""
     import multiprocessing
     from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
     workers = max(1, min(ctx.threads, VIIRS_WORKERS))
@@ -2066,7 +2177,7 @@ def grab_viirs_many(fires, ctx, chunk=25):
     for group in _chunks(fires, chunk):
         if ctx.expired():
             return
-        need, left, written, srcs, failed = {}, {}, {}, {}, {}
+        need, left, written, srcs, failed, region = {}, {}, {}, {}, {}, {}
         with ThreadPoolExecutor(8) as ex:
             for f, grans, err in ex.map(look, group):
                 fid = f["fire_id"]
@@ -2074,6 +2185,7 @@ def grab_viirs_many(fires, ctx, chunk=25):
                     yield f, ("error" if err else "empty"), [], err
                     continue
                 left[fid], written[fid], srcs[fid], failed[fid] = len(grans), [], [], []
+                region[fid] = area(f)
                 for k, e in grans.items():
                     need.setdefault(k, (e, []))[1].append(f)
         jobs = [(k, e, [(f["fire_id"], area(f)) for f in fs])
@@ -2086,9 +2198,8 @@ def grab_viirs_many(fires, ctx, chunk=25):
                 got += nbytes
                 e, fs = need[key]
                 for fid, c in crops.items():
-                    name = viirs_file_name(key, e)
-                    _viirs_write(ctx.stage(fid) / name, fid, key, e, c)
-                    written[fid].append(name)
+                    part = ctx.stage(fid) / (VIIRS_FILE + ".part")
+                    written[fid].append(_viirs_write(part, fid, key, e, c, buffer_box(region[fid], VIIRS_MASK_PAD_KM)))
                     srcs[fid].append(e["02IMG"])
                 for f in fs:
                     fid = f["fire_id"]
@@ -2098,6 +2209,8 @@ def grab_viirs_many(fires, ctx, chunk=25):
                     if left[fid] == 0:
                         note = (f"{len(failed[fid])} granule(s) failed: {failed[fid][0]}" if failed[fid] else None)
                         status = "ok" if written[fid] else ("error" if failed[fid] else "empty")
+                        if written[fid]:
+                            _viirs_finish(ctx.stage(fid) / (VIIRS_FILE + ".part"), fid, region[fid])
                         yield f, status, srcs[fid], note
                 if ctx.expired():
                     stopped = True

@@ -102,13 +102,14 @@ def test_latest_manifest_row_decides_done():
 
 class FakeApi:
     def __init__(self, fail=False):
-        self.fail, self.commits = fail, []
+        self.fail, self.commits, self.deletes = fail, [], []
 
-    def upload_folder(self, repo_id, folder_path, repo_type, commit_message):
+    def upload_folder(self, repo_id, folder_path, repo_type, commit_message, delete_patterns=None):
         if self.fail:
             raise RuntimeError("503")
         files = sorted(str(p.relative_to(folder_path)) for p in Path(folder_path).rglob("*") if p.is_file())
         self.commits.append((commit_message, files))
+        self.deletes.append(delete_patterns)
 
 
 def staged(tmp, fid, name="x.csv", size=10):

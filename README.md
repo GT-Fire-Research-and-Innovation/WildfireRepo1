@@ -53,6 +53,7 @@ python pipeline/raw_grab.py --channel history --hf-repo you/wildfire-raw-2014-20
 python pipeline/raw_grab.py --status --hf-repo you/wildfire-raw-2014-2025           # progress per channel
 python pipeline/raw_grab.py --extents --hf-repo you/wildfire-raw-2014-2025          # after firms: catalog/fire_extents.csv
 python pipeline/raw_grab.py --links --hf-repo you/wildfire-raw-2014-2025            # fires/<id>/LINKS.md + links.json
+python pipeline/raw_grab.py --repack --channel perimeters --hf-repo you/wildfire-raw-2014-2025  # gzip old .geojson in place
 python pipeline/raw_grab.py --channel goes --ids F2003403265 --dry-run --work /tmp/raw  # one fire, no upload
 ```
 Channels: history, perimeters, firms, gridmet, ics209, suppression, tessera (reference only), terrain, landfire,
@@ -64,8 +65,9 @@ and `GEE_PROJECT`). Each fire is cut on the source's own grid to its region (the
 pushed out 32 km on every side, so any 64 km tile centred in the fire fits), over a time window that adds the
 days FIRMS saw the fire active before its first perimeter and after its last, plus a day on each side; its
 ignition point is stored for tiles that start from it (run firms, then `--extents`, before the other
-time-dependent channels). Batches are
-uploaded and then deleted locally. Each fire gets one folder, `fires/<id>/`, with a subfolder per channel and a
+time-dependent channels). GeoJSON is stored gzipped and viirs as one `viirs.nc` per fire (a group per
+satellite pass). Batches are
+uploaded and then deleted locally; a fire fetched again replaces its older files. Each fire gets one folder, `fires/<id>/`, with a subfolder per channel and a
 `LINKS.md` that links every file and its upstream source. `notebooks/kaggle_data_grab.ipynb` runs all channels
 on Kaggle. Repo layout and sources: `docs/RAW_DATA_CARD.md`.
 

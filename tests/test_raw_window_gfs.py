@@ -101,7 +101,10 @@ def test_fires_fetched_for_another_window_or_region_are_fetched_again():
                       dict(fire_id="C", status="ok", fetched_utc="2026-11-01", window="", region="")])   # before the rules
     assert RG.done_ids(m, "hrrr", [a, b, c]) == {"A"}                         # B's window grew, C has neither
     assert RG.done_ids(m, "terrain", [a, b, c]) == {"A", "B"}                 # region only: C was cut to the old box
-    assert RG.done_ids(m, "perimeters", [a, b, c]) == {"A", "B", "C"}         # on the build's box, no window
+    gz = m.assign(files="records.geojson.gz")
+    assert RG.done_ids(gz, "perimeters", [a, b, c]) == {"A", "B", "C"}        # on the build's box, no window
+    plain = gz.assign(files=["records.geojson", "records.geojson.gz", "records.geojson"])
+    assert RG.done_ids(plain, "perimeters", [a, b, c]) == {"B"}               # plain .geojson: repack or refetch
     old = m.drop(columns=["window", "region"])                                 # manifests written before the columns
     assert RG.done_ids(old, "goes", [a, b, c]) == set() and RG.done_ids(old, "goes") == {"A", "B", "C"}
 
