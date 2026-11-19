@@ -25,6 +25,7 @@ Group channels (goes, hrrr, osm) share downloads across fires: grab_<channel>_ma
 yields (fire, status, sources, error). Secrets (FIRMS map key, HF token) never reach the manifest.
 """
 import gzip
+import hashlib
 import json
 import math
 import os
@@ -718,32 +719,90 @@ def _open_nc_bytes(netCDF4, data, ctx):
         return netCDF4.Dataset(p), Path(p)
 
 
+def _s3_get(ctx, bucket, key):
+    """One object of a public S3 bucket, checked against its ETag (the MD5 of a single-part upload, which
+    every GOES file is): bytes cut short or garbled on the way raise here, so the caller downloads again,
+    instead of failing later inside the netCDF reader."""
+    rr = ctx.sess.get(f"https://{bucket}.s3.amazonaws.com/{key}", timeout=120)
+    rr.raise_for_status()
+    data = rr.content
+    etag = rr.headers.get("ETag", "").strip('"')
+    if re.fullmatch(r"[0-9a-f]{32}", etag) and hashlib.md5(data).hexdigest() != etag:
+        raise OSError(f"{key.rsplit('/', 1)[-1]}: {len(data)} bytes do not match the object's MD5 (ETag)")
+    return data
+
+
+def _read_goes_scan(netCDF4, data, ctx, grids, sat):
+    """Everything grab_goes_many takes from one FDCC file, read in full and the file closed again:
+    {"vars": {name: (array, dtype, attrs)} packed as in the file, "x", "y", "proj": the projection's
+    attributes, "latlon": (lat, lon) of its grid}. A file with a damaged compressed chunk opens fine and fails
+    only when that chunk is read ("RuntimeError: NetCDF: HDF error"); reading it all here makes such a file
+    fail as a whole, before any fire's series gets part of the scan."""
+    import build_multiyear as BM
+    ds, tmp = _open_nc_bytes(netCDF4, data, ctx)
+    try:
+        shape = ds.variables["Mask"].shape
+        if (sat, shape) not in grids:
+            grids[(sat, shape)] = BM._goes_latlon(ds)
+        proj = ds.variables["goes_imager_projection"]
+        scan = {"vars": {}, "latlon": grids[(sat, shape)], "x": ds.variables["x"][:], "y": ds.variables["y"][:],
+                "proj": {a: proj.getncattr(a) for a in proj.ncattrs()}}
+        for nm in GOES_VARS:
+            if nm in ds.variables:
+                v = ds.variables[nm]
+                v.set_auto_maskandscale(False)
+                scan["vars"][nm] = (v[:], v.dtype, {a: v.getncattr(a) for a in v.ncattrs()})
+        return scan
+    finally:
+        ds.close()
+        if tmp:
+            tmp.unlink(missing_ok=True)
+
+
+def _goes_scan(netCDF4, ctx, grids, sat, bucket, keys, data, tries=3):
+    """(scan, key) of the nearest readable scan of the hour. keys: the hour's scans, nearest first; data: the
+    first one's bytes (None if its download failed). A file that does not read, i.e. one stored corrupt in
+    the bucket (its bytes match the ETag yet a chunk does not decompress), is logged and replaced by the next
+    nearest scan, up to `tries` files. (None, None) when none reads: the hour is left out."""
+    for i, key in enumerate(keys[:tries]):
+        try:
+            if i:
+                data = _s3_get(ctx, bucket, key)
+            if data is None:
+                break
+            return _read_goes_scan(netCDF4, data, ctx, grids, sat), key
+        except (OSError, RuntimeError, KeyError, ValueError, IndexError) as ex:
+            then = "trying the next scan of the hour" if i + 1 < min(tries, len(keys)) else "hour left out"
+            print(f"    GOES {sat} {key.rsplit('/', 1)[-1]}: unreadable ({type(ex).__name__}: {str(ex)[:100]}), {then}",
+                  flush=True)
+    return None, None
+
+
 def grab_goes_many(fires, ctx, chunk=25):
     """Per fire and satellite: the scan nearest each hour, cropped to the box on the ABI fixed grid, with
-    the fire product's own variables (Mask, Power, Area, Temp, DQF) left packed as in the source file."""
+    the fire product's own variables (Mask, Power, Area, Temp, DQF) left packed as in the source file.
+    A scan that is corrupt in the bucket is replaced by the next nearest of the same hour (_goes_scan)."""
     import netCDF4
     import pandas as pd
     from concurrent.futures import ThreadPoolExecutor
-    import build_multiyear as BM
 
     def fetch(item):
+        """-> (item, the hour's keys nearest first, the nearest one's bytes); ([], None) when nothing came."""
         t, sat, bucket = item
         prefix = f"ABI-L2-FDCC/{t.year}/{t.dayofyear:03d}/{t.hour:02d}/"
         for attempt in range(3):
             try:
                 r = ctx.sess.get(f"https://{bucket}.s3.amazonaws.com/", params={"list-type": 2, "prefix": prefix}, timeout=60)
                 r.raise_for_status()
-                keys = re.findall(r"<Key>([^<]+)</Key>", r.text)
+                keys = sorted(re.findall(r"<Key>([^<]+)</Key>", r.text),
+                              key=lambda k: abs(int(k.split("_s")[1][9:11]) - t.minute))
                 if not keys:
-                    return item, None, None
-                key = min(keys, key=lambda k: abs(int(k.split("_s")[1][9:11]) - t.minute))
-                rr = ctx.sess.get(f"https://{bucket}.s3.amazonaws.com/{key}", timeout=120)
-                rr.raise_for_status()
-                return item, key, rr.content
+                    return item, [], None
+                return item, keys, _s3_get(ctx, bucket, keys[0])
             except Exception as ex:  # noqa: BLE001
                 if attempt == 2:
                     print(f"    GOES {sat} {t}: {str(ex)[:120]}", flush=True)
-                    return item, None, None
+                    return item, [], None
                 time.sleep(3 * (attempt + 1))
 
     grids = {}
@@ -760,51 +819,35 @@ def grab_goes_many(fires, ctx, chunk=25):
         series, scans = {}, {f["fire_id"]: {} for f in group}
         stopped = False
         with ThreadPoolExecutor(ctx.threads) as ex:
-            for (t, sat, bucket), key, data in _windowed_map(ex, fetch, sorted(need), 4 * ctx.threads):
-                if data is not None:
-                    ds, tmp = _open_nc_bytes(netCDF4, data, ctx)
-                    try:
-                        shape = ds.variables["Mask"].shape
-                        if (sat, shape) not in grids:
-                            grids[(sat, shape)] = BM._goes_latlon(ds)
-                        lat, lon = grids[(sat, shape)]
-                        raw = {}
-                        for nm in GOES_VARS:
-                            if nm in ds.variables:
-                                v = ds.variables[nm]
-                                v.set_auto_maskandscale(False)
-                                raw[nm] = (v, v.dtype, {a: v.getncattr(a) for a in v.ncattrs()})
-                        for f in need[(t, sat, bucket)]:
-                            fid = f["fire_id"]
-                            k = (fid, sat)
-                            if k not in series:
-                                win = _window(lat, lon, f["bounds"])
-                                if win is None:
-                                    series[k] = None
-                                else:
-                                    r0, r1, c0, c1 = win
-                                    xv, yv = ds.variables["x"][c0:c1], ds.variables["y"][r0:r1]
-                                    proj = ds.variables["goes_imager_projection"]
-                                    static = {"x": (("x",), xv.astype("f8"), {"units": "rad", "long_name": "ABI fixed grid x"}),
-                                              "y": (("y",), yv.astype("f8"), {"units": "rad", "long_name": "ABI fixed grid y"}),
-                                              "goes_imager_projection": ((), 0, {a: proj.getncattr(a) for a in proj.ncattrs()})}
-                                    path = ctx.stage(fid) / f"goes_{sat}.nc"
-                                    s = NcSeries(path, lat[r0:r1, c0:c1], lon[r0:r1, c0:c1],
-                                                 {"title": f"GOES ABI L2 FDCC ({sat}) cropped to {fid}", "fire_id": fid,
-                                                  "source": f"s3://{bucket}/ABI-L2-FDCC/", "window_rows_cols": f"{r0}:{r1},{c0}:{c1}"},
-                                                 static)
-                                    series[k] = (s, win)
-                            if series[k] is not None:
-                                s, (r0, r1, c0, c1) = series[k]
-                                t_scan = pd.to_datetime(key.split("_s")[1][:13], format="%Y%j%H%M%S", utc=True).value
-                                s.append(t_scan, f"s3://{bucket}/{key}",
-                                         {nm: (v[r0:r1, c0:c1], dt, at) for nm, (v, dt, at) in raw.items()})
-                                day = f"ABI-L2-FDCC/{t.year}/{t.dayofyear:03d}/"
-                                scans[fid][(bucket, day)] = scans[fid].get((bucket, day), 0) + 1
-                    finally:
-                        ds.close()
-                        if tmp:
-                            tmp.unlink(missing_ok=True)
+            for (t, sat, bucket), keys, data in _windowed_map(ex, fetch, sorted(need), 4 * ctx.threads):
+                scan, key = _goes_scan(netCDF4, ctx, grids, sat, bucket, keys, data)
+                if scan is not None:
+                    lat, lon = scan["latlon"]
+                    for f in need[(t, sat, bucket)]:
+                        fid = f["fire_id"]
+                        k = (fid, sat)
+                        if k not in series:
+                            win = _window(lat, lon, f["bounds"])
+                            if win is None:
+                                series[k] = None
+                            else:
+                                r0, r1, c0, c1 = win
+                                static = {"x": (("x",), scan["x"][c0:c1].astype("f8"), {"units": "rad", "long_name": "ABI fixed grid x"}),
+                                          "y": (("y",), scan["y"][r0:r1].astype("f8"), {"units": "rad", "long_name": "ABI fixed grid y"}),
+                                          "goes_imager_projection": ((), 0, scan["proj"])}
+                                path = ctx.stage(fid) / f"goes_{sat}.nc"
+                                s = NcSeries(path, lat[r0:r1, c0:c1], lon[r0:r1, c0:c1],
+                                             {"title": f"GOES ABI L2 FDCC ({sat}) cropped to {fid}", "fire_id": fid,
+                                              "source": f"s3://{bucket}/ABI-L2-FDCC/", "window_rows_cols": f"{r0}:{r1},{c0}:{c1}"},
+                                             static)
+                                series[k] = (s, win)
+                        if series[k] is not None:
+                            s, (r0, r1, c0, c1) = series[k]
+                            t_scan = pd.to_datetime(key.split("_s")[1][:13], format="%Y%j%H%M%S", utc=True).value
+                            s.append(t_scan, f"s3://{bucket}/{key}",
+                                     {nm: (a[r0:r1, c0:c1], dt, at) for nm, (a, dt, at) in scan["vars"].items()})
+                            day = f"ABI-L2-FDCC/{t.year}/{t.dayofyear:03d}/"
+                            scans[fid][(bucket, day)] = scans[fid].get((bucket, day), 0) + 1
                 for f in need[(t, sat, bucket)]:
                     fid = f["fire_id"]
                     left[fid] -= 1
