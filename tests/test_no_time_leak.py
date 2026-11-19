@@ -53,3 +53,30 @@ def test_goes_pixel_waits_for_its_companion():
     assert comp[0] > t_i                 # its only companion (1 km away) appears at 11:00, after the forecast start
     assert comp[0] == t[1].value and comp[1] == t[1].value
     assert comp[2] == np.iinfo(np.int64).max     # isolated forever
+
+
+def _supp_line(saved_utc, created_utc=None):
+    ms = lambda s: int(pd.Timestamp(s, tz="UTC").value // 10 ** 6)  # noqa: E731
+    props = {"FeatureCategory": "Completed Dozer Line", "IncidentName": "Camp", "GDB_FROM_DATE": ms(saved_utc),
+             "CreateDate": ms(created_utc or saved_utc), "DateCurrent": ms(saved_utc), "GDB_TO_DATE": None}
+    return {"type": "Feature", "properties": props,
+            "geometry": {"type": "LineString", "coordinates": [[-120.0, 39.985], [-119.96, 39.985]]}}
+
+
+def test_suppression_is_shown_from_the_burn_day_after_it_was_saved():
+    """Day d's suppression map holds only versions saved by 06:00 local on d+1, and the loader gives a forecast
+    the previous burn day's map (tests/test_loader.py), so a line drawn on a burn day first appears the day after."""
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "pipeline"))
+    import suppression_layers as SL
+    fire = {"height": 4, "width": 4, "transform": [0.01, 0, -120.0, 0, -0.01, 40.0],
+            "bounds_lonlat": [-120.0, 39.96, -119.96, 40.0]}
+    days = ["2019-08-09", "2019-08-10"]
+    dozer = SL.CHANNEL_NAMES.index("dozer_line")
+    saved = SL.archive_features([_supp_line("2019-08-10 23:00")])      # 15:00 local: burn day 08-10
+    lay = SL.rasterize_layers(saved, fire, days)
+    assert lay[0].sum() == 0 and lay[1, dozer].any()
+    edited = SL.archive_features([_supp_line("2019-08-10 23:00", created_utc="2019-08-01 00:00")])
+    assert edited.t_from.iloc[0] == pd.Timestamp("2019-08-10 23:00", tz="UTC")   # an edit counts from the edit
+    stamped_late = SL.archive_features([_supp_line("2019-08-09 12:00", created_utc="2019-08-10 23:00")])
+    assert stamped_late.t_from.iloc[0] == pd.Timestamp("2019-08-10 23:00", tz="UTC")  # the latest stamp wins
+    assert SL.rasterize_layers(stamped_late, fire, days)[0].sum() == 0

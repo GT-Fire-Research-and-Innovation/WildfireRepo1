@@ -10,6 +10,10 @@ A. Spatial, from the NIFC Operational Data Archive (2018 onward only).
    The archive keeps every version of every feature with the dates it existed
    (GDB_FROM_DATE / GDB_TO_DATE), so for each day we rebuild the map exactly
    as it stood at the end of that burn day (06:00 local the next morning).
+   A version counts from when it was saved: the latest of GDB_FROM_DATE,
+   CreateDate and DateCurrent. The loader (model/data.py) gives a forecast
+   the PREVIOUS burn day's map, so anything saved on a burn day is shown from
+   the next burn day on, never on the day it was drawn.
    Channels (CHANNELS below):
      hand_line, dozer_line, other_line, burnout, retardant, water_foam,
      uncontrolled_edge
@@ -141,12 +145,16 @@ def archive_features(feats):
             continue
         if str(p.get("deletethis") or "").strip().lower() in {"yes", "y", "true", "1"}:
             continue
-        t_from = NP._ms_to_dt(p.get("gdb_from_date"))
-        t_to = NP._ms_to_dt(p.get("gdb_to_date"))
-        if pd.isna(t_from):
-            t_from = NP._ms_to_dt(p.get("createdate"))
-        if pd.isna(t_from):
+        # A version counts from when it was saved: the latest of its archive time and its own create / edit
+        # stamps. They agree in the 2018 archive; an edit keeps the feature's first CreateDate but gets a new
+        # GDB_FROM_DATE, and a feature collected in the field can carry stamps later than its archive time.
+        # Taking the latest means no version is ever shown before the moment it existed in the database.
+        stamps = [NP._ms_to_dt(p.get(k)) for k in ("gdb_from_date", "createdate", "datecurrent")]
+        stamps = [t for t in stamps if not pd.isna(t)]
+        if not stamps:
             continue
+        t_from = max(stamps)
+        t_to = NP._ms_to_dt(p.get("gdb_to_date"))
         if re.search(NP.TEST_NAME_RE, p.get("incidentname") or "", re.I):
             continue  # placeholder / practice incident
         if pd.isna(t_to) or t_to.year >= 9000:
