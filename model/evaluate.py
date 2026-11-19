@@ -89,6 +89,29 @@ class Member:
         if mode is None:
             mode = next((m for m in ("physics2", "hybrid2", "unet3", "unet2", "physics", "unet", "hybrid") if name.startswith(m)), "hybrid")
         self.name, self.mode, self.device = name, mode, device
+        if mode == "hazard":                              # FireStep stage 1 (train_hazard.py): settings from its json
+            import train_hazard as THZ
+            arch = j["arch"]
+            if arch["time"]:
+                D.TEMPORAL = True
+            self.groups = TH.groups_used(set(drop), v2=True, t3=arch["time"], origin=origin, fm=fm)
+            n_in = sum(D.GROUPS[g] for g in self.groups)
+            pt, ck = runs / f"{name}.pt", runs / f"{name}.ckpt"
+            if pt.exists():
+                sd, src = torch.load(pt, map_location=device, weights_only=False), "final weights"
+            elif ck.exists():
+                c = torch.load(ck, map_location=device, weights_only=False)
+                best = c.get("best")
+                sd, src = (best[1], f"best so far (val AP {best[0]:.3f})") if best and best[1] is not None else (c["model"], "latest")
+            else:
+                raise SystemExit(f"no checkpoint for {name} in {runs}")
+            self.model = THZ.build(n_in, j["width"], arch["attn"], arch["time"], device, j.get("hidden", 32))
+            self.model.load_state_dict(sd)
+            self.model.eval()
+            self._thz = THZ
+            print(f"  {name}: hazard ({j['n_bins']} bins x {j['bin_h']:g} h, unet3 trunk), {src}; gaps over "
+                  f"{j['n_bins'] * j['bin_h']:g} h carry the last bin's hazard on", flush=True)
+            return
         if mode == "unet3":                               # architecture read from the weights
             pt, ck = runs / f"{name}.pt", runs / f"{name}.ckpt"
             if pt.exists():
@@ -142,6 +165,17 @@ class Member:
             self.model.load_state_dict(sd)
             print(f"  {name}: {mode}, {src}", flush=True)
         self.model.eval()
+
+    @torch.no_grad()
+    def hazard_state(self, f, i, gap_h, win):
+        """Hazard model: its own inputs (72 h weather window, per-bin weather), scored as the logit of
+        P(burned by the next perimeter) so it is ranked and calibrated like every other model."""
+        THZ = self._thz
+        x, wx, *_ , y, m, _ = THZ.inputs(f, i, win, self.groups)
+        h, w = y.shape
+        lam = self.model(torch.from_numpy(TH.pad8(x))[None].float().to(self.device),
+                         torch.from_numpy(TH.pad8(wx))[None].float().to(self.device))[:, :, :h, :w]
+        return {"logit": THZ.HZ.logit_burned_by(lam, torch.full((1, h, w), float(gap_h), device=self.device))[0].float()}
 
     @torch.no_grad()
     def state(self, feats, phys, b0, gap_h):
@@ -258,7 +292,8 @@ def run_split(members, fires, calibrate, max_pairs=None, log_every=200):
                     continue
                 gap = gap - LAG_H
             feats, phys, y, m, b0 = f.sample(i, gap, window(f, i), lag_h=LAG_H)
-            states = [mb.state(feats, phys, b0, gap) for mb in members]
+            states = [mb.hazard_state(f, i, gap, window(f, i)) if mb.mode == "hazard" else mb.state(feats, phys, b0, gap)
+                      for mb in members]
             raw = ens_logit([mb.logits(st) for mb, st in zip(members, states)])
             out["raw"].append(raw.cpu().numpy()[m])
             rec = dict(fire=f.fid, year=f.year, i=i, gap_h=gap, new=int(y[m].sum()), cells=int(m.sum()),
@@ -378,7 +413,12 @@ def breakdown(s, cells, thr, key, names):
         yy, ss = y[sel], s[sel]
         p = ss >= thr
         tp, fp, fn = (p & yy).sum(), (p & ~yy).sum(), (~p & yy).sum()
+        prob = 1 / (1 + np.exp(-np.clip(ss.astype(np.float64), -30, 30)))      # calibration per group (logit scores)
+        bins = np.minimum((prob * 10).astype(int), 9)
+        rel = [(prob[bins == b].mean(), yy[bins == b].mean(), (bins == b).sum()) for b in range(10) if (bins == b).sum() >= 50]
         out.append(dict(group=nm, cells=int(sel.sum()), burned=int(yy.sum()),
+                        brier=float(np.mean((prob - yy) ** 2)), mean_pred=float(prob.mean()),
+                        ece=float(sum(abs(q - o) * c for q, o, c in rel) / max(sum(c for *_, c in rel), 1)),
                         ap=float(average_precision_score(yy, ss)) if yy.any() and (~yy).any() else float("nan"),
                         f1=float(2 * tp / max(2 * tp + fp + fn, 1)), recall=float(tp / max(tp + fn, 1)),
                         area_ratio=float(p.sum() / max(yy.sum(), 1))))
@@ -465,6 +505,10 @@ def main():
                        for sp in a.model) or any(json.loads((runs / f"{sp.split(':')[0]}.json").read_text()).get("mode") in TH.V2_MODES
                                                  for sp in a.model if (runs / f"{sp.split(':')[0]}.json").exists())
     members = [Member(runs, sp, None, groups_all, a.device, res_m, a.width) for sp in a.model]
+    if any(mb.mode == "hazard" for mb in members):
+        D.PHYSICS_V2 = True                               # its unet3 trunk uses the crown-fire / ember group
+        if LAG_H:
+            raise SystemExit("the hazard model is not set up for late starts (--lag-h) yet")
     calibrate = not a.no_calibration
     print(f"[{a.out}] {len(members)} model(s); val/test fires {len(split['val'])}/{len(split['test'])}; "
           f"calibration {'on' if calibrate else 'off'}", flush=True)
@@ -501,7 +545,7 @@ def main():
             a_ = arr[:, j, 0]
             res["calibration_params"][mb.name] = (
                 {"logit_bias_median": float(np.median(a_)), "logit_bias_p10_p90": [float(np.percentile(a_, q)) for q in (10, 90)]}
-                if mb.mode in TH.UNET_MODES else
+                if mb.mode in TH.UNET_MODES + ("hazard",) else
                 {"rate_multiplier_median": float(np.exp(np.median(a_))),
                  "rate_multiplier_p10_p90": [float(np.exp(np.percentile(a_, q))) for q in (10, 90)]})
     for r in rows:
