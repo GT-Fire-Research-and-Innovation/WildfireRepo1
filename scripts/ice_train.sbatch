@@ -2,6 +2,7 @@
 # GT PACE-ICE: one training run on one H100 or H200 (coe-gpu partition, coe-ice QOS).
 # Checkpoints every epoch; resubmitting the same NAME continues it after the 16 h limit.
 #   NAME=hybrid_v1 MODE=hybrid sbatch scripts/ice_train.sbatch
+#   SCRIPT=train_hazard.py NAME=hazard_v1 EXTRA="--width 64" sbatch scripts/ice_train.sbatch
 #   NAME=smoke MODE=hybrid EXTRA="--max-fires 40 --epochs 1 --steps 20" sbatch scripts/ice_train.sbatch
 #SBATCH -J wf-train
 #SBATCH -p coe-gpu
@@ -14,5 +15,8 @@ module purge
 export PATH="$HOME/scratch/envs/wildfire/bin:$PATH"
 cd "$SLURM_SUBMIT_DIR/model"
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
-python train_hybrid.py --data "${WF_DATA:-$HOME/scratch/wildfire/my}" --name "${NAME:-hybrid}" --mode "${MODE:-hybrid}" \
+SCRIPT="${SCRIPT:-train_hybrid.py}"                 # train_hazard.py for the hazard model (it has no --mode)
+MODEARG=$([ "$SCRIPT" = train_hybrid.py ] && echo "--mode ${MODE:-hybrid}")
+echo "code: $(git -C "$SLURM_SUBMIT_DIR" log --oneline -1)"
+python "$SCRIPT" --data "${WF_DATA:-$HOME/scratch/wildfire/my}" --name "${NAME:-hybrid}" $MODEARG \
        --device cuda --workers 6 ${EXTRA:-}

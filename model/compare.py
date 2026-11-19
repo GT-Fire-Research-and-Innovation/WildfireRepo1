@@ -80,6 +80,21 @@ def main():
             rows.append(["baseline: grow evenly"] + [f"{fmt(by[g]['ap'], 2)} / {fmt(by[g]['f1'], 2)}" if g in by else "-" for g in groups])
         out.append(f"\n## By {title} (AP / F1)\n")
         out.append(table(["model"] + groups, rows))
+    rows = []                     # calibration by gap: only evaluations made after breakdowns gained ECE
+    gaps = []
+    for name, e in evals:
+        for b in e.get("raw", {}).get("by_gap", []):
+            if "ece" in b and b["group"] not in gaps:
+                gaps.append(b["group"])
+    for name, e in evals:
+        for v in ("raw", "calibrated"):
+            by = {b["group"]: b for b in e.get(v, {}).get("by_gap", []) if "ece" in b}
+            if by:
+                rows.append([f"{name} {v}"] + [f"{fmt(by[g]['ece'], 3)} / {fmt(by[g]['mean_pred'] * by[g]['cells'] / max(by[g]['burned'], 1), 2)}"
+                                               if g in by else "-" for g in gaps])
+    if rows:
+        out.append("\n## Calibration by time gap (ECE / predicted-to-observed burned cells; 1.00 = right total)\n")
+        out.append(table(["model"] + gaps, rows))
     for name, e in evals:
         c = e.get("calibration_params")
         if c:

@@ -213,18 +213,22 @@ class Fire:
         return np.argwhere(binary_dilation(b, iterations=2) & ~b)
 
     # ------------------------------------------------------------------ features
-    def sample(self, i, gap_h, win, hide=(), lag_h=0.0):
+    def sample(self, i, gap_h, win, hide=(), lag_h=0.0, wx_h=None):
         """Inputs (dict of group -> (C, h, w) float32), physics fields, target, mask, burning.
         lag_h > 0: the forecast starts lag_h hours AFTER perimeter i was mapped, as it does on the live site:
         the fire shape is still perimeter i, but satellite and weather inputs run up to the later start,
         gap_h is the time left to perimeter i+1, and the target is everything that burns by then (what
-        burned during the lag included: the model has to work that out from the satellite inputs)."""
+        burned during the lag included: the model has to work that out from the satellite inputs).
+        wx_h: weather (HRRR, GRIDMET window, fuel moisture) covers [t_i, t_i + wx_h] instead of [t_i, t_j], so the
+        inputs do not depend on when the next perimeter happened to be mapped (the hazard model, horizon 72 h).
+        The target and mask are unchanged: they still describe perimeter i+1."""
         from scipy.ndimage import binary_dilation, distance_transform_edt
         r0, r1, c0, c1 = win
         sl = (slice(r0, r1), slice(c0, c1))
         h, w = r1 - r0, c1 - c0
         lag = pd.Timedelta(hours=float(lag_h))
         t_i, t_j = self.times[i] + lag, self.times[i + 1]    # t_i = the forecast start
+        t_w = t_i + pd.Timedelta(hours=float(wx_h)) if wx_h else t_j     # end of the weather the inputs see
         t_sat = self.sat_time(i) + lag                        # newest satellite observation the inputs may use
         f = {}
         B0 = self.burned(i)[sl]
@@ -386,7 +390,7 @@ class Fire:
             ks = [k]
             if GM_DAY == "window" and WEATHER_MODE != "forecast":
                 off = pd.Timedelta(hours=self.g["transform"][2] / 15)
-                li, lj = t_i.tz_convert(None) + off, t_j.tz_convert(None) + off
+                li, lj = t_i.tz_convert(None) + off, t_w.tz_convert(None) + off
                 dd = [d for d in pd.date_range(li.normalize(), lj.normalize()) if li <= d + pd.Timedelta(hours=15) <= lj]
                 if not dd:
                     dd = [(li + (lj - li) / 2).normalize()]
@@ -430,7 +434,7 @@ class Fire:
             if WEATHER_MODE == "forecast":
                 sel = (ts >= t_i - pd.Timedelta(hours=24)) & (ts <= t_i)
             else:
-                sel = (ts >= t_i - pd.Timedelta(hours=1)) & (ts <= t_j)
+                sel = (ts >= t_i - pd.Timedelta(hours=1)) & (ts <= t_w)
             if sel.sum() == 0:
                 sel = np.abs((ts - t_i).total_seconds()) == np.abs((ts - t_i).total_seconds()).min()
                 if WEATHER_MODE == "forecast":
@@ -441,7 +445,7 @@ class Fire:
                 vt = pd.to_datetime(rz["fc_times"], utc=True)          # valid times (12z init + 9 h)
                 issued = (pd.to_datetime(rz["fc_issued"], utc=True) if "fc_issued" in rz and len(rz["fc_issued"]) == len(vt)
                           else vt - pd.Timedelta(hours=9))     # dataset: 12z runs at +9 h; live: the real run time
-                use = (vt > t_i) & (vt <= t_j) & (issued <= t_i - pd.Timedelta(hours=2))
+                use = (vt > t_i) & (vt <= t_w) & (issued <= t_i - pd.Timedelta(hours=2))
                 if use.any():
                     F = np.concatenate([F, rz["fc"][use].astype(np.float32)]) if len(F) else rz["fc"][use].astype(np.float32)
                     tF = tF.append(vt[use])
@@ -485,7 +489,7 @@ class Fire:
                                rh.min(0) / 100, full(1.0)])
                 self._spd_stats = (spd.mean(0), np.quantile(spd, 0.9, axis=0) if len(spd) > 1 else spd[0])
                 if TEMPORAL:
-                    hseq = self.hrrr_segments(tF, u, vv, spd, rh, t_i, t_j, hr)
+                    hseq = self.hrrr_segments(tF, u, vv, spd, rh, t_i, t_w, hr)
         f["hrrr"] = hr
         if TEMPORAL:
             f["hrrr_seq"] = hseq if hseq is not None else np.zeros((SEQ_SEG * 4, h, w), np.float32)
@@ -519,7 +523,7 @@ class Fire:
         # Rothermel fields (physics backbone)
         self._canopy = (np.clip(lf["cc"][sl], 0, 100) / 100.0, np.clip(lf["ch"][sl], 0, 1000) / 10.0) if fb is not None else None
         if FM_ON or FM_PHYSICS:
-            f["fmoist"], self._fm = self.fuel_moist(sl, t_i, t_j, ter, self._canopy[0] * 100 if fb is not None else 0.0, h, w)
+            f["fmoist"], self._fm = self.fuel_moist(sl, t_i, t_w, ter, self._canopy[0] * 100 if fb is not None else 0.0, h, w)
             f["green"] = self.greenness(sl, t_sat, h, w)
         else:
             f["fmoist"], f["green"], self._fm = np.zeros((15, h, w), np.float32), np.zeros((4, h, w), np.float32), None
@@ -531,6 +535,7 @@ class Fire:
         for k in f:                                   # last line of defence: no NaN / inf reaches the network
             f[k] = np.nan_to_num(f[k], nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
         phys = {k: np.nan_to_num(v, nan=0.0, posinf=0.0, neginf=0.0) for k, v in phys.items()}
+        self._evidence = evidence                     # label-side satellite support (tests compare label_evidence with it)
         target = self.arrival[sl] == i + 1
         mask = ~B0 & ~oth
         far = target & (dist > CLEAN_FAR_KM) & ~evidence[sl]
@@ -538,6 +543,156 @@ class Fire:
         if DATA_VERSION >= 2:
             mask &= ~self.unsupported(target & ~B0 & ~oth, evidence[sl])
         return f, phys, target, mask, B0
+
+    # ------------------------------------------------------------------ hazard model (interval labels, per-bin weather)
+    def label_evidence(self, j):
+        """Satellite fire support (full grid) for the burn between perimeters j and j+1: VIIRS on the local days from
+        the one before t_j to the one after t_j+1, GOES (v2 two-sided filter) from 24 h before to 24 h after.
+        The same rule sample() uses for its label check (a test compares the two)."""
+        from scipy.ndimage import binary_dilation
+        t_i, t_j = self.times[j], self.times[j + 1]
+        evidence = np.zeros((self.H, self.W), bool)
+        v = self.z("viirs")
+        if v is not None:
+            lon_c = self.g["transform"][2]
+            local_i = (t_i.tz_convert(None) + pd.Timedelta(hours=lon_c / 15)).normalize()
+            local_j = (t_j.tz_convert(None) + pd.Timedelta(hours=lon_c / 15)).normalize()
+            for k, dday in enumerate(pd.to_datetime(v["dates"])):
+                if local_i - pd.Timedelta(days=1) <= dday <= local_j + pd.Timedelta(days=1):
+                    evidence |= (v["af_day"][k] + v["af_night"][k]) > 0
+        gz = self.z("goes")
+        if gz is not None and len(gz["t"]):
+            if DATA_VERSION >= 2:
+                keep = self.goes_keep(gz)
+                gz = {k: (a[keep] if getattr(a, "ndim", 0) == 1 and len(a) == len(keep) else a) for k, a in gz.items()}
+            if len(gz["t"]):
+                t = pd.to_datetime(gz["t"], utc=True)
+                dur = (t > t_i - pd.Timedelta(hours=24)) & (t <= t_j + pd.Timedelta(hours=24))
+                if dur.any():
+                    dx, _, x0, _, ey, y0 = self.g["transform"]
+                    cc = np.clip(np.floor((gz["lon"][dur] - x0) / dx).astype(int), 0, self.W - 1)
+                    rr = np.clip(np.floor((gz["lat"][dur] - y0) / ey).astype(int), 0, self.H - 1)
+                    gev = np.zeros((self.H, self.W), bool)
+                    gev[rr, cc] = True
+                    evidence |= binary_dilation(gev, iterations=max(1, int(round(1.5 / self.cell_km))))
+        return evidence
+
+    def pair_qc_bad(self, a):
+        """Flat indices of the cells first covered by perimeter a that the label check of pair (a-1, a) does not
+        trust (far from the fire with no satellite fire nearby, or an unsupported patch). Done on the full grid
+        (sample() does it inside its window, so crop edges can differ slightly). Cached per fire, sparse."""
+        cache = self.__dict__.setdefault("_qc_bad", {})
+        if a in cache:
+            return cache[a]
+        from scipy.ndimage import distance_transform_edt
+        target = self.arrival == a
+        out = np.zeros(0, np.int64)
+        if target.any():
+            b = self.burned(a - 1)
+            dist = distance_transform_edt(~b) * self.cell_km if b.any() else np.full(b.shape, 30.0)
+            ev = self.label_evidence(a - 1)
+            bad = target & (dist > CLEAN_FAR_KM) & ~ev
+            if DATA_VERSION >= 2:
+                bad |= self.unsupported(target & ~b & ~self.other, ev)
+            out = np.flatnonzero(bad)
+        cache[a] = out
+        return out
+
+    def time_bounds(self, i):
+        """Earliest / latest true time of every perimeter, hours from perimeter i's stamp."""
+        import intervals as IV
+        rel = (self.times - self.times[i]).total_seconds().values / 3600
+        src = getattr(self, "time_src", None)
+        # a bare date is stored either as 00:00 UTC on the date (NIFS) or as local midnight converted to UTC (GeoMAC).
+        # Both start the bound at the stamp (for 00:00 UTC that is earlier than local midnight: wide, never wrong);
+        # for 00:00 UTC the local day ends -lon/15 h after stamp + 24 h.
+        utc0 = (self.times.hour == 0) & (self.times.minute == 0) & (self.times.second == 0)
+        extra = np.where(utc0, max(0.0, -self.g["transform"][2] / 15), 0.0)
+        return IV.perimeter_bounds(rel, src, extra)
+
+    def intervals(self, i, win, horizon_h=72.0, qc=True):
+        """Interval-censored burn times (intervals.py) for a forecast from perimeter i, inside window win.
+        Returns t_lo, t_hi (inf = right-censored), valid; hours from the start."""
+        import intervals as IV
+        r0, r1, c0, c1 = win
+        lo, hi = self.time_bounds(i)
+        bad = None
+        if qc:
+            bad = np.zeros(self.H * self.W, bool)
+            for a in range(i + 1, len(self.times)):
+                if max(lo[a - 1], 0.0) >= horizon_h:
+                    break
+                if hi[a] <= horizon_h:            # past the horizon the cell is censored at t_lo anyway
+                    bad[self.pair_qc_bad(a)] = True
+            bad = bad.reshape(self.H, self.W)[r0:r1, c0:c1]
+        return IV.interval_labels(self.arrival[r0:r1, c0:c1], i, lo, hi, horizon_h, bad=bad,
+                                  exclude=self.other[r0:r1, c0:c1])
+
+    BIN_CH = 8   # per-bin weather channels: u, v, speed, gust, RH, sin and cos of local solar hour, has data
+
+    def bin_weather(self, i, win, n_bins=24, bin_h=3.0):
+        """HRRR weather in each 3 h bin after perimeter i (observed analyses, as the rest of the inputs), with the
+        same rotation to true north and terrain wind as sample(): (n_bins, BIN_CH, h, w) float32. A bin without
+        HRRR hours takes the nearest bin that has them and its 'has data' channel is 0."""
+        if WEATHER_MODE == "forecast":
+            raise NotImplementedError("per-bin weather is built from observed analyses only (Stage 1)")
+        r0, r1, c0, c1 = win
+        h, w = r1 - r0, c1 - c0
+        t_i = self.times[i]
+        lon0 = self.g["transform"][2]
+        out = np.zeros((n_bins, self.BIN_CH, h, w), np.float32)
+        mids = [t_i + pd.Timedelta(hours=(b + 0.5) * bin_h) for b in range(n_bins)]
+        for b, t in enumerate(mids):
+            hour = t.hour + t.minute / 60 + lon0 / 15
+            out[b, 5], out[b, 6] = math.sin(2 * math.pi * hour / 24), math.cos(2 * math.pi * hour / 24)
+        rz = self.z("hrrr")
+        if rz is None or not len(rz["times"]):
+            return out
+        ts = pd.to_datetime(rz["times"], utc=True)
+        sel = (ts >= t_i) & (ts < t_i + pd.Timedelta(hours=n_bins * bin_h))
+        if not sel.any():
+            return out
+        F = rz["fields"][sel].astype(np.float32)
+        tF = ts[sel]
+        flat = F.reshape(F.shape[0], 4, -1)[:, :, rz["idx"][r0:r1, c0:c1]]
+        ok = np.isfinite(flat[:, 1]).any((1, 2)) & np.isfinite(flat[:, 2]).any((1, 2))
+        if not ok.any():
+            return out
+        flat, tF = flat[ok], tF[ok]
+        u, vv = np.nan_to_num(flat[:, 1]), np.nan_to_num(flat[:, 2])
+        if HRRR_ROTATE:
+            dxg, _, x0g = self.g["transform"][:3]
+            ang = math.radians(HRRR_CONE * (x0g + dxg * (c0 + c1) / 2 - HRRR_LON0))
+            u, vv = u * math.cos(ang) + vv * math.sin(ang), -u * math.sin(ang) + vv * math.cos(ang)
+        spd = np.hypot(u, vv)
+        gust = np.where(np.isfinite(flat[:, 0]), flat[:, 0], spd)
+        if WIND_TERRAIN:
+            tw = self.z(WIND_TERRAIN if isinstance(WIND_TERRAIN, str) else "terrain_wind")
+            if tw is None:
+                TW_MISSING.add(self.fid)
+            else:
+                u, vv = terrain_wind(tw["resp"][:, :, r0:r1, c0:c1], u, vv)
+                spd, broad = np.hypot(u, vv), spd
+                gust = gust * np.clip(spd / np.maximum(broad, 0.5), 0.25, 3.0)
+        rh = flat[:, 3]
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            fill = np.nanmean(rh, 0) if np.isfinite(rh).any() else np.full((h, w), np.nan, np.float32)
+        rh = np.where(np.isfinite(rh), rh, np.where(np.isfinite(fill), fill, 30.0)[None])
+        k = ((tF - t_i).total_seconds().values / 3600 // bin_h).astype(int)
+        have = []
+        for b in range(n_bins):
+            s_ = k == b
+            if s_.any():
+                out[b, 0], out[b, 1] = u[s_].mean(0) / 8, vv[s_].mean(0) / 8
+                out[b, 2], out[b, 3] = spd[s_].mean(0) / 8, gust[s_].max(0) / 20
+                out[b, 4], out[b, 7] = rh[s_].mean(0) / 100, 1.0
+                have.append(b)
+        for b in range(n_bins):
+            if b not in have:
+                near = min(have, key=lambda q: (abs(q - b), q))
+                out[b, :5] = out[near, :5]
+        return out
 
     def fuel_moist(self, sl, t_i, t_j, ter, canopy_cover, h, w):
         """The 'fmoist' input group (fuel_moisture.py): fine dead fuel moisture stepped through the weather
