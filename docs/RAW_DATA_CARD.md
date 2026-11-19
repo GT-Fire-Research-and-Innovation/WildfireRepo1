@@ -174,8 +174,10 @@ What this one fire teaches:
 - **Estimated numbers look precise.** The incident reports give crew sizes like 1,645.3 people: ICS-209-PLUS fills in
   some values by estimation, so they are not exact counts.
 - **The human record helps, and can leak.** Crews mapped 1,793 line records for this fire, as in the table below.
-  The 41 records marked "Uncontrolled Fire Edge" trace the fire's own edge, so using a version from after the
-  prediction day would hand the model the answer.
+  Each record carries the time it was saved, and a model may see it only from the day after. The 41 records
+  marked "Uncontrolled Fire Edge" show why: a day later they are just yesterday's edge, but on the day they were
+  drawn they trace where the fire got to, which is the answer. From 19 Nov records were saved in batches of about
+  400 every two days, so a line built days earlier counts only from the day after its batch was saved.
 
 **What each folder holds for this fire**
 
@@ -185,7 +187,7 @@ What this one fire teaches:
 | `firms` | Series | 8,669 detections inside the fire's box from 70 satellite passes; FIRMS fetched 26 October to 9 December |
 | `goes` | Series | 480 hourly scans from GOES-16; 288 from GOES-17, whose data starts 15 November |
 | `viirs` | Series | 130 satellite passes: 65 from S-NPP and 65 from NOAA-20 |
-| `hrrr` | Series | 160 weather snapshots (every 3 hours) and 20 daily forecasts |
+| `hrrr` | Series | 160 weather snapshots (every 3 hours) |
 | `hrrr_next` | Series | 20 daily forecasts × 12 steps, out to 36 hours |
 | `gfs` | Series | 20 daily forecasts × 80 steps, out to 10 days |
 | `gridmet` | Series | 34 days, 25 October to 27 November, 13 variables |
@@ -267,13 +269,14 @@ next-day spread model is likely to lose without it:
 
 | Rank | Input | From | What it tells the model | Watch out for |
 |---|---|---|---|---|
-| 2 | Completed control lines at the prediction moment | `suppression` | Where crews have already stopped fuel from carrying fire | 2018+ only; use only versions current at that moment |
+| 2 | Completed control lines at the prediction moment | `suppression` | Where crews have already stopped fuel from carrying fire | 2018+ only; show each version from the day after it was saved |
 | 2 | Roads and trails | `osm` | Firebreaks, and where crews can reach | Rural maps can be incomplete |
 | 3 | Planned control lines | `suppression` | Where crews intend to hold the fire | — |
 | 3 | Buildings | `osm` | Homes at risk; crews concentrate there | — |
 | 4 | Containment and crew size | `ics209` | How hard the fire was being fought | 2014–2020 only; one number per report, no map |
 | 4 | Power lines | `osm` | Where fires start, not how they spread | — |
-| Never | Lines that trace the fire's own edge | `suppression` | They are the fire's outline | Use only to check labels |
+| 4 | Mapped fire edge from the day before | `suppression` | Where crews saw the edge yesterday | Repeats the previous perimeter |
+| Never | Any line saved on or after the prediction day | `suppression` | Edge lines drawn that day trace where the fire went | Time each version by the latest of `GDB_FROM_DATE`, `CreateDate`, `DateCurrent` |
 
 ### Words used here
 - **Active fire detection:** a satellite pixel flagged as burning at the moment of the pass.
@@ -300,7 +303,7 @@ next-day spread model is likely to lose without it:
 | firms | NASA FIRMS VIIRS 375 m active fire: S-NPP and NOAA-20 standard product, plus near-real-time for 2024+, from 14 days before the first perimeter to 14 days after the last | all | `<SOURCE>.csv.gz` |
 | gridmet | GRIDMET daily, 13 variables (vpd, fm100, fm1000, bi, erc, rmin, vs, th, tmmx, pr, tmmn, sph, and the 5-day drought index pdsi), from 13 days before the window (pdsi: 23) to 1 day after it, as the THREDDS subset service returns it | all | `gridmet_<var>.nc` (13 files) |
 | ics209 | ICS-209-PLUS (St. Denis et al.): incident and situation-report rows | ≤ 2020 | `incidents.csv`, `sitreps.csv` |
-| suppression | NIFS / ODA EventLine and EventPolygon: every archived version (GDB_FROM_DATE / GDB_TO_DATE) | 2018+ | `event_lines.geojson.gz`, `event_polygons.geojson.gz` |
+| suppression | NIFS / ODA EventLine and EventPolygon: every archived version (GDB_FROM_DATE / GDB_TO_DATE), with its CreateDate and DateCurrent; a model may use a version only from the burn day after the latest of the three | 2018+ | `event_lines.geojson.gz`, `event_polygons.geojson.gz` |
 | tessera | GeoTessera v1.1: reference only (year, region, how to fetch) | 2018+ | `tessera_ref.json` |
 | terrain | Copernicus GLO-30 DEM, native 1 arc-second | all | `dem_glo30.tif` |
 | landfire | LANDFIRE FBFM40, CC, CH, CBH, CBD from the newest version before the fire: the stored 30 m pixels in EPSG:5070 from LANDFIRE's image services (snapped to its grid, nearest neighbour), LZW GeoTIFF as the server returns it | 2017+ | `landfire_<version>_<layer>.tif` (5 files) |
@@ -308,7 +311,7 @@ next-day spread model is likely to lose without it:
 | landcover | MODIS MCD12Q1 v061 annual land cover of the year before the fire, every layer (LC_Type1-5, LC_Prop1-3 and assessments, QC, LW), on the sinusoidal 463 m grid; tiles joined pixel for pixel | all | `mcd12q1_<year>.nc` |
 | vegetation | VIIRS VNP13A1 v002 16-day vegetation indices, every layer (NDVI, EVI, EVI2, reflectances, angles, composite day, VI quality, pixel reliability), each composite overlapping 16 days before the window to its end, sinusoidal 463 m grid | all | `vnp13a1.nc` (`time` = composite start) |
 | goes | GOES-16/17/18/19 ABI L2 fire product (FDCC): the scan nearest each hour of the window, cropped on the fixed grid; Mask/Power/Area/Temp/DQF stay packed as in the source | window ≥ 2017-06 | `goes_<sat>.nc` |
-| hrrr | NOAA HRRR GUST, UGRD/VGRD 10 m, RH 2 m, decoded from the files' own GRIB2 messages and cropped on the native 3 km grid: analyses every 3 h and the 12z run's 9 h forecast each day of the window | window ≥ 2014-08 | `hrrr_ana.nc`, `hrrr_fc.nc` |
+| hrrr | NOAA HRRR GUST, UGRD/VGRD 10 m, RH 2 m, decoded from the files' own GRIB2 messages and cropped on the native 3 km grid: analyses every 3 h across the window (the 12z run's forecasts are in `hrrr_next`) | window ≥ 2014-08 | `hrrr_ana.nc` |
 | hrrr_next | NOAA HRRR, the 12z run's forecasts every 3 h out to 36 h for each day (to 15 h before 2016-08-23, 18 h before 2018-07-12): GUST, UGRD/VGRD 10 m, RH 2 m, TMP 2 m, SPFH 2 m, APCP accumulated from the run start; `lead_h` and `run_time` per step | window ≥ 2014-08 | `hrrr_next.nc` |
 | gfs | NOAA GFS 0.25° (TS-SatFire's forecast source) from Google Earth Engine `NOAA/GFS0P25`: the 12z run's forecasts every 3 h out to 10 days for each day of the window (to 36 h before 2017-07-09, as the collection holds them), every band of each image (2 m temperature in °C, specific / relative humidity, 10 m wind, precipitation accumulated over the last 1–6 h, precipitable water, cloud cover, radiation; more bands from 2025-01-15) on the native 0.25° grid; `lead_h` and `run_time` per step | window ≥ 2015-07 | `gfs.nc` |
 | osm | OpenStreetMap, Geofabrik snapshot of 1 January of the fire's year: full extract of the region | all | `osm_<YYYY>-01-01.osm.pbf` |

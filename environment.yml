@@ -1,32 +1,26 @@
-# Conda environment (no root needed: PACE, RunPod, a desktop). Python 3.12+ is required by geotessera.
-#   mamba env create -f environment.yml -p ~/scratch/envs/wildfire
-#   export PATH=~/scratch/envs/wildfire/bin:$PATH      (PACE: load only the mamba module)
-#   pip install --index-url https://download.pytorch.org/whl/cu124 torch    # GPU build of PyTorch
-name: wildfire
+# Conda environment for the raw data grab (no root needed: PACE, a desktop).
+#   mamba env create -f environment.yml -p ~/scratch/envs/wildfire-raw
+#   export PATH=~/scratch/envs/wildfire-raw/bin:$PATH      (PACE: load only the mamba module)
+name: wildfire-raw
 channels: [conda-forge]
 dependencies:
   - python=3.12
   - numpy
   - pandas
-  - scipy
-  - scikit-learn
   - geopandas
   - pyogrio
   - shapely>=2
   - rasterio
   - pyproj
-  - xarray
   - netcdf4
-  - zarr
   - pygrib
   - h5py
   - pyhdf
   - osmium-tool
   - aria2
-  - matplotlib
   - requests
   - huggingface_hub
+  - pytest
   - pip
   - pip:
-      - geotessera
       - earthengine-api

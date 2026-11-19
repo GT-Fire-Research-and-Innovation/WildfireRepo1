@@ -1,44 +1,15 @@
 """
-Daily weather for every fire, beyond what TS-SatFire carries.
+GRIDMET and HRRR access for the raw grab (raw_channels.py: gridmet, hrrr, hrrr_next).
 
-For each fire (from OUT_DIR/fires.json, written by nifc_perimeters.py) and each day from
-6 days before its first TS-SatFire day to 2 days after its last:
-
-  GRIDMET (daily, ~4 km; via the THREDDS OPeNDAP aggregations, only the fire's box is read)
-    vpd      mean vapor pressure deficit (kPa)
-    fm100    100-hour dead fuel moisture (%)
-    fm1000   1000-hour dead fuel moisture (%)
-    bi       burning index
-    erc      energy release component
-    rmin     minimum relative humidity (%)
-    vs       mean wind speed at 10 m (m/s)
-    th       wind direction (degrees, from)
-    tmmx     maximum temperature (K)
-
-  HRRR (hourly model, 3 km; only 4 fields are fetched per file using the .idx byte ranges)
-    ana  = 21 UTC analysis of that day (early afternoon in the West): what the weather WAS
-    fc   = 12 UTC run, 9-hour forecast, valid 21 UTC that day: what was FORECAST that morning
-    fields: gust (m/s), u10, v10 (m/s), rh2 (%)
-
-  To predict growth from day t to t+1 without peeking, use GRIDMET/HRRR-ana up to day t and
-  HRRR-fc for day t+1 (issued 12 UTC on t+1, i.e. ~5-6 am in the West, around when the
-  day-t perimeter is mapped).
-
-Output: OUT_DIR/weather/<fire_id>.npz
-  dates (D,), gm (D, 9, hg, wg) float32, gm_vars, gm_lat (hg,), gm_lon (wg,)
-  hrrr_ana (D, 4, hh, wh), hrrr_fc (D, 4, hh, wh), hrrr_vars, hrrr_lat (hh, wh), hrrr_lon (hh, wh)
-  NaN where data were missing.
+  GRIDMET, GM_VARS   THREDDS aggregation URL and the names of 9 variables inside it (raw_channels adds the rest)
+  hrrr_fetch         chosen GRIB2 messages of one HRRR file, fetched by the byte ranges in its .idx
+  hrrr_latlon        latitude / longitude of HRRR's 3 km Lambert grid
+  hrrr_window        rows / cols of that grid covering a box (plus PAD_DEG)
 """
-import argparse
-import warnings
-import json
-import sys
 import time
-from concurrent.futures import ThreadPoolExecutor
-from pathlib import Path
+import warnings
 
 import numpy as np
-import pandas as pd
 
 GRIDMET = "https://thredds.northwestknowledge.net/thredds/dodsC/agg_met_{v}_1979_CurrentYear_CONUS.nc"
 GM_VARS = {  # short name -> variable inside the aggregation
@@ -57,45 +28,6 @@ HRRR_FIELDS = [("gust", ":GUST:surface:"), ("u10", ":UGRD:10 m above ground:"),
                ("v10", ":VGRD:10 m above ground:"), ("rh2", ":RH:2 m above ground:")]
 warnings.filterwarnings("ignore")
 PAD_DEG = 0.05
-DAYS_BEFORE, DAYS_AFTER = 6, 2
-
-
-def _session():
-    import requests
-    s = requests.Session()
-    s.headers["User-Agent"] = "tesserafire-weather/1.0"
-    return s
-
-
-def fire_days(fire):
-    d0 = pd.Timestamp(fire["first_day"] or f"{fire['fire_year']}-07-01") - pd.Timedelta(days=DAYS_BEFORE)
-    d1 = pd.Timestamp(fire["last_day"] or fire["first_day"] or f"{fire['fire_year']}-07-01") + pd.Timedelta(days=DAYS_AFTER)
-    return pd.date_range(d0, d1)
-
-
-# ---------------------------------------------------------------------------- GRIDMET
-
-def gridmet_fire(datasets, fire, days):
-    w, s, e, n = fire["bounds_lonlat"]
-    out, lat, lon = [], None, None
-    for short, ds in datasets.items():
-        var = GM_VARS[short]
-        sub = ds[var].sel(lat=slice(n + PAD_DEG, s - PAD_DEG), lon=slice(w - PAD_DEG, e + PAD_DEG),
-                          day=slice(days[0], days[-1]))
-        for tries in range(5):
-            try:
-                arr = sub.load()
-                break
-            except Exception as ex:  # noqa: BLE001
-                if tries == 4:
-                    raise
-                print(f"    gridmet {short} retry ({ex})")
-                time.sleep(5 * (tries + 1))
-        arr = arr.reindex(day=days)  # NaN for missing days
-        out.append(arr.values.astype(np.float32))
-        lat, lon = arr["lat"].values, arr["lon"].values
-    return np.stack(out, axis=1), lat, lon  # (D, V, hg, wg)
-
 
 # ---------------------------------------------------------------------------- HRRR
 
@@ -155,88 +87,3 @@ def hrrr_window(lat, lon, bounds):
     if not len(rows):
         return None
     return rows.min(), rows.max() + 1, cols.min(), cols.max() + 1
-
-
-# ---------------------------------------------------------------------------- driver
-
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--out", default="nifc_out")
-    ap.add_argument("--fires", nargs="*")
-    ap.add_argument("--redo", action="store_true")
-    ap.add_argument("--workers", type=int, default=8)
-    args = ap.parse_args()
-    out = Path(args.out)
-    (out / "weather").mkdir(parents=True, exist_ok=True)
-    fires = json.loads((out / "fires.json").read_text())
-    ids = sorted(fires) if not args.fires else [f for f in sorted(fires) if f in set(args.fires)]
-    todo = [f for f in ids if args.redo or not (out / "weather" / f"{f}.npz").exists()]
-    print(f"{len(todo)} of {len(ids)} fires to do")
-    if not todo:
-        return
-
-    import xarray as xr
-    gm = {k: xr.open_dataset(GRIDMET.format(v=k), engine="netcdf4") for k in GM_VARS}
-    sess = _session()
-    hlat, hlon = hrrr_latlon(sess)
-
-    # HRRR: fetch each needed date once (analysis + morning forecast), crop for every fire.
-    need = {}
-    for fid in todo:
-        for d in fire_days(fires[fid]):
-            need.setdefault(d.strftime("%Y%m%d"), []).append(fid)
-    wins = {fid: hrrr_window(hlat, hlon, fires[fid]["bounds_lonlat"]) for fid in todo}
-    crops = {fid: {} for fid in todo}  # fid -> {(date, kind): (4, hh, wh)}
-
-    def job(dk):
-        d, kind = dk
-        url = HRRR.format(d=d, h=21, f=0) if kind == "ana" else HRRR.format(d=d, h=12, f=9)
-        return dk, hrrr_fetch(_session(), url)
-
-    jobs = [(d, k) for d in sorted(need) for k in ("ana", "fc")]
-    print(f"HRRR: {len(need)} dates, {len(jobs)} files")
-    t0 = time.time()
-    with ThreadPoolExecutor(args.workers) as ex:
-        for i, ((d, kind), fields) in enumerate(ex.map(job, jobs)):
-            if fields is not None:
-                for fid in need[d]:
-                    w = wins[fid]
-                    if w is None:
-                        continue
-                    r0, r1, c0, c1 = w
-                    crops[fid][(d, kind)] = np.stack([fields[n][r0:r1, c0:c1] for n, _ in HRRR_FIELDS])
-            if (i + 1) % 100 == 0:
-                print(f"  HRRR {i + 1}/{len(jobs)} files ({time.time() - t0:.0f}s)")
-
-    for k, fid in enumerate(todo):
-        fire = fires[fid]
-        days = fire_days(fire)
-        t1 = time.time()
-        try:
-            g, glat, glon = gridmet_fire(gm, fire, days)
-        except Exception as ex:  # noqa: BLE001
-            print(f"[{k + 1}/{len(todo)}] {fid}: GRIDMET ERROR {ex}")
-            continue
-        w = wins[fid]
-        if w is None:
-            ana = fc = np.zeros((len(days), 4, 0, 0), np.float32)
-            hl = hn = np.zeros((0, 0), np.float32)
-        else:
-            r0, r1, c0, c1 = w
-            shape = (4, r1 - r0, c1 - c0)
-            blank = np.full(shape, np.nan, np.float32)
-            ana = np.stack([crops[fid].get((d.strftime("%Y%m%d"), "ana"), blank) for d in days])
-            fc = np.stack([crops[fid].get((d.strftime("%Y%m%d"), "fc"), blank) for d in days])
-            hl, hn = hlat[r0:r1, c0:c1].astype(np.float32), hlon[r0:r1, c0:c1].astype(np.float32)
-        np.savez_compressed(out / "weather" / f"{fid}.npz",
-                            dates=np.array([str(d.date()) for d in days]), gm=g, gm_vars=np.array(list(GM_VARS)),
-                            gm_lat=glat, gm_lon=glon, hrrr_ana=ana, hrrr_fc=fc,
-                            hrrr_vars=np.array([n for n, _ in HRRR_FIELDS]), hrrr_lat=hl, hrrr_lon=hn)
-        miss = float(np.isnan(ana).mean()) if ana.size else 1.0
-        print(f"[{k + 1}/{len(todo)}] {fid}: {len(days)} days, gridmet {g.shape[2:]}, hrrr {ana.shape[2:]}, "
-              f"hrrr missing {miss:.0%} ({time.time() - t1:.0f}s)")
-    print("Done:", out / "weather")
-
-
-if __name__ == "__main__":
-    sys.exit(main())

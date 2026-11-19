@@ -58,7 +58,6 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
-sys.path.insert(0, str(HERE.parent))
 
 import raw_channels as RC  # noqa: E402
 
@@ -71,12 +70,29 @@ MANIFEST_COLS = ["fire_id", "name", "year", "channel", "status", "n_files", "byt
 
 # ------------------------------------------------------------------------------------- fire list
 
+GRID_RES_M = 150.0               # the built dataset's cell size and margin: its grid box is each fire's "bounds"
+GRID_PAD_KM = 9.6
+
+
+def build_grid(row):
+    """The built dataset's grid for a catalog row: the perimeters' box plus GRID_PAD_KM, on GRID_RES_M cells
+    (north-up lon/lat). -> {"transform": [dx, 0, x0, 0, -dy, y0], "bounds_lonlat": [w, s, e, n]}"""
+    import math
+    pad = int(round(GRID_PAD_KM * 1000 / GRID_RES_M))
+    lat0 = (row.south + row.north) / 2
+    dy = GRID_RES_M / 110570.0
+    dx = GRID_RES_M / (111320.0 * math.cos(math.radians(lat0)))
+    w = int(math.ceil((row.east - row.west) / dx)) + 2 * pad
+    h = int(math.ceil((row.north - row.south) / dy)) + 2 * pad
+    x0, y0 = row.west - pad * dx, row.north + pad * dy
+    return {"transform": [dx, 0.0, x0, 0.0, -dy, y0], "bounds_lonlat": [x0, y0 - h * dy, x0 + w * dx, y0]}
+
+
 def load_fires(source_repo, which="built", ids=None, cache=None):
     """Fires as dicts: fire_id, incident, name, year, first, last, bounds (build grid box), grid_transform,
     perim_bounds (the perimeters' own box), rating."""
     import pandas as pd
     from huggingface_hub import HfApi, hf_hub_download
-    import build_multiyear as BM
     kw = dict(repo_type="dataset", local_dir=str(cache) if cache else None)
     cat = pd.read_csv(hf_hub_download(source_repo, "catalog/fires.csv", **kw))
     qc = pd.read_csv(hf_hub_download(source_repo, "catalog/qc_fires.csv", **kw), usecols=["fire_id", "rating"])
@@ -90,7 +106,7 @@ def load_fires(source_repo, which="built", ids=None, cache=None):
         cat = cat[cat.fire_id.isin(set(ids))]
     fires = []
     for _, row in cat.iterrows():
-        g = BM.make_grid(row)
+        g = build_grid(row)
         fires.append(dict(fire_id=row.fire_id, incident=str(row.incident), name=str(row["name"]), year=int(row.year),
                           first=str(row["first"]), last=str(row["last"]), bounds=list(g["bounds_lonlat"]),
                           grid_transform=list(g["transform"]),

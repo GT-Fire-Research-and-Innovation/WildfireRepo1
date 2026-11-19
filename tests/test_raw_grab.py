@@ -434,7 +434,6 @@ class _GoesCtx:
 def test_goes_skips_a_damaged_scan_instead_of_stopping_the_channel(tmp_path, monkeypatch):
     netCDF4 = pytest.importorskip("netCDF4")
     import numpy as np
-    import build_multiyear as BM
     good, good2 = _fdcc(tmp_path / "a.nc", seed=1), _fdcc(tmp_path / "b.nc", seed=2)
     bad = _break_chunks(good, tmp_path)
     with netCDF4.Dataset("mem", memory=bad) as ds:          # the Kaggle failure: opens, then the read fails
@@ -450,7 +449,7 @@ def test_goes_skips_a_damaged_scan_instead_of_stopping_the_channel(tmp_path, mon
             key(hours[2], 1): bad, key(hours[2], 6): bad}                               # nothing readable that hour
     s3 = _S3(objs, garble={key(hours[1], 1): 1})
     lat, lon = np.meshgrid(np.linspace(44, 36, 40), np.linspace(-125, -117, 40), indexing="ij")
-    monkeypatch.setattr(BM, "_goes_latlon", lambda ds: (lat.astype("f4"), lon.astype("f4")))
+    monkeypatch.setattr(RC, "goes_latlon", lambda ds: (lat.astype("f4"), lon.astype("f4")))
     monkeypatch.setattr(RC, "goes_hours", lambda f: [(t, [("G16", "bkt")]) for t in hours])
     monkeypatch.setattr(RC.time, "sleep", lambda s: None)
 
@@ -461,3 +460,38 @@ def test_goes_skips_a_damaged_scan_instead_of_stopping_the_channel(tmp_path, mon
     with netCDF4.Dataset(tmp_path / "w" / "stage" / CAMP["fire_id"] / "goes" / "goes_G16.nc") as ds:
         assert list(ds.variables["source"][:]) == [f"s3://bkt/{key(hours[0], 6)}", f"s3://bkt/{key(hours[1], 1)}"]
         assert ds.variables["Mask"].shape[0] == 2 and ds.variables["Mask"][:].mask.sum() == 0
+
+
+class _HrrrCtx(_GoesCtx):
+    def stage(self, fid):
+        p = self.root / "stage" / fid / "hrrr"
+        p.mkdir(parents=True, exist_ok=True)
+        return p
+
+    def memo(self, key, fn):
+        return fn()
+
+
+def test_hrrr_writes_only_the_analyses(tmp_path, monkeypatch):
+    """The 12z run's 9 h forecast is hrrr_next's lead_h = 9 step, so hrrr fetches only f00 analyses."""
+    netCDF4 = pytest.importorskip("netCDF4")
+    import numpy as np
+    import weather_features as WF
+    lat, lon = np.meshgrid(np.linspace(41, 38, 40), np.linspace(-123, -120, 40), indexing="ij")
+    urls = []
+
+    def fetch(sess, url, fields=None):
+        urls.append(url)
+        return {n: np.full(lat.shape, float(len(urls)), np.float32) for n, _ in WF.HRRR_FIELDS}
+
+    monkeypatch.setattr(WF, "hrrr_latlon", lambda sess: (lat, lon))
+    monkeypatch.setattr(WF, "hrrr_fetch", fetch)
+    [(f, status, sources, err)] = list(RC.grab_hrrr_many([CAMP], _HrrrCtx(tmp_path, None)))
+    ana, _ = RC.hrrr_times(CAMP)
+    assert status == "ok" and err is None and len(sources) == len(ana) == len(urls)
+    assert all(u.endswith("wrfsfcf00.grib2") for u in urls)
+    stage = tmp_path / "stage" / CAMP["fire_id"] / "hrrr"
+    assert sorted(p.name for p in stage.iterdir()) == ["hrrr_ana.nc"]
+    with netCDF4.Dataset(stage / "hrrr_ana.nc") as ds:
+        t = ds["time"][:]
+        assert len(t) == len(ana) and t[0] == ana[0].value and {"gust", "u10", "v10", "rh2"} <= set(ds.variables)

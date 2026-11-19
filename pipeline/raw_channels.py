@@ -22,7 +22,7 @@ Channels (cheap -> heavy) and what each writes into fires/<fire_id>/<channel>/:
   landcover    MODIS MCD12Q1 annual land cover, sinusoidal 463 m (Earthdata)     mcd12q1_<year>.nc
   vegetation   VIIRS VNP13A1 16-day vegetation indices, sinusoidal 463 m (Earthdata) vnp13a1.nc
   goes         GOES-16/17/18/19 ABI L2 FDCC, hourly scan, fixed-grid crop        goes_<sat>.nc
-  hrrr         HRRR gust/u10/v10/rh2, 3-hourly analyses + 12z+9h forecasts       hrrr_ana.nc, hrrr_fc.nc
+  hrrr         HRRR gust/u10/v10/rh2, 3-hourly analyses                          hrrr_ana.nc
   hrrr_next    HRRR 12z run every 3 h out to 36 h: + t2/q2/apcp                  hrrr_next.nc
   gfs          NOAA GFS 0.25 deg 12z run every 3 h out to 10 days (Earth Engine)   gfs.nc
   osm          OpenStreetMap 1 January snapshot of the fire's year, full extract osm_<YYYY>-01-01.osm.pbf
@@ -56,7 +56,6 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
-sys.path.insert(0, str(HERE.parent))
 
 CHANNELS = ["history", "perimeters", "firms", "gridmet", "ics209", "suppression", "tessera", "terrain",
             "landfire", "lulc", "landcover", "vegetation", "goes", "hrrr", "hrrr_next", "gfs", "osm", "viirs"]
@@ -322,7 +321,7 @@ def window_label(channel, fire):
 
 
 def landfire_version(year):
-    """Same rule as build_multiyear.landfire_version: newest LANDFIRE that predates the fire."""
+    """The newest LANDFIRE version that predates the fire (the built dataset's rule)."""
     if year <= 2016:
         return None
     if year <= 2022:
@@ -352,9 +351,8 @@ def applies(channel, fire):
     if channel == "lulc" and y < LULC_FIRST_YEAR:
         return "Esri 10 m land cover starts 2017"
     if channel == "osm":
-        import human_features as HF
         try:
-            HF.region_file({"bounds_lonlat": area(fire)})
+            osm_region(area(fire))
         except RuntimeError as ex:
             return str(ex)
     return None
@@ -510,8 +508,7 @@ class Ctx:
 def requirements(channel):
     """Raise SystemExit when the channel cannot run here (missing key or tool)."""
     if channel == "firms":
-        from live import firms
-        firms.map_key()
+        firms_map_key()
     if channel == "osm" and not shutil.which("osmium"):
         raise SystemExit("osm needs osmium-tool (apt-get install -y osmium-tool, or conda install osmium-tool)")
     if channel in ("hrrr", "hrrr_next"):
@@ -653,12 +650,15 @@ def _box_query(ctx, url, bbox):
 
 # ------------------------------------------------------------------------------------- per-fire channels
 
+HIST_URL = ("https://services3.arcgis.com/T4QMspbfLg3qTGWY/arcgis/rest/services/"
+            "InterAgencyFirePerimeterHistory_All_Years_View/FeatureServer/0")
+
+
 def grab_history(fire, out, ctx):
-    import build_multiyear as BM
     where = f"FIRE_YEAR_INT < {int(fire['year'])}"
-    feats = arcgis_box_features(ctx.sess, BM.HIST_URL, area(fire), where=where, chunk=100)
+    feats = arcgis_box_features(ctx.sess, HIST_URL, area(fire), where=where, chunk=100)
     _write_geojson(out / "history.geojson.gz", feats)
-    return ("ok" if feats else "empty"), [arcgis_query_url(BM.HIST_URL, area(fire), where=where)]
+    return ("ok" if feats else "empty"), [arcgis_query_url(HIST_URL, area(fire), where=where)]
 
 
 def _perimeter_layers(ctx, year):
@@ -694,17 +694,52 @@ def grab_perimeters(fire, out, ctx):
     return ("ok" if keep else "empty"), sources
 
 
+FIRMS_API = "https://firms.modaps.eosdis.nasa.gov/api/area/csv/{key}/{src}/{bbox}/{days}"
+FIRMS_NRT = ["VIIRS_SNPP_NRT", "VIIRS_NOAA20_NRT", "VIIRS_NOAA21_NRT"]
+
+
+def firms_map_key():
+    """FIRMS MAP_KEY from the FIRMS_MAP_KEY environment variable or a .env file (never committed)."""
+    key = os.environ.get("FIRMS_MAP_KEY")
+    for p in (Path(".env"), Path.home() / ".config" / "wildfire" / "env"):
+        if not key and p.exists():
+            for line in p.read_text().splitlines():
+                if line.startswith("FIRMS_MAP_KEY="):
+                    key = line.split("=", 1)[1].strip()
+    if not key:
+        raise SystemExit("Set FIRMS_MAP_KEY (environment or .env).")
+    return key
+
+
+def firms_get(src, bbox, days, day=None):
+    """One FIRMS area call (up to 5 days from `day`): the detections as FIRMS returns them, plus 'source'."""
+    import io
+    import pandas as pd
+    import requests
+    url = FIRMS_API.format(key=firms_map_key(), src=src, bbox=",".join(f"{v:.4f}" for v in bbox), days=days)
+    if day:
+        url += f"/{day}"
+    for t in range(4):
+        r = requests.get(url, timeout=120)
+        if r.status_code == 200 and not r.text.startswith("Invalid"):
+            df = pd.read_csv(io.StringIO(r.text)) if r.text.strip() else pd.DataFrame()
+            if len(df):
+                df["source"] = src
+            return df
+        time.sleep(10 * (t + 1))
+    raise RuntimeError(f"FIRMS {src}: HTTP {r.status_code} {r.text[:200]}")
+
+
 def grab_firms(fire, out, ctx):
     """FIRMS area API, 5-day calls; NRT fills the days the standard product has not reached (2024+)."""
     import pandas as pd
-    from live import firms
     frames, sources = {}, []
 
     def call(src, day, k):
         ctx.throttle(0.15)                              # 5000 transactions / 10 min per key
-        df = firms.get(src, area(fire), k, day)
+        df = firms_get(src, area(fire), k, day)
         bbox = ",".join(f"{v:.4f}" for v in area(fire))
-        sources.append(redact(firms.API.format(key="KEY", src=src, bbox=bbox, days=k) + f"/{day}"))
+        sources.append(redact(FIRMS_API.format(key="KEY", src=src, bbox=bbox, days=k) + f"/{day}"))
         if len(df):
             frames.setdefault(src, []).append(df)
 
@@ -716,7 +751,7 @@ def grab_firms(fire, out, ctx):
         start = (max(sp) + pd.Timedelta(days=1)) if sp else ds[0]
         while start <= ds[-1]:
             k = min(5, (ds[-1] - start).days + 1)
-            for src in firms.NRT:
+            for src in FIRMS_NRT:
                 call(src, start.date().isoformat(), k)
             start += pd.Timedelta(days=k)
     n = 0
@@ -855,17 +890,20 @@ def grab_tessera(fire, out, ctx):
     return "ok", ref["links"][:1]
 
 
+DEM_URL = ("https://copernicus-dem-30m.s3.amazonaws.com/Copernicus_DSM_COG_10_{ns}{lat:02d}_00_{ew}{lon:03d}_00_DEM/"
+           "Copernicus_DSM_COG_10_{ns}{lat:02d}_00_{ew}{lon:03d}_00_DEM.tif")
+
+
 def grab_terrain(fire, out, ctx):
     """Copernicus GLO-30 at its native 1 arc-second grid, cut to the box from the 1-degree COG tiles."""
     import rasterio
     from rasterio.merge import merge
-    import build_dataset as B
     w, s, e, n = area(fire)
     srcs, sources = [], []
     with rasterio.Env(GDAL_DISABLE_READDIR_ON_OPEN="EMPTY_DIR", CPL_VSIL_CURL_ALLOWED_EXTENSIONS=".tif"):
         for lat in range(math.floor(s), math.floor(n) + 1):
             for lon in range(math.floor(w), math.floor(e) + 1):
-                url = B.DEM_URL.format(ns="N" if lat >= 0 else "S", lat=abs(lat), ew="W" if lon < 0 else "E", lon=abs(lon))
+                url = DEM_URL.format(ns="N" if lat >= 0 else "S", lat=abs(lat), ew="W" if lon < 0 else "E", lon=abs(lon))
                 code = ctx.sess.head(url, timeout=60).status_code
                 if code in (403, 404):
                     continue                                 # ocean: the archive has no tile there
@@ -1353,18 +1391,40 @@ def _s3_get(ctx, bucket, key):
     return data
 
 
+def goes_latlon(ds):
+    """Latitude/longitude of the ABI fixed grid (GOES-R PUG formulas)."""
+    import numpy as np
+    p = ds.variables["goes_imager_projection"]
+    H = p.perspective_point_height + p.semi_major_axis
+    req, rpol = p.semi_major_axis, p.semi_minor_axis
+    lon0 = math.radians(p.longitude_of_projection_origin)
+    x = ds.variables["x"][:].astype(np.float64)
+    y = ds.variables["y"][:].astype(np.float64)
+    X, Y = np.meshgrid(x, y)
+    a = np.sin(X) ** 2 + np.cos(X) ** 2 * (np.cos(Y) ** 2 + (req / rpol) ** 2 * np.sin(Y) ** 2)
+    b = -2 * H * np.cos(X) * np.cos(Y)
+    c = H ** 2 - req ** 2
+    with np.errstate(invalid="ignore"):
+        rs = (-b - np.sqrt(b ** 2 - 4 * a * c)) / (2 * a)
+        sx = rs * np.cos(X) * np.cos(Y)
+        sy = -rs * np.sin(X)
+        sz = rs * np.cos(X) * np.sin(Y)
+        lat = np.degrees(np.arctan((req / rpol) ** 2 * sz / np.sqrt((H - sx) ** 2 + sy ** 2)))
+        lon = np.degrees(lon0 - np.arctan(sy / (H - sx)))
+    return lat.astype(np.float32), lon.astype(np.float32)
+
+
 def _read_goes_scan(netCDF4, data, ctx, grids, sat):
     """Everything grab_goes_many takes from one FDCC file, read in full and the file closed again:
     {"vars": {name: (array, dtype, attrs)} packed as in the file, "x", "y", "proj": the projection's
     attributes, "latlon": (lat, lon) of its grid}. A file with a damaged compressed chunk opens fine and fails
     only when that chunk is read ("RuntimeError: NetCDF: HDF error"); reading it all here makes such a file
     fail as a whole, before any fire's series gets part of the scan."""
-    import build_multiyear as BM
     ds, tmp = _open_nc_bytes(netCDF4, data, ctx)
     try:
         shape = ds.variables["Mask"].shape
         if (sat, shape) not in grids:
-            grids[(sat, shape)] = BM._goes_latlon(ds)
+            grids[(sat, shape)] = goes_latlon(ds)
         proj = ds.variables["goes_imager_projection"]
         scan = {"vars": {}, "latlon": grids[(sat, shape)], "x": ds.variables["x"][:], "y": ds.variables["y"][:],
                 "proj": {a: proj.getncattr(a) for a in proj.ncattrs()}}
@@ -1492,18 +1552,16 @@ def grab_goes_many(fires, ctx, chunk=25):
 
 def grab_hrrr_many(fires, ctx, chunk=25, step_h=3):
     """gust, u10, v10, rh2 decoded from each HRRR file's own GRIB2 messages (fetched by .idx byte range),
-    cropped to the fire on HRRR's native 3 km Lambert grid: analyses (f00) every step_h hours and the 12z
-    run's f09 forecast each day."""
-    import pandas as pd
+    cropped to the fire on HRRR's native 3 km Lambert grid: analyses (f00) every step_h hours. The 12z run's
+    forecasts are hrrr_next's (its lead_h = 9 step is the same file, fields and crop the old hrrr_fc.nc held)."""
     from concurrent.futures import ThreadPoolExecutor
     import weather_features as WF
     lat, lon = ctx.memo("hrrr_grid", lambda: WF.hrrr_latlon(ctx.sess))
     names = [n for n, _ in WF.HRRR_FIELDS]
 
-    def fetch(key):
-        t, f = key
-        url = WF.HRRR.format(d=t.strftime("%Y%m%d"), h=t.hour, f=f)
-        return key, url, WF.hrrr_fetch(ctx.sess, url)
+    def fetch(t):
+        url = WF.HRRR.format(d=t.strftime("%Y%m%d"), h=t.hour, f=0)
+        return t, url, WF.hrrr_fetch(ctx.sess, url)
 
     for group in _chunks(fires, chunk):
         if ctx.expired():
@@ -1511,62 +1569,77 @@ def grab_hrrr_many(fires, ctx, chunk=25, step_h=3):
         need, left, wins, series, got_n = {}, {}, {}, {}, {}
         for f in group:
             fid = f["fire_id"]
-            ana, fc = hrrr_times(f, step_h)
+            ana, _ = hrrr_times(f, step_h)
             ana = [t for t in ana if t >= _ts(HRRR_START)]
-            fc = [t for t in fc if t >= _ts(HRRR_START)]
             wins[fid] = WF.hrrr_window(lat, lon, area(f))
-            left[fid], got_n[fid] = len(ana) + len(fc), []
+            left[fid], got_n[fid] = len(ana), []
+            if not ana:
+                yield f, "empty", [], None
             for t in ana:
-                need.setdefault((t, 0), []).append((f, "ana"))
-            for t in fc:
-                need.setdefault((t, 9), []).append((f, "fc"))
+                need.setdefault(t, []).append(f)
         stopped = False
         with ThreadPoolExecutor(ctx.threads) as ex:
-            for (t, fh), url, got in _windowed_map(ex, fetch, sorted(need), 2 * ctx.threads):
-                for f, which in need[(t, fh)]:
+            for t, url, got in _windowed_map(ex, fetch, sorted(need), 2 * ctx.threads):
+                for f in need[t]:
                     fid = f["fire_id"]
                     win = wins[fid]
                     if got and win is not None:
                         r0, r1, c0, c1 = win
-                        k = (fid, which)
-                        if k not in series:
-                            series[k] = NcSeries(ctx.stage(fid) / f"hrrr_{which}.nc", lat[r0:r1, c0:c1], lon[r0:r1, c0:c1],
-                                                 {"title": f"HRRR {'analyses (f00)' if which == 'ana' else '12z run, 9 h forecast'} cropped to {fid}",
-                                                  "fire_id": fid, "source": "https://noaa-hrrr-bdp-pds.s3.amazonaws.com/",
-                                                  "fields": "GUST surface; UGRD/VGRD 10 m; RH 2 m",
-                                                  "window_rows_cols": f"{r0}:{r1},{c0}:{c1}"})
-                        valid = t + pd.Timedelta(hours=fh)
-                        series[k].append(valid.value, url, {n: (got[n][r0:r1, c0:c1], "f4", {}) for n in names if n in got})
+                        if fid not in series:
+                            series[fid] = NcSeries(ctx.stage(fid) / "hrrr_ana.nc", lat[r0:r1, c0:c1], lon[r0:r1, c0:c1],
+                                                   {"title": f"HRRR analyses (f00) cropped to {fid}",
+                                                    "fire_id": fid, "source": "https://noaa-hrrr-bdp-pds.s3.amazonaws.com/",
+                                                    "fields": "GUST surface; UGRD/VGRD 10 m; RH 2 m",
+                                                    "window_rows_cols": f"{r0}:{r1},{c0}:{c1}"})
+                        series[fid].append(t.value, url, {n: (got[n][r0:r1, c0:c1], "f4", {}) for n in names if n in got})
                         got_n[fid].append(url)
                     left[fid] -= 1
                     if left[fid] == 0:
-                        for w in ("ana", "fc"):
-                            if (fid, w) in series:
-                                series.pop((fid, w)).close()
+                        if fid in series:
+                            series.pop(fid).close()
                         yield f, ("ok" if got_n[fid] else "empty"), sorted(got_n[fid]), None
                 if ctx.expired():
                     stopped = True
                     break
         if stopped:
-            for (fid, _), s in series.items():
+            for fid, s in series.items():
                 s.close()
                 ctx.drop_stage(fid)
             return
+
+
+GEOFABRIK = "https://download.geofabrik.de/north-america"
+# Fires outside the us-west region file: (state file, lon_min, lat_min, lon_max, lat_max).
+OSM_EAST_STATES = [("us/kansas", -102.06, 36.99, -94.58, 40.01), ("us/oklahoma", -103.0, 33.6, -94.4, 37.0),
+                   ("us/texas", -106.65, 25.8, -93.5, 36.5), ("us/florida", -87.7, 24.4, -79.9, 31.0),
+                   ("us/nebraska", -104.06, 40.0, -95.3, 43.0), ("us/missouri", -95.8, 35.99, -89.1, 40.6)]
+
+
+def osm_region(bounds):
+    """Geofabrik file (without date) covering the box centre."""
+    w, s, e, n = bounds
+    lon, lat = (w + e) / 2, (s + n) / 2
+    west_tx = lat < 32.0 and lon > -106.65  # west Texas is in us-south, not us-west
+    if lon < -102.05 and not west_tx:
+        return "us-west"
+    for name, x0, y0, x1, y1 in OSM_EAST_STATES:
+        if x0 <= lon <= x1 and y0 <= lat <= y1:
+            return name
+    raise RuntimeError(f"no Geofabrik region for fire at {lon:.2f},{lat:.2f}")
 
 
 def grab_osm_many(fires, ctx):
     """Full (unfiltered) OpenStreetMap extract of each box from the Geofabrik snapshot of 1 January of the
     fire's year. Fires are grouped by (region, year) so each ~2-3 GB snapshot downloads once, then it is
     deleted before the next one."""
-    import human_features as HF
     groups = {}
     for f in fires:
-        groups.setdefault((HF.region_file({"bounds_lonlat": area(f)}), int(f["year"])), []).append(f)
+        groups.setdefault((osm_region(area(f)), int(f["year"])), []).append(f)
     for (region, year), group in sorted(groups.items()):
         if ctx.expired():
             return
         tag = f"{str(year)[2:]}0101"
-        url = f"{HF.GEOFABRIK}/{region}-{tag}.osm.pbf"
+        url = f"{GEOFABRIK}/{region}-{tag}.osm.pbf"
         snap = ctx.cache / f"{region.replace('/', '_')}-{tag}.osm.pbf"
         try:
             if not snap.exists():
