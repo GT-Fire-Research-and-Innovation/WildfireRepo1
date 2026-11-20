@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import logging
 import re
+import time
 import warnings
 import zipfile
 from pathlib import Path
@@ -33,9 +34,11 @@ class NifcArchive:
         r"(National_Incident_Feature_Service|NIFS_OpenData|NIFS_Archive|Operational_Data_Archive)", re.I
     )
     FGDB_CHUNK = 20000  # features read per pass when caching a geodatabase layer
+    LISTING_TRIES = 4
 
     def __init__(self, arcgis: ArcGisClient, http: HttpClient, fgdb_dir: Path) -> None:
         self.arcgis, self.http, self.fgdb_dir = arcgis, http, Path(fgdb_dir)
+        self._names: set[str] | None = None
 
     @classmethod
     def for_run(cls, ctx: RunContext) -> NifcArchive:
@@ -71,11 +74,34 @@ class NifcArchive:
 
     # ------------------------------------------------------------------------------------- discovery
 
+    def service_names(self) -> set[str]:
+        """Every feature service of the NIFC organisation, listed once per run. ArcGIS Online now and then answers
+        this listing with no services at all; that is retried, then raised, so the fire is recorded as an error and
+        fetched again on the next run instead of being recorded 'empty' for good."""
+        if self._names is None:
+            for attempt in range(self.LISTING_TRIES):
+                js = self.arcgis.get_json(self.ROOT)
+                names = {s["name"] for s in js.get("services", []) if s.get("type") == "FeatureServer"}
+                if names:
+                    self._names = names
+                    break
+                log.info(f"    NIFC service listing came back empty (try {attempt + 1}), asking again")
+                time.sleep(5 * (attempt + 1))
+            else:
+                raise RuntimeError(f"{self.ROOT}: the service listing came back empty {self.LISTING_TRIES} times")
+        return self._names
+
     def _archive_services(self, year: int) -> tuple[list[str], set[str]]:
         """(the year's NIFS / Operational Data Archive services, every feature service name)."""
-        js = self.arcgis.get_json(self.ROOT)
-        names = {s["name"] for s in js.get("services", []) if s.get("type") == "FeatureServer"}
+        names = self.service_names()
         return sorted(n for n in names if str(year) in n and self.ARCHIVE_SERVICE.search(n)), names
+
+    def _service_layers(self, service: str) -> list[dict]:
+        """A service's layers; an empty list is a failed answer (an archive service always has layers)."""
+        layers = self.arcgis.get_json(f"{self.ROOT}/{service}/FeatureServer").get("layers", [])
+        if not layers:
+            raise RuntimeError(f"{service}: the service listed no layers")
+        return layers
 
     def perimeter_layers(self, year: int) -> list[tuple[str, str]]:
         """[(kind, layer_url)] of the year's perimeter layers: 'geomac' (Historic GeoMAC) and 'nifs' (EventPolygon
@@ -87,11 +113,11 @@ class NifcArchive:
             found.append(("geomac", f"{self.ROOT}/{geomac}/FeatureServer/0"))
         for n in services:
             try:
-                fs = self.arcgis.get_json(f"{self.ROOT}/{n}/FeatureServer")
+                layers = self._service_layers(n)
             except Exception as ex:  # noqa: BLE001  (one broken service must not hide the others)
                 log.info(f"  could not open {n}: {ex}")
                 continue
-            for lyr in fs.get("layers", []):
+            for lyr in layers:
                 if self.layer_is(lyr["name"], "eventpolygon"):
                     found.append(("nifs", f"{self.ROOT}/{n}/FeatureServer/{lyr['id']}"))
         if not any(k == "nifs" for k, _ in found) and year in self.FGDB_ITEMS:
@@ -107,8 +133,7 @@ class NifcArchive:
         services, _ = self._archive_services(year)
         found = []
         for n in services:
-            fs = self.arcgis.get_json(f"{self.ROOT}/{n}/FeatureServer")
-            for lyr in fs.get("layers", []):
+            for lyr in self._service_layers(n):
                 if self.layer_is(lyr["name"], "eventline"):
                     found.append((f"{self.ROOT}/{n}/FeatureServer/{lyr['id']}", "line"))
                 elif self.layer_is(lyr["name"], "eventpolygon"):

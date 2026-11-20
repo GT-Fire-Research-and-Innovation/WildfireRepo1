@@ -20,6 +20,7 @@ from fah.sources.gridmet import GridmetService
 from fah.sources.hrrr import HrrrArchive
 from fah.sources.http import HttpClient, ParallelMap
 from fah.sources.landfire import LandfireImageService
+from fah.sources.nifc import NifcArchive
 
 
 class Reply:
@@ -234,3 +235,35 @@ def test_gfs_fires_of_one_run_share_requests_within_a_size_limit():
     from fah.channels.gfs import GfsChannel
 
     assert [len(c) for c in EarthEngineGfs.lead_chunks(list(GfsChannel.LEADS))] == [45, 35]
+
+
+class Listing:
+    """The NIFC service listing: empty for the first `empty` calls (as ArcGIS Online now and then answers), then
+    one 2018 archive service whose layer list is `layers`."""
+
+    def __init__(self, empty: int, layers: list | None = None) -> None:
+        self.empty, self.calls = empty, 0
+        self.layers = (
+            [{"id": 1, "name": "EventLine2018"}, {"id": 2, "name": "EventPolygon2018"}] if layers is None else layers
+        )
+
+    def get_json(self, url, params=None):
+        if url == NifcArchive.ROOT:
+            self.calls += 1
+            if self.calls <= self.empty:
+                return {"currentVersion": 11, "services": []}
+            return {"services": [{"name": "National_Incident_Feature_Service_2018", "type": "FeatureServer"}]}
+        return {"layers": self.layers}
+
+
+def test_an_empty_nifc_listing_is_retried_then_an_error_never_empty(tmp_path, monkeypatch):
+    monkeypatch.setattr("time.sleep", lambda s: None)
+    flaky = Listing(empty=2)
+    nifc = NifcArchive(flaky, HttpClient(None), tmp_path)
+    assert [kind for _, kind in nifc.event_layers(2018)] == ["line", "polygon"] and flaky.calls == 3
+    nifc.perimeter_layers(2018)
+    assert flaky.calls == 3  # listed once per run
+    with pytest.raises(RuntimeError, match="came back empty"):
+        NifcArchive(Listing(empty=99), HttpClient(None), tmp_path).event_layers(2018)
+    with pytest.raises(RuntimeError, match="listed no layers"):
+        NifcArchive(Listing(empty=0, layers=[]), HttpClient(None), tmp_path).event_layers(2018)
