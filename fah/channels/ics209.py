@@ -12,7 +12,7 @@ from fah.sources.ics209 import Ics209Archive
 
 
 class Ics209Channel(PerFireChannel):
-    """incidents.csv, sitreps.csv: the original rows, every column as text. Incidents are matched on the build box
+    """incidents.csv, sitreps.csv: the original rows, every column as text. Incidents are matched on the perimeters' box
     (a wider box would match neighbours). The source zip goes to shared/ once per repo."""
 
     name = "ics209"
@@ -38,7 +38,7 @@ class Ics209Channel(PerFireChannel):
             incidents,
             {irwin} if irwin else set(),
             {str(fire.name).lower()},
-            fire.build_box,
+            fire.box,
             Utc.stamp(fire.first).tz_convert(None),
             Utc.stamp(fire.last).tz_convert(None),
         )

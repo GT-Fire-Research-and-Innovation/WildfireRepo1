@@ -74,6 +74,36 @@ def test_failed_upload_keeps_batch(tmp_path, monkeypatch, camp):
     assert list((tmp_path / "batch").rglob("x.csv"))
 
 
+class Refused(Exception):
+    def __init__(self, code: int) -> None:
+        super().__init__(f"HTTP {code}")
+        self.response = type("R", (), {"status_code": code})()
+
+
+def test_hub_writes_wait_out_a_busy_repo_but_not_a_refused_token(tmp_path, monkeypatch):
+    """Notebook copies of different channels commit to one repo at once: a clash (412), rate limit (429) or 5xx is
+    retried with growing, jittered waits; 401 / 403 / 404 stop at once."""
+    waits = []
+    monkeypatch.setattr("time.sleep", waits.append)
+    calls = []
+
+    def flaky(code):
+        def call():
+            calls.append(code)
+            if len(calls) < 3:
+                raise Refused(code)
+
+        return call
+
+    hub = HubRepo(FakeApi(), "me/raw")
+    hub._write("batch", flaky(412))
+    assert len(calls) == 3 and len(waits) == 2 and 15 <= waits[0] <= 45 and 30 <= waits[1] <= 90
+    calls.clear()
+    with pytest.raises(Refused):
+        hub._write("batch", flaky(403))
+    assert len(calls) == 1 and len(waits) == 2
+
+
 def test_error_status_uploads_no_files(tmp_path, camp):
     api = FakeApi()
     b = uploader(tmp_path, api, batch_fires=1)

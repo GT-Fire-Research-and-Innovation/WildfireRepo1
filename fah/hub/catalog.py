@@ -1,96 +1,69 @@
-"""The fire list of the built dataset (its catalog and grids), and the extents table this repo adds to it."""
+"""The fire list: the repo's own catalog/fires.csv (written by `--catalog build`), and the extents table."""
 
 from __future__ import annotations
 
-import math
+import logging
 from pathlib import Path
 
-import numpy as np
 import pandas as pd
 
-from fah.core.extent import FireExtentEstimator
 from fah.core.fire import Fire
 from fah.core.geometry import BoundingBox
 from fah.hub.repo import HubRepo
 
+log = logging.getLogger(__name__)
+
 
 class FireCatalog:
-    """Fires of the built dataset (source repo): catalog/fires.csv joined with the QC ratings, each with the build's
-    grid box. `which`: 'built' (fires with a built folder), 'keep' (QC rating keep) or 'all'."""
+    """Fires of catalog/fires.csv, from the target repo or a local file. `archive` picks geomac, nifs, both or all."""
 
-    CATALOG_FILES = ("catalog/fires.csv", "catalog/qc_fires.csv")
+    FIRES_FILE = "catalog/fires.csv"
     EXTENTS_FILE = "catalog/fire_extents.csv"
-    GRID_RES_M = 150.0  # the built dataset's cell size and margin: its grid box is each fire's build box
-    GRID_PAD_KM = 9.6
+    ARCHIVES = ("geomac", "nifs", "both")
 
-    def __init__(self, source_repo: str, cache: Path) -> None:
-        self.source = HubRepo.connect(source_repo)
-        self.source_repo, self.cache = source_repo, Path(cache)
+    def __init__(self, hub: HubRepo, cache: Path, local_file: str | Path | None = None) -> None:
+        self.hub, self.cache, self.local_file = hub, Path(cache), local_file
 
-    @classmethod
-    def build_grid(cls, row) -> dict:
-        """The built dataset's grid for a catalog row: the perimeters' box plus GRID_PAD_KM on GRID_RES_M cells
-        (north-up lon/lat). -> {"transform": [dx, 0, x0, 0, -dy, y0], "bounds_lonlat": [w, s, e, n]}"""
-        pad = int(round(cls.GRID_PAD_KM * 1000 / cls.GRID_RES_M))
-        lat0 = (row.south + row.north) / 2
-        dy = cls.GRID_RES_M / 110570.0
-        dx = cls.GRID_RES_M / (111320.0 * math.cos(math.radians(lat0)))
-        w = int(math.ceil((row.east - row.west) / dx)) + 2 * pad
-        h = int(math.ceil((row.north - row.south) / dy)) + 2 * pad
-        x0, y0 = row.west - pad * dx, row.north + pad * dy
-        return {"transform": [dx, 0.0, x0, 0.0, -dy, y0], "bounds_lonlat": [x0, y0 - h * dy, x0 + w * dx, y0]}
+    def table(self) -> pd.DataFrame:
+        path = self.local_file
+        if path is None:
+            if not self.hub.repo_id:
+                raise FileNotFoundError(f"no fire list: give --hf-repo (its {self.FIRES_FILE}) or --catalog-file")
+            path = self.hub.download(self.FIRES_FILE, self.cache)
+        return pd.read_csv(path, dtype={"fire_id": str, "incident": str})
 
-    def catalog_files(self) -> list[tuple[str, str]]:
-        """[(repo path, local file)] of the catalog, downloaded once."""
-        return [(f, self.source.download(f, self.cache)) for f in self.CATALOG_FILES]
-
-    def fires(self, which: str = "built", ids: list[str] | None = None) -> list[Fire]:
-        files = dict(self.catalog_files())
-        cat = pd.read_csv(files["catalog/fires.csv"])
-        qc = pd.read_csv(files["catalog/qc_fires.csv"], usecols=["fire_id", "rating"])
-        cat = cat.merge(qc, on="fire_id", how="left")
-        if which == "built":
-            built = {p.split("/")[-1] for p in self.source.files("fires", recursive=False)}
-            cat = cat[cat.fire_id.isin(built)]
-        elif which == "keep":
-            cat = cat[cat.rating == "keep"]
+    def fires(self, archive: str = "all", ids: list[str] | None = None) -> list[Fire]:
+        cat = self.table()
+        if archive != "all":
+            cat = cat[cat["archive"] == archive]
         if ids:
-            cat = cat[cat.fire_id.isin(set(ids))]
-        return [self.fire_from_row(row) for _, row in cat.iterrows()]
+            cat = cat[cat["fire_id"].isin(set(ids))]
+        boxed = cat[["west", "south", "east", "north"]].notna().all(axis=1)
+        if (~boxed).any():
+            log.warning(f"warning: {int((~boxed).sum())} fires have no box in {self.FIRES_FILE} and are left out")
+        return [self.fire_from_row(row) for _, row in cat[boxed].iterrows()]
 
-    @classmethod
-    def fire_from_row(cls, row) -> Fire:
-        g = cls.build_grid(row)
-        sides = ("west", "south", "east", "north")
-        own = (
-            BoundingBox(*(float(row[k]) for k in sides)) if all(k in row and pd.notna(row[k]) for k in sides) else None
+    @staticmethod
+    def fire_from_row(row: pd.Series) -> Fire:
+        def point(t: str, lat: str, lon: str) -> tuple | None:
+            vals = (row.get(t), row.get(lat), row.get(lon))
+            return vals if all(pd.notna(v) for v in vals) else None
+
+        origin_lat, origin_lon = (
+            ("initial_lat", "initial_lon") if pd.notna(row.get("initial_lat")) else ("incident_lat", "incident_lon")
         )
         return Fire(
-            fire_id=row.fire_id,
-            incident=str(row.incident),
+            fire_id=str(row["fire_id"]),
+            incident=str(row["incident"]),
             name=str(row["name"]),
-            year=int(row.year),
+            year=int(row["year"]),
             first=str(row["first"]),
             last=str(row["last"]),
-            build_box=BoundingBox(*g["bounds_lonlat"]),
-            perimeter_box=own,
-            grid_transform=tuple(g["transform"]),
-            rating=str(row.rating),
+            box=BoundingBox(*(float(row[k]) for k in ("west", "south", "east", "north"))),
+            archive=str(row.get("archive", "")),
+            first_record=point("first_record_time", "first_lat", "first_lon"),
+            origin=point("discovery_utc", origin_lat, origin_lon),
         )
-
-    def first_perimeters(self, fires: list[Fire]) -> dict[str, tuple]:
-        """{fire_id: (time, lat, lon)} of each fire's first mapped perimeter, from the built dataset's labels.npz
-        (arrival index per cell) on the fire's build grid. Fires without labels are left out."""
-        self.source.snapshot([f"fires/{f.fire_id}/labels.npz" for f in fires], self.cache)
-        out = {}
-        for f in fires:
-            p = self.cache / "fires" / f.fire_id / "labels.npz"
-            if p.exists() and f.grid_transform:
-                with np.load(p, allow_pickle=False) as z:
-                    pt = FireExtentEstimator.first_perimeter_point(z["arrival"], f.grid_transform, z["times"])
-                if pt is not None:
-                    out[f.fire_id] = pt
-        return out
 
     @staticmethod
     def read_extents(path: Path | str) -> dict[str, dict]:

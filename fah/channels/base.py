@@ -26,7 +26,7 @@ class Channel(ABC):
 
     name: ClassVar[str]
     time_dependent: ClassVar[bool] = False  # files depend on the fire's time window
-    region_cut: ClassVar[bool] = True  # cut to Fire.region() (False: the build box, or not spatial)
+    region_cut: ClassVar[bool] = True  # cut to Fire.region() (False: the perimeters' box, or not spatial)
     required_files: ClassVar[frozenset[str] | None] = None
 
     @property
@@ -51,7 +51,7 @@ class Channel(ABC):
         return fire.span().label() if self.time_dependent else ""
 
     def region_label(self, fire: Fire) -> str:
-        """The box this channel's files cover ('' for channels on the build box)."""
+        """The box this channel's files cover ('' for channels on the perimeters' box)."""
         return fire.region().label() if self.region_cut else ""
 
     def labels(self, fire: Fire) -> tuple[str, str]:

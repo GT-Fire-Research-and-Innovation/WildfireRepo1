@@ -11,7 +11,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from fah.core.geometry import PixelWindow, SinusoidalGrid
+from fah.core.geometry import BoundingBox, PixelWindow, SinusoidalGrid
 from fah.sources.arcgis import ArcGisClient
 from fah.sources.earthdata import EarthdataClient, RangeFile
 from fah.sources.gfs import EarthEngineGfs
@@ -21,6 +21,9 @@ from fah.sources.hrrr import HrrrArchive
 from fah.sources.http import HttpClient, ParallelMap
 from fah.sources.landfire import LandfireImageService
 from fah.sources.nifc import NifcArchive
+
+# a fixed box (the Camp Fire's old build box): the expected URLs and windows below are worked out for it
+BOX = BoundingBox(-121.88999101802999, 39.51118309776612, -121.23979602288742, 39.98463882716831)
 
 
 class Reply:
@@ -78,20 +81,20 @@ class IdSession:
 
 def test_box_features_page_by_id_and_check_completeness(camp):
     s = IdSession()
-    feats = ArcGisClient(s).box_features("https://x/FeatureServer/1", camp.build_box)
+    feats = ArcGisClient(s).box_features("https://x/FeatureServer/1", BOX)
     assert [f["id"] for f in feats] == list(range(1, 451)) and s.posts == [200, 200, 50]
     with pytest.raises(RuntimeError, match="listed 450 features, received 449"):
-        ArcGisClient(IdSession(drop=7)).box_features("https://x/FeatureServer/1", camp.build_box)
+        ArcGisClient(IdSession(drop=7)).box_features("https://x/FeatureServer/1", BOX)
 
 
 def test_query_links_are_complete_urls(camp):
-    u = ArcGisClient.query_url("https://x/FeatureServer/0", camp.build_box, where="FIRE_YEAR_INT < 2018")
+    u = ArcGisClient.query_url("https://x/FeatureServer/0", BOX, where="FIRE_YEAR_INT < 2018")
     assert "f=geojson" in u and "where=FIRE_YEAR_INT+%3C+2018" in u and "geometry=-121.88999%2C39.51118" in u
 
 
 def test_gridmet_url_is_plain_https_subset(camp):
     d = camp.days()
-    u = GridmetService.subset_url("vpd", "daily_mean_vapor_pressure_deficit", camp.build_box, d[0], d[-1], 0.05)
+    u = GridmetService.subset_url("vpd", "daily_mean_vapor_pressure_deficit", BOX, d[0], d[-1], 0.05)
     assert u.startswith(
         "https://thredds.northwestknowledge.net/thredds/ncss/grid/agg_met_vpd_1979_CurrentYear_CONUS.nc?"
     )
@@ -105,19 +108,19 @@ def test_gridmet_gains_tssatfire_variables(camp):
     assert v["pdsi"] == "daily_mean_palmer_drought_severity_index" and v["sph"] == "daily_mean_specific_humidity"
     d = camp.days()
     start = d[0] - pd.Timedelta(days=GridmetService.LEAD_DAYS["pdsi"])
-    u = GridmetService.subset_url("pdsi", v["pdsi"], camp.build_box, start, d[-1], 0.05)
+    u = GridmetService.subset_url("pdsi", v["pdsi"], BOX, start, d[-1], 0.05)
     assert "/ncss/grid/agg_met_pdsi_1979_CurrentYear_CONUS.nc?var=daily_mean_palmer_drought_severity_index" in u
     assert "time_start=2018-10-16T00:00:00Z" in u
 
 
 def test_landfire_window_snaps_to_native_30m_grid(camp):
     pytest.importorskip("pyproj")
-    x0, y0, x1, y1, w, h = LandfireImageService.native_window(camp.build_box, (-2362425, 3177435), 30)
+    x0, y0, x1, y1, w, h = LandfireImageService.native_window(BOX, (-2362425, 3177435), 30)
     assert (x0 + 2362425) % 30 == 0 and (3177435 - y1) % 30 == 0  # pixel edges of the stored grid
     assert (w, h) == ((x1 - x0) / 30, (y1 - y0) / 30) == (2246, 2195)  # Camp, as served
     info = {"extent": {"xmin": -2362425, "ymax": 3177435}, "pixelSizeX": 30, "spatialReference": {"wkid": 5070},
             "pixelType": "S16", "noDataValue": -9999}  # fmt: skip
-    u = LandfireImageService.export_url("LF2016", "FBFM40", camp.build_box, info)
+    u = LandfireImageService.export_url("LF2016", "FBFM40", BOX, info)
     assert "/Landfire_LF2016/LF2016_FBFM40_CONUS/ImageServer/exportImage?" in u
     assert "size=2246%2C2195" in u and "interpolation=RSP_NearestNeighbor" in u and "compression=LZW" in u
     assert "Email" not in u
@@ -137,7 +140,21 @@ def test_hrrr_forecast_takes_precipitation_accumulated_from_the_run_start():
 
     rng = HrrrArchive(S()).byte_ranges("u", HrrrArchive.FORECAST_FIELDS)
     assert rng["t2"] == (100, 199) and rng["q2"] == (200, 299) and rng["apcp"] == (400, 499)
-    assert HrrrArchive(S()).byte_ranges("u").keys() <= {"gust", "u10", "v10", "rh2"}  # the analyses' fields
+    assert HrrrArchive(S()).byte_ranges("u").keys() <= {"gust", "u10", "v10", "rh2"}  # the default fields
+
+
+def test_hrrr_rain_is_the_three_hour_accumulation_of_the_f03_file():
+    idx = ("1:0:d=2018110909:TMP:2 m above ground:3 hour fcst:\n"
+           "2:100:d=2018110909:APCP:surface:0-3 hour acc fcst:\n"
+           "3:200:d=2018110909:APCP:surface:2-3 hour acc fcst:\n"
+           "4:300:d=2018110909:DSWRF:surface:3 hour fcst:\n")  # fmt: skip
+
+    class S:
+        def get(self, url, timeout):
+            return type("R", (), {"status_code": 200, "text": idx})()
+
+    rng = HrrrArchive(S()).byte_ranges("u", HrrrArchive.PREVIOUS_F03_FIELDS)
+    assert rng == {"apcp": (100, 199), "dswrf": (300, None)}
 
 
 def test_netcdf_bytes_fall_back_to_a_file(tmp_path):
@@ -209,7 +226,7 @@ GRID360 = ("EPSG:4326", (0.25, 0.0, -0.125, 0.0, -0.25, 90.125), 1440, 721)
 
 def test_gfs_window_is_cut_on_the_native_grid_either_longitude_convention(camp):
     pytest.importorskip("affine")
-    box = camp.build_box
+    box = BOX
     w = EarthEngineGfs.window(GRID[1], GRID[2], GRID[3], box)
     lat, lon = EarthEngineGfs.latlon(GRID[1], GRID[2], w)
     h = 0.125  # cells (not centres) cover the box

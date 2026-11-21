@@ -9,13 +9,16 @@ import json
 from pathlib import Path
 
 import pandas as pd
+import pytest
 
 from fah.__main__ import main
 from fah.commands.extents import ExtentsBuilder
 from fah.commands.links import LinksBuilder
 from fah.commands.progress import ChannelProgress
-from fah.commands.run import ErrorStreak
+from fah.commands.run import ChannelRun, ErrorStreak
 from fah.commands.settings import RunSettings
+from fah.core.errors import ChannelUnavailable
+from fah.core.extent import FireExtentEstimator
 from fah.hub.catalog import FireCatalog
 from fah.hub.manifest import ManifestBook
 from fah.hub.repo import HubRepo
@@ -41,11 +44,18 @@ def test_fires_fetched_for_another_window_or_region_are_fetched_again(camp_perim
     m = pd.DataFrame([dict(fire_id="A", status="ok", fetched_utc="2026-11-01", window=hrrr.window_label(a), region=reg),
                       dict(fire_id="B", status="ok", fetched_utc="2026-11-01", window=hrrr.window_label(a), region=reg),
                       dict(fire_id="C", status="ok", fetched_utc="2026-11-01", window="", region="")])  # fmt: skip
+    m["files"] = "hrrr_ana.nc;hrrr_f03.nc"
     fires = [a, b, c]
     assert ChannelProgress.done_ids(m, hrrr, fires) == {"A"}  # B's window grew, C has neither
+    old = m.assign(files="hrrr_ana.nc")  # fetched before hrrr_f03.nc existed
+    assert ChannelProgress.done_ids(old, hrrr, fires) == set()
     assert ChannelProgress.done_ids(m, channels.get("terrain"), fires) == {"A", "B"}  # C was cut to the old box
     gz = m.assign(files="records.geojson.gz")
-    assert ChannelProgress.done_ids(gz, channels.get("perimeters"), fires) == {"A", "B", "C"}  # build box, no window
+    assert ChannelProgress.done_ids(gz, channels.get("perimeters"), fires) == {
+        "A",
+        "B",
+        "C",
+    }  # perimeters' box, no window
     plain = gz.assign(files=["records.geojson", "records.geojson.gz", "records.geojson"])
     assert ChannelProgress.done_ids(plain, channels.get("perimeters"), fires) == {"B"}  # plain .geojson: repack
     old = m.drop(columns=["window", "region"])  # manifests written before the columns
@@ -70,12 +80,12 @@ def test_fire_links_cover_every_channel_with_files_and_sources(camp, channels):
                  error=""),
             dict(fire_id=camp.fire_id, channel="landfire", status="ok", files="landfire_LF2016.zip", bytes="5",
                  sources=lf, fetched_utc="2026-11-15T11:00:00+00:00", error=""),
-            dict(fire_id=camp.fire_id, channel="hrrr", status="ok", files="hrrr_ana.nc;hrrr_fc.nc", bytes="9",
+            dict(fire_id=camp.fire_id, channel="hrrr", status="ok", files="hrrr_ana.nc;hrrr_f03.nc", bytes="9",
                  sources=ManifestBook.SEP.join(["https://h/a.grib2", "https://h/b.grib2"]),
                  fetched_utc="2026-11-15T11:00:00+00:00", error=""),
             dict(fire_id=camp.fire_id, channel="ics209", status="n/a", files="", bytes="0", sources="",
                  fetched_utc="2026-11-15T11:00:00+00:00", error="ICS-209-PLUS covers 1999-2020")]  # fmt: skip
-    links = LinksBuilder.fire_links(camp, rows, "me/raw", RunSettings.SOURCE_REPO, channels.names())
+    links = LinksBuilder.fire_links(camp, rows, "me/raw", channels.names())
     assert list(links["channels"]) == channels.names()
     t = links["channels"]["terrain"]
     assert t["status"] == "ok"
@@ -88,9 +98,8 @@ def test_fire_links_cover_every_channel_with_files_and_sources(camp, channels):
     assert links["channels"]["ics209"]["note"].startswith("ICS-209") and links["channels"]["goes"] == {
         "status": "pending"
     }
-    assert links["folder"].endswith("/tree/main/fires/F2003403265") and links["build_box_lonlat"] == list(
-        camp.build_box
-    )
+    assert links["folder"].endswith("/tree/main/fires/F2003403265")
+    assert links["perimeters_box_lonlat"] == [round(v, 5) for v in camp.box] and links["archive"] == "both"
     md = LinksBuilder.markdown(links)
     assert (
         "[dem_glo30.tif](https://huggingface.co/datasets/me/raw/resolve/main/fires/F2003403265/terrain/dem_glo30.tif)"
@@ -110,13 +119,13 @@ def test_extents_step_writes_catalog_from_local_firms_files(tmp_path, monkeypatc
         pd.DataFrame(rows).to_csv(fh, index=False)
     (batch / "manifest" / "firms").mkdir(parents=True)
     window = channels.get("firms").window_label(camp_perimeters)
-    pd.DataFrame([dict(fire_id=camp_perimeters.fire_id, status="ok", fetched_utc="2026-11-18", window=window)],
+    pd.DataFrame([dict(fire_id=camp_perimeters.fire_id, status="ok", fetched_utc="2026-11-18", window=window,
+                       region=channels.get("firms").region_label(camp_perimeters), files="VIIRS_SNPP_SP.csv.gz")],
                  columns=ManifestBook.COLUMNS).to_csv(batch / "manifest" / "firms" / "firms-x-000.csv", index=False)  # fmt: skip
-    other = camp_perimeters.replace(fire_id="F0000000000")
-    monkeypatch.setattr(FireCatalog, "fires", lambda self, which="built", ids=None: [camp_perimeters, other])
-    first = (pd.Timestamp("2018-11-09 02:00", tz="UTC"), 39.75, -121.55)  # the other fire: no FIRMS, a perimeter
-    monkeypatch.setattr(FireCatalog, "first_perimeters", lambda self, fires: {"F0000000000": first})
-    s = RunSettings(work=tmp_path / "w", dry_run=True, source_repo="x", local_manifests=str(tmp_path / "batch"))
+    first = ("2018-11-09T02:00:00+00:00", 39.75, -121.55)  # the other fire: no FIRMS, its first perimeter record
+    other = camp_perimeters.replace(fire_id="F0000000000", first_record=first)
+    monkeypatch.setattr(FireCatalog, "fires", lambda self, archive="all", ids=None: [camp_perimeters, other])
+    s = RunSettings(work=tmp_path / "w", dry_run=True, local_manifests=str(tmp_path / "batch"))
     assert ExtentsBuilder(s).execute() == 0
     path = tmp_path / "w" / "extents" / FireCatalog.EXTENTS_FILE
     t = pd.read_csv(path).set_index("fire_id")
@@ -130,6 +139,20 @@ def test_extents_step_writes_catalog_from_local_firms_files(tmp_path, monkeypatc
     assert camp_row["region_west"] == round(camp_perimeters.region()[0], 5)
     table = FireCatalog.load_extents(None, path=path)
     assert camp_perimeters.with_extent(table[camp_perimeters.fire_id]).span()[0] == pd.Timestamp("2018-11-06", tz="UTC")
+    assert bool(camp_row["firms_current"]) and not bool(t.loc["F0000000000", "firms_current"])
+
+    # a time-dependent channel waits until every window is final, unless told to go ahead
+    run = ChannelRun(RunSettings(channel="gridmet", work=tmp_path / "w", extents_file=str(path)))
+    with pytest.raises(ChannelUnavailable, match="1 of 2 fires have no final window"):
+        run._with_extents(None, [camp_perimeters, other], tmp_path / "w")
+    ahead = ChannelRun(
+        RunSettings(channel="gridmet", work=tmp_path / "w", extents_file=str(path), partial_windows=True)
+    )
+    got = ahead._with_extents(None, [camp_perimeters, other], tmp_path / "w")
+    assert got[0].window_days == ("2018-11-06", "2018-11-26") and got[1].window_days is not None
+    moved = camp_perimeters.replace(first="2018-11-07 20:00:00+00:00")  # the catalog changed since --extents
+    assert not FireExtentEstimator.is_final(moved, table[camp_perimeters.fire_id])
+    assert FireExtentEstimator.is_final(camp_perimeters, table[camp_perimeters.fire_id])
 
 
 def test_repack_gzips_plain_geojson_in_place_and_keeps_the_old_rows_labels(tmp_path, monkeypatch, channels):

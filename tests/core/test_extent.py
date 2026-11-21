@@ -3,7 +3,6 @@ static detections do not count, and the ignition point is the earliest observati
 
 from __future__ import annotations
 
-import numpy as np
 import pandas as pd
 import pytest
 
@@ -52,7 +51,7 @@ def test_active_days_ignore_low_confidence_static_sources_and_neighbours(camp_pe
         ("2018-11-09", 5, 39.0, lon, "h", 0),  # outside the perimeters' box
         ("2018-11-10", 2, 39.9, -121.35, "nominal", 0),  # on the box edge (pad)
     ])  # fmt: skip
-    box = camp_perimeters.perimeter_box
+    box = camp_perimeters.box
     assert X.active_days(df, box) == [day("2018-11-05"), day("2018-11-10")]
     assert X.active_days(None, box) == []
     nrt = df.drop(columns=["type"])  # NRT files have no type column
@@ -80,7 +79,7 @@ def test_ignition_is_the_earliest_observation_of_the_fire(camp_perimeters):
         ("2018-11-08", 9, lat + 0.1, lon + 0.1, "h", 0, 2050),
         ("2018-10-20", 9, lat, lon, "h", 0, 2000),  # weeks earlier: not chained to this fire
     ])  # fmt: skip
-    act = X.active_days(df, camp_perimeters.perimeter_box)
+    act = X.active_days(df, camp_perimeters.box)
     y, x, t, how = X.ignition(camp_perimeters, df, act)
     assert how == "firms" and t == pd.Timestamp("2018-11-07 09:54", tz="UTC")
     assert y == pytest.approx(lat + 0.008) and x == pytest.approx(lon)
@@ -92,12 +91,13 @@ def test_ignition_is_the_earliest_observation_of_the_fire(camp_perimeters):
     assert how == "perimeter_box_centre" and y == pytest.approx(39.7482, abs=1e-3)
 
 
-def test_first_perimeter_point_is_the_centre_of_the_earliest_arrival():
-    arrival = np.full((10, 10), -1, "i2")
-    arrival[2:4, 6:8] = 0
-    arrival[2:9, 1:9] = np.where(arrival[2:9, 1:9] == 0, 0, 1)
-    times = np.array([pd.Timestamp("2018-11-09", tz="UTC").value, pd.Timestamp("2018-11-10", tz="UTC").value])
-    t, y, x = X.first_perimeter_point(arrival, [0.01, 0.0, -122.0, 0.0, -0.01, 40.0], times)
-    assert t == pd.Timestamp("2018-11-09", tz="UTC")  # cells 2-3 x 6-7: centre 3.0, 7.0
-    assert y == pytest.approx(40.0 - 0.03) and x == pytest.approx(-122.0 + 0.07)
-    assert X.first_perimeter_point(np.full((3, 3), -1), [0.01, 0, -122, 0, -0.01, 40], times) is None
+def test_catalog_first_record_and_reported_origin_are_ignition_candidates(camp):
+    first = ("2018-11-08 15:30:00+00:00", 39.81, -121.43)  # catalog first_record_time / lat / lon
+    assert X.ignition(camp.replace(first_record=first)).method == "first_perimeter"
+    origin = ("2018-11-08T14:33:00+00:00", 39.8136, -121.4347)  # WFIGS discovery time and point: earlier
+    ig = X.ignition(camp.replace(first_record=first, origin=origin))
+    assert ig.method == "reported_origin" and ig.lat == pytest.approx(39.8136)
+    stale = ("2018-09-01T00:00:00+00:00", 39.8, -121.4)  # weeks before the first perimeter: another start
+    assert X.ignition(camp.replace(first_record=first, origin=stale)).method == "first_perimeter"
+    blank = (None, None, None)  # WFIGS without a point
+    assert X.ignition(camp.replace(origin=blank)).method == "perimeter_box_centre"

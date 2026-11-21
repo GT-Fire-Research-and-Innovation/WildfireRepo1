@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import logging
 import shutil
-import time
 from collections.abc import Iterable, Sequence
 from datetime import datetime, timezone
 from pathlib import Path
@@ -130,16 +129,10 @@ class BatchUploader:
         n_ok = sum(r["status"] == Status.OK for r in self.rows)
         msg = f"raw {self.channel}: {len(self.rows)} fires ({n_ok} ok), {self.bytes / 1e9:.2f} GB"
         if not self.dry_run:
-            for attempt in range(6):
-                try:
-                    self.hub.upload_folder(self.dir, msg, self.replace or None)
-                    break
-                except Exception as ex:  # noqa: BLE001  (rate limits, transient 5xx)
-                    if attempt == 5:
-                        raise RuntimeError(f"upload failed, batch kept at {self.dir}: {ex}") from ex
-                    wait = 30 * 2**attempt
-                    log.info(f"  upload retry {attempt + 1} in {wait}s: {str(ex)[:150]}")
-                    time.sleep(wait)
+            try:
+                self.hub.upload_folder(self.dir, msg, self.replace or None)  # retried inside when the Hub is busy
+            except Exception as ex:  # noqa: BLE001  (every retry failed: keep the batch for the next run)
+                raise RuntimeError(f"upload failed, batch kept at {self.dir}: {Secrets.redact(str(ex))[:300]}") from ex
         log.info(
             f"  {'[dry-run] ' if self.dry_run else ''}{msg}"
             + (f" -> kept {self.dir}" if self.keep else " -> uploaded, local copy deleted")

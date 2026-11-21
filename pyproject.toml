@@ -8,7 +8,7 @@ version = "1.0.0"
 description = "Raw upstream data of every fire in the wildfire spread dataset, fetched one channel at a time into a Hugging Face repo"
 readme = "README.md"
 requires-python = ">=3.10"
-dependencies = ["numpy", "pandas", "requests", "huggingface_hub>=0.24"]
+dependencies = ["numpy", "pandas", "pyarrow", "requests", "huggingface_hub>=0.24"]
 
 [project.optional-dependencies]
 channels = ["affine", "earthengine-api", "geopandas", "h5py", "netCDF4", "pygrib", "pyhdf", "pyogrio", "pyproj",

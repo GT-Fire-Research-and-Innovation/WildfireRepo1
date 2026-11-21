@@ -28,6 +28,16 @@ class HrrrArchive:
         ("v10", ":VGRD:10 m above ground:"),
         ("rh2", ":RH:2 m above ground:"),
     ]
+    # Each 3-hourly analysis (f00) also gives the weather of fine (1 h / 10 h) fuel moisture. DSWRF is missing from the
+    # analyses of 2014 and a few days of 2016; PREVIOUS_F03_FIELDS has it in every version.
+    ANALYSIS_FIELDS = FIELDS + [
+        ("t2", ":TMP:2 m above ground:"),
+        ("dpt", ":DPT:2 m above ground:"),
+        ("dswrf", ":DSWRF:surface:"),
+    ]
+    # The run 3 h before an analysis time, its 3 h forecast (f03) valid at that time: the rain of the 3 h before it
+    # (the 0-3 h accumulation, not the last hour's 2-3 h one) and the sunlight.
+    PREVIOUS_F03_FIELDS = [("apcp", ":APCP:surface:0-3 hour acc"), ("dswrf", ":DSWRF:surface:")]
     # APCP is the message accumulated from the run start ('0-9 hour acc', '0-1 day acc'), not the last hour's.
     FORECAST_FIELDS = FIELDS + [
         ("t2", ":TMP:2 m above ground:"),
@@ -40,6 +50,8 @@ class HrrrArchive:
         "v10": "m s-1",
         "rh2": "%",
         "t2": "K",
+        "dpt": "K",
+        "dswrf": "W m-2",
         "q2": "kg kg-1",
         "apcp": "kg m-2 (accumulated from the run start to the valid time)",
     }

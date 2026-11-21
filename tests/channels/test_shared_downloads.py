@@ -1,5 +1,5 @@
 """Shared-download channels end to end, offline (fake buckets, grids and files): GOES skips a damaged scan, HRRR
-writes only the analyses, GFS fires of one run share requests, and a VIIRS granule is cropped on the swath for each
+writes analyses and the previous run's rain, GFS fires of one run share requests, and a VIIRS granule is cropped on the swath for each
 fire and packed in one file."""
 
 from __future__ import annotations
@@ -121,27 +121,40 @@ def test_goes_skips_a_damaged_scan_instead_of_stopping_the_channel(tmp_path, mon
 # ------------------------------------------------------------------------------------- hrrr
 
 
-def test_hrrr_writes_only_the_analyses(tmp_path, monkeypatch, camp):
-    """The 12z run's 9 h forecast is hrrr_next's lead_h = 9 step, so hrrr fetches only f00 analyses."""
+def test_hrrr_writes_analyses_and_the_previous_runs_rain_from_three_days_before(tmp_path, monkeypatch, camp):
+    """Every 3 h valid time: f00 of that run (hrrr_ana.nc) and f03 of the run 3 h earlier (hrrr_f03.nc), from 72 h
+    before the window; the 12z run's longer forecasts are hrrr_next's."""
     netCDF4 = pytest.importorskip("netCDF4")
     lat, lon = np.meshgrid(np.linspace(41, 38, 40), np.linspace(-123, -120, 40), indexing="ij")
     urls = []
 
     def fetch(self, url, fields=None):
         urls.append(url)
-        return {n: np.full(lat.shape, float(len(urls)), np.float32) for n, _ in HrrrArchive.FIELDS}
+        names = [n for n, _ in fields]
+        if url.endswith("f00.grib2") and url.split("/")[-3] == "hrrr.20181102":
+            names.remove("dswrf")  # an analysis without DSWRF (as in 2014)
+        return {n: np.full(lat.shape, float(len(urls)), np.float32) for n in names}
 
     monkeypatch.setattr(HrrrArchive, "grid", lambda self: (lat, lon))
     monkeypatch.setattr(HrrrArchive, "fetch", fetch)
-    [r] = list(HrrrChannel().fetch([camp], RunContext("hrrr", tmp_path, threads=2)))
-    ana = camp.span().hours(3)
-    assert r.status == "ok" and r.error == "" and len(r.sources) == len(ana) == len(urls)
-    assert all(u.endswith("wrfsfcf00.grib2") for u in urls)
+    channel = HrrrChannel()
+    [r] = list(channel.fetch([camp], RunContext("hrrr", tmp_path, threads=2)))
+    valid = channel.times(camp)
+    assert valid[0] == camp.span().start - pd.Timedelta(hours=72) and valid[-1] == camp.span().end - pd.Timedelta(
+        hours=2
+    )
+    assert channel.window_label(camp) == "2018-11-05/2018-11-26" and camp.span().label() == "2018-11-08/2018-11-26"
+    assert r.status == "ok" and len(r.sources) == len(urls) == 2 * len(valid)
+    assert HrrrArchive.url(valid[0], 0) in urls and HrrrArchive.url(valid[0] - pd.Timedelta(hours=3), 3) in urls
     stage = tmp_path / "stage" / camp.fire_id / "hrrr"
-    assert sorted(p.name for p in stage.iterdir()) == ["hrrr_ana.nc"]
+    assert sorted(p.name for p in stage.iterdir()) == ["hrrr_ana.nc", "hrrr_f03.nc"] == sorted(channel.required_files)
     with netCDF4.Dataset(stage / "hrrr_ana.nc") as ds:
-        t = ds["time"][:]
-        assert len(t) == len(ana) and t[0] == ana[0].value and {"gust", "u10", "v10", "rh2"} <= set(ds.variables)
+        assert len(ds["time"][:]) == len(valid) and ds["time"][0] == valid[0].value
+        assert {"gust", "u10", "v10", "rh2", "t2", "dpt", "dswrf"} <= set(ds.variables)
+        assert ds["dswrf"].units == "W m-2" and ds["dpt"].units == "K"
+    with netCDF4.Dataset(stage / "hrrr_f03.nc") as ds:
+        assert {"apcp", "dswrf"} <= set(ds.variables) and "gust" not in ds.variables
+        assert all(str(s).endswith("wrfsfcf03.grib2") for s in ds["source"][:])
 
 
 # ------------------------------------------------------------------------------------- gfs
@@ -170,7 +183,7 @@ def test_gfs_series_per_fire_from_shared_requests(tmp_path, monkeypatch, camp_pe
     monkeypatch.setattr(EarthEngineGfs, "connect", classmethod(lambda cls: FakeGfs()))
     short = {"first": "2018-11-09 00:00+00:00", "last": "2018-11-09 06:00+00:00"}
     near = camp_perimeters.replace(**short)  # runs 11-08, 11-09, 11-10
-    next_door = camp_perimeters.replace(fire_id="next", build_box=BoundingBox(-121.2, 39.6, -121.0, 39.9), **short)
+    next_door = camp_perimeters.replace(fire_id="next", box=BoundingBox(-121.2, 39.6, -121.0, 39.9), **short)
     old = camp_perimeters.replace(
         fire_id="old", year=2014, first="2014-08-01 00:00+00:00", last="2014-08-02 00:00+00:00"
     )
@@ -245,7 +258,7 @@ def test_viirs_granule_is_cropped_on_the_swath_for_each_fire(tmp_path, monkeypat
     monkeypatch.setattr(ViirsChannel, "granules",
                         classmethod(lambda cls, s, f: {key: entry, key2: entry2} if f.fire_id != "far" else {}))  # fmt: skip
     monkeypatch.setattr(ViirsChannel, "POOL", "thread")
-    near, far = camp, camp.replace(fire_id="far", build_box=BoundingBox(0, 0, 1, 1))
+    near, far = camp, camp.replace(fire_id="far", box=BoundingBox(0, 0, 1, 1))
     res = {r.fire.fire_id: r for r in ViirsChannel().fetch([near, far], RunContext("viirs", tmp_path, threads=2))}
     assert res["far"].status == "empty" and res[near.fire_id].status == "ok"
     assert sorted(res[near.fire_id].sources) == sorted([entry["02IMG"], entry2["02IMG"]])

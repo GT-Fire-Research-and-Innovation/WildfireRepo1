@@ -52,13 +52,12 @@ def test_extent_row_moves_the_window(camp_perimeters):
 @pytest.mark.parametrize("lat", [25.0, 39.7, 48.5, 64.0])
 def test_region_reaches_32_km_past_the_perimeters_on_every_side(camp_perimeters, lat):
     pb = BoundingBox(-121.7, lat - 0.05, -121.6, lat + 0.05)  # a 9 x 11 km fire
-    f = camp_perimeters.replace(perimeter_box=pb, build_box=pb.buffered(9.6))
+    f = camp_perimeters.replace(box=pb)
     w, s, e, n = f.region()
     assert km_between(s, -121.65, pb[1], -121.65) >= 32 and km_between(pb[3], -121.65, n, -121.65) >= 32
     for y in (s, pb[1], pb[3], n):  # east-west margin holds at every latitude of the box
         assert km_between(y, w, y, pb[0]) >= 32 and km_between(y, pb[2], y, e) >= 32
     assert km_between(s, w, s, e) >= 64 and km_between(s, w, n, w) >= 64
-    assert w <= f.build_box[0] and n >= f.build_box[3]  # never smaller than the build's box
     point = BoundingBox(-121.6, lat, -121.6, lat)
-    tw, ts, te, tn = f.replace(perimeter_box=point, build_box=point).region()  # a 64 km square (+ the 1 km margin)
+    tw, ts, te, tn = f.replace(box=point).region()  # a 64 km square (+ the 1 km margin)
     assert 64 <= km_between(ts, tw, tn, tw) <= 67 and 64 <= km_between(ts, tw, ts, te) <= 67

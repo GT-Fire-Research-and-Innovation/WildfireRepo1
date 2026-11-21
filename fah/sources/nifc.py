@@ -154,6 +154,43 @@ class NifcArchive:
             return self._read_fgdb(url, box)
         return self.arcgis.box_features(url, box)
 
+    def layer_records(self, url: str) -> pd.DataFrame:
+        """Every record of a layer, all fields as served (no geometry), plus `_oid` (its object id), `_cx`, `_cy`
+        (centroid, lon / lat) and, for geodatabase layers, `_xmin` .. `_ymax` (its box)."""
+        if url.startswith("fgdb://"):
+            return self._fgdb_records(url)
+        oid_field = self.arcgis.get_json(url).get("objectIdField") or "OBJECTID"
+        rows = []
+        for f in self.arcgis.records(url, centroid=True):
+            a = dict(f.get("attributes") or {})
+            c = f.get("centroid") or {}
+            a.update(_oid=a.get(oid_field), _cx=c.get("x"), _cy=c.get("y"))
+            rows.append(a)
+        return pd.DataFrame(rows)
+
+    def extent(self, url: str, records: pd.DataFrame) -> BoundingBox | None:
+        """The exact box of these records of one layer: computed by the service, or from the geodatabase boxes."""
+        if url.startswith("fgdb://"):
+            b = records[["_xmin", "_ymin", "_xmax", "_ymax"]].apply(pd.to_numeric, errors="coerce")
+            if b.isna().all().any():
+                return None
+            return BoundingBox(b["_xmin"].min(), b["_ymin"].min(), b["_xmax"].max(), b["_ymax"].max())
+        ids = sorted(int(i) for i in pd.to_numeric(records["_oid"], errors="coerce").dropna())
+        return self.arcgis.extent(url, ids) if ids else None
+
+    def _fgdb_records(self, url: str) -> pd.DataFrame:
+        import shapely
+
+        gdb, layer = url[len("fgdb://") :].split("|")
+        parts = []
+        for p in sorted(self._fgdb_cache(gdb, layer).glob("part-*.parquet")):
+            df = pd.read_parquet(p)
+            c = shapely.centroid(shapely.from_wkb(df.pop("wkb").values))
+            df = df.rename(columns={k: f"_{k}" for k in ("xmin", "ymin", "xmax", "ymax")})
+            df["_cx"], df["_cy"], df["_oid"] = shapely.get_x(c), shapely.get_y(c), None
+            parts.append(df)
+        return pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
+
     def _fgdb_layers(self, year: int, prefixes: tuple[str, ...]) -> list[str]:
         """Download (once) the year's archive geodatabase; fgdb:// urls of its matching layers."""
         import pyogrio

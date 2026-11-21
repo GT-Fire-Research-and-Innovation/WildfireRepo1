@@ -24,7 +24,7 @@ class Repacker:
     """Fires whose latest row is 'ok' and lists only .geojson files: each file is downloaded, written as
     <name>.geojson.gz with the fixed header and committed in place of the old one, with a new manifest row (same
     sources; window / region of the old row; note: when it was fetched). For channels the next run does not fetch
-    again anyway (perimeters keeps the build box)."""
+    again anyway."""
 
     CHANNELS = ("perimeters", "history", "suppression")
 

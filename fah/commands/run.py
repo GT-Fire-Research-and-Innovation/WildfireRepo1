@@ -13,6 +13,7 @@ from fah.commands.progress import ChannelProgress
 from fah.commands.settings import RunSettings
 from fah.core.context import RunContext
 from fah.core.errors import ChannelUnavailable, ExitCode
+from fah.core.extent import FireExtentEstimator
 from fah.core.fire import Fire
 from fah.core.result import Status
 from fah.core.secrets import Secrets
@@ -44,8 +45,6 @@ class ChannelRun:
     """One channel over the fire list: resume from the manifests, skip fires the source does not cover, fetch the
     rest, record every fire in a batch. -> exit code 0, or CHANNEL_BROKEN when the error streak trips."""
 
-    CARD = Path(__file__).resolve().parents[2] / "docs" / "RAW_DATA_CARD.md"
-
     def __init__(self, settings: RunSettings, registry: ChannelRegistry | None = None) -> None:
         self.s = settings
         self.channel: Channel = (registry or ChannelRegistry()).get(settings.channel)
@@ -60,14 +59,12 @@ class ChannelRun:
             hub.check_write()
         channel.check_ready()
 
-        catalog = FireCatalog(s.source_repo, work / "source")
-        fires = catalog.fires(s.fires, list(s.ids) if s.ids else None)
-        log.info(f"{len(fires)} fires ({s.fires}{', ' + str(len(s.ids)) + ' ids' if s.ids else ''})")
+        fires = FireCatalog(hub, work / "target", s.catalog_file).fires(s.archive, list(s.ids) if s.ids else None)
+        log.info(f"{len(fires)} fires (archive {s.archive}{', ' + str(len(s.ids)) + ' ids' if s.ids else ''})")
         if channel.time_dependent and channel.name != "firms":
             fires = self._with_extents(hub, fires, work)
         if not s.dry_run:
-            card = self.CARD.read_text().replace("{SOURCE_REPO}", s.source_repo)
-            hub.ensure(s.private, card, catalog.catalog_files())
+            hub.ensure(s.private)
         manifest = ManifestBook.read(hub, channel.name) if (s.hf_repo and not s.redo) else None
         done = ChannelProgress.done_ids(manifest, channel, fires)
         todo = [f for f in fires if f.fire_id not in done]
@@ -129,16 +126,20 @@ class ChannelRun:
 
     def _with_extents(self, hub: HubRepo, fires: list[Fire], work: Path) -> list[Fire]:
         """The fires with their windows from catalog/fire_extents.csv (needed by every time-dependent channel but
-        firms, which is its input)."""
-        extents = FireCatalog.load_extents(hub, work / "target", self.s.extents_file)
-        if extents is None:
+        firms, which is its input). Refuses while some windows can still grow (firms not finished for those fires,
+        or the catalog changed since --extents), since those fires would be fetched again; --partial-windows (or
+        --dry-run) goes ahead with the perimeter days +- 1 for them."""
+        extents = FireCatalog.load_extents(hub, work / "target", self.s.extents_file) or {}
+        waiting = [f.fire_id for f in fires if not FireExtentEstimator.is_final(f, extents.get(f.fire_id))]
+        if waiting:
             msg = (
-                f"{FireCatalog.EXTENTS_FILE} not found: run the firms channel, then --extents, so "
-                f"{self.channel.name} covers the days the fire was active (not only its perimeter days)"
+                f"{len(waiting)} of {len(fires)} fires have no final window in {FireCatalog.EXTENTS_FILE} yet (e.g. "
+                f"{', '.join(waiting[:3])}): finish the firms channel, run --extents, then {self.channel.name}; or "
+                "pass --partial-windows to fetch them now (they are fetched again once their windows are final)"
             )
-            if not self.s.dry_run:
+            if not (self.s.partial_windows or self.s.dry_run):
                 raise ChannelUnavailable(msg)
-            log.warning(f"warning: {msg}; using the perimeter days +- 1")
+            log.warning(f"warning: {msg}")
         fires = FireCatalog.with_extents(fires, extents)
         log.info(
             f"time window: {sum(f.window_days is not None for f in fires)} of {len(fires)} fires from "

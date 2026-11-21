@@ -15,7 +15,7 @@ from fah.storage.geojson import GzipGeoJson
 
 class PerimetersChannel(PerFireChannel):
     """records.geojson.gz: the incident's records in each archive layer of its years (all attributes, full geometry);
-    _source_layer / _source_kind say where each came from. Queried over the build box, which holds every record
+    _source_layer / _source_kind say where each came from. Queried over the perimeters' box, which holds every record
     of the fire itself (a wider box would only add neighbours)."""
 
     name = "perimeters"
@@ -25,7 +25,7 @@ class PerimetersChannel(PerFireChannel):
     def fetch_one(self, fire: Fire, out: Path, ctx: RunContext) -> tuple[str, list[str]]:
         nifc = NifcArchive.for_run(ctx)
         irwin, name_uid = fire.incident_key()
-        box = fire.build_box
+        box = fire.box
         keep, sources = [], []
         for year in fire.years():
             for kind, url in ctx.memo(("perim_layers", year), lambda y=year: nifc.perimeter_layers(y)):

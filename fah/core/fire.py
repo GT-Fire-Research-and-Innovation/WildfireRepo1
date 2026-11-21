@@ -39,8 +39,9 @@ class FireRef(NamedTuple):
 
 @dataclass(frozen=True, slots=True)
 class Fire:
-    """One fire of the catalog. `build_box` is the built dataset's grid box, `perimeter_box` the box around all
-    its perimeters (None when the catalog has none)."""
+    """One fire of the catalog (catalog/fires.csv). `box` is the exact extent of its main run of perimeter records;
+    `first_record` is (time, lat, lon) of the earliest of them and `origin` (time, lat, lon) the incident's reported
+    discovery time and location (WFIGS), when known."""
 
     REGION_BUFFER_KM: ClassVar[float] = 32.0  # half a 64 km tile: the region reaches this far past the perimeters
     DETECTION_PAD_DEG: ClassVar[float] = 0.01  # ~1 km around the perimeters' box: a 375 m pixel centre can sit outside
@@ -54,10 +55,10 @@ class Fire:
     year: int
     first: str
     last: str
-    build_box: BoundingBox
-    perimeter_box: BoundingBox | None = None
-    grid_transform: tuple[float, ...] | None = None
-    rating: str = ""
+    box: BoundingBox
+    archive: str = ""
+    first_record: tuple | None = None
+    origin: tuple | None = None
     window_days: tuple[str, str] | None = None
     ignition: Ignition | None = None
 
@@ -101,16 +102,12 @@ class Fire:
 
     # ---------------------------------------------------------------------------------------- space
 
-    def own_box(self) -> BoundingBox:
-        """The perimeters' own box, or the build box when the catalog has none."""
-        return self.perimeter_box or self.build_box
-
     def region(self) -> BoundingBox:
-        """The box every spatial channel is cut to: the perimeters' own box, grown by DETECTION_PAD_DEG (so an
-        ignition point found from FIRMS lies inside it) and then by REGION_BUFFER_KM on every side, and never
-        smaller than the build box. A tile of 2 x REGION_BUFFER_KM centred anywhere in the fire lies inside it.
-        Depends on the perimeters only, so it is known before any channel runs."""
-        return self.own_box().padded(self.DETECTION_PAD_DEG).buffered(self.REGION_BUFFER_KM).union(self.build_box)
+        """The box every spatial channel is cut to: the perimeters' box, grown by DETECTION_PAD_DEG (so an ignition
+        point found from FIRMS lies inside it) and then by REGION_BUFFER_KM on every side. A tile of
+        2 x REGION_BUFFER_KM centred anywhere in the fire lies inside it. Depends on the perimeters only, so it is known
+        before any channel runs."""
+        return self.box.padded(self.DETECTION_PAD_DEG).buffered(self.REGION_BUFFER_KM)
 
     # ---------------------------------------------------------------------------------------- time
 

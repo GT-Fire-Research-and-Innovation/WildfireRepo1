@@ -8,7 +8,8 @@ from fah.__main__ import main
 from fah.hub.repo import HubRepo
 
 FLAGS = ["--channel", "--status", "--check", "--links", "--links-chunk", "--extents", "--repack", "--extents-file",
-         "--local-manifests", "--hf-repo", "--source-repo", "--work", "--fires", "--ids", "--limit", "--batch-gb",
+         "--local-manifests", "--hf-repo", "--work", "--archive", "--catalog-file", "--catalog", "--years",
+         "--min-acres", "--min-days", "--partial-windows", "--ids", "--limit", "--batch-gb",
          "--batch-fires", "--min-free-gb", "--max-hours", "--threads", "--private", "--redo", "--dry-run", "--keep",
          "--keep-cache", "--max-errors-in-row", "--verbose"]  # fmt: skip
 
@@ -44,3 +45,9 @@ def test_missing_arguments_are_usage_errors():
         with pytest.raises(SystemExit) as e:
             main(argv)
         assert e.value.code == 2
+
+
+def test_catalog_needs_a_target_repo_or_dry_run(capsys):
+    with pytest.raises(SystemExit) as e:
+        main(["--catalog", "build"])
+    assert e.value.code == 2 and "--catalog needs --hf-repo" in capsys.readouterr().err

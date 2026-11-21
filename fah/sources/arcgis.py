@@ -85,6 +85,37 @@ class ArcGisClient:
             raise RuntimeError(f"{layer_url}: listed {len(ids)} features, received {len(feats)}")
         return feats
 
+    def records(
+        self, layer_url: str, where: str = "1=1", chunk: int = 1000, centroid: bool = False, geometry: bool = False
+    ) -> list[dict]:
+        """Every record matching `where`, all fields, paged by id (as box_features). centroid adds each polygon's
+        centroid ('centroid': {'x', 'y'}, lon / lat); geometry returns point geometry (lon / lat). Raises if any listed
+        id does not come back."""
+        listing = self._query(layer_url, {"where": where, "returnIdsOnly": "true", "f": "json"}, post=True)
+        ids = sorted(set(listing.get("objectIds") or []))
+        out = []
+        for i in range(0, len(ids), chunk):
+            params = {"objectIds": ",".join(map(str, ids[i : i + chunk])), "outFields": "*", "outSR": 4326, "f": "json",
+                      "returnGeometry": "true" if geometry else "false"}  # fmt: skip
+            if centroid:
+                params["returnCentroid"] = "true"
+            out += self._query(layer_url, params, post=True).get("features", [])
+        if len(out) != len(ids):
+            raise RuntimeError(f"{layer_url}: listed {len(ids)} records, received {len(out)}")
+        return out
+
+    def extent(self, layer_url: str, object_ids: list[int], chunk: int = 500) -> BoundingBox | None:
+        """The exact lon / lat extent of these records' geometry, computed by the service (no geometry downloaded)."""
+        box = None
+        for i in range(0, len(object_ids), chunk):
+            params = {"objectIds": ",".join(map(str, object_ids[i : i + chunk])), "returnExtentOnly": "true",
+                      "outSR": 4326, "f": "json"}  # fmt: skip
+            e = self._query(layer_url, params, post=True).get("extent") or {}
+            if all(isinstance(e.get(k), (int, float)) for k in ("xmin", "ymin", "xmax", "ymax")):
+                b = BoundingBox(e["xmin"], e["ymin"], e["xmax"], e["ymax"])
+                box = b if box is None else box.union(b)
+        return box
+
     def _query(self, layer_url: str, params: dict, post: bool = False, tries: int = 6) -> dict:
         """One query, retried."""
         for attempt in range(tries):

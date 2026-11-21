@@ -22,7 +22,7 @@ log = logging.getLogger(__name__)
 
 class ExtentsBuilder:
     """Reads the firms files from the target repo (or local --dry-run batches with --local-manifests) and each fire's
-    first perimeter from the built dataset. Rows of fires not in this run (--ids) are kept."""
+    first perimeter record and reported origin from the catalog. Rows of fires not in this run (--ids) are kept."""
 
     def __init__(self, settings: RunSettings, registry: ChannelRegistry | None = None) -> None:
         self.s = settings
@@ -34,10 +34,9 @@ class ExtentsBuilder:
         work = Path(s.work)
         if not s.dry_run:
             hub.check_write()
-        catalog = FireCatalog(s.source_repo, work / "source")
-        fires = catalog.fires(s.fires, list(s.ids) if s.ids else None)
+        fires = FireCatalog(hub, work / "target", s.catalog_file).fires(s.archive, list(s.ids) if s.ids else None)
         if not fires:
-            log.info("no fires matched (--fires / --ids): nothing to do")
+            log.info("no fires matched (--archive / --ids): nothing to do")
             return ExitCode.FAILED
         if s.local_manifests:
             m = ManifestBook.read_local(Path(s.local_manifests), "firms")
@@ -49,10 +48,8 @@ class ExtentsBuilder:
             roots = [dl / "fires"]
         current = ChannelProgress.done_ids(m, self.firms, fires)
         stale = [f.fire_id for f in fires if f.fire_id not in current]
-        firsts = catalog.first_perimeters(fires)
-        new = pd.DataFrame(
-            [FireExtentEstimator.row(f, self._detections(f, roots), firsts.get(f.fire_id)) for f in fires]
-        )
+        rows = [FireExtentEstimator.row(f, self._detections(f, roots)) for f in fires]
+        new = pd.DataFrame([r | {"firms_current": r["fire_id"] in current} for r in rows])
         old = FireCatalog.load_extents(None if s.dry_run else hub, work / "target")
         if old and s.ids:
             keep = pd.DataFrame([r for fid, r in old.items() if fid not in set(new.fire_id)])

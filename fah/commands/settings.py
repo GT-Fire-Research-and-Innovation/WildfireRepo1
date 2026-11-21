@@ -6,20 +6,17 @@ import argparse
 import dataclasses
 from dataclasses import dataclass
 from pathlib import Path
-from typing import ClassVar
 
 
 @dataclass(frozen=True, slots=True)
 class RunSettings:
     """Every command line option (defaults as the command line gives them)."""
 
-    SOURCE_REPO: ClassVar[str] = "Javyn123/wildfire-spread-2014-2025"  # the built dataset
-
     channel: str | None = None
     hf_repo: str | None = None
-    source_repo: str = SOURCE_REPO
     work: Path = Path("raw_work")
-    fires: str = "built"
+    archive: str = "all"  # geomac | nifs | both | all: which fires of the catalog a run takes
+    catalog_file: str | None = None  # a local fires.csv instead of the repo's catalog/fires.csv
     ids: tuple[str, ...] | None = None
     limit: int | None = None
     batch_gb: float = 2.0
@@ -36,7 +33,13 @@ class RunSettings:
     verbose: bool = False
     links_chunk: int = 500
     extents_file: str | None = None
+    partial_windows: bool = False  # time-dependent channels: go ahead while some windows are not final
     local_manifests: str | None = None
+    catalog: str | None = None  # scan | build | all
+    first_year: int = 2014
+    last_year: int = 2025
+    min_acres: float = 1000.0
+    min_days: int = 3
 
     @classmethod
     def from_args(cls, args: argparse.Namespace) -> RunSettings:
@@ -44,6 +47,10 @@ class RunSettings:
         values["work"] = Path(values.get("work") or "raw_work")
         if values.get("ids") is not None:
             values["ids"] = tuple(values["ids"])
+        years = getattr(args, "years", None)
+        if years:
+            first, _, last = str(years).partition("-")
+            values["first_year"], values["last_year"] = int(first), int(last or first)
         return cls(**values)
 
     def replace(self, **changes: object) -> RunSettings:

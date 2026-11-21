@@ -80,7 +80,8 @@ def test_the_window_moves_every_time_dependent_channel(camp_perimeters, channels
     assert ana[0] == t0 and runs[-1] == pd.Timestamp("2018-11-28 12:00", tz="UTC")
     assert GoesChannel.hours(f)[0][0] == t0 and GfsChannel.times(f)[0][0] == pd.Timestamp("2018-11-05 12:00", tz="UTC")
     assert (
-        channels.get("hrrr").window_label(f) == "2018-11-05/2018-11-28"
+        channels.get("goes").window_label(f) == "2018-11-05/2018-11-28"
+        and channels.get("hrrr").window_label(f) == "2018-11-02/2018-11-28"  # 3 days of spin-up
         and channels.get("terrain").window_label(f) == ""
     )
     assert channels.get("firms").window_label(f) == "2018-10-26/2018-12-09"  # the window's input: fixed days

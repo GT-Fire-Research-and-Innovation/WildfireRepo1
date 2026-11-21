@@ -31,9 +31,7 @@ class LinksBuilder:
         self.channels = (registry or ChannelRegistry()).names()
 
     @staticmethod
-    def fire_links(
-        fire: Fire, rows: Sequence[dict], repo: str | None, source_repo: str, channels: Sequence[str]
-    ) -> dict:
+    def fire_links(fire: Fire, rows: Sequence[dict], repo: str | None, channels: Sequence[str]) -> dict:
         """links.json of one fire: the latest manifest row per channel (channels not run yet are 'pending')."""
         fid = fire.fire_id
         base = f"https://huggingface.co/datasets/{repo}" if repo else "."
@@ -65,11 +63,11 @@ class LinksBuilder:
             "first_perimeter_utc": fire.first,
             "last_perimeter_utc": fire.last,
             "time_window_utc": [t.isoformat() for t in fire.span()],
+            "archive": fire.archive,
             "region_lonlat": [round(v, 5) for v in fire.region()],
-            "build_box_lonlat": list(fire.build_box),
+            "perimeters_box_lonlat": [round(v, 5) for v in fire.box],
             "ignition": dict(fire.ignition._asdict()) if fire.ignition else None,
             "folder": f"{base}/tree/main/fires/{fid}",
-            "built_dataset": f"https://huggingface.co/datasets/{source_repo}/tree/main/fires/{fid}",
             "channels": chans,
         }
 
@@ -82,12 +80,13 @@ class LinksBuilder:
         out = [
             f"# {links['name']} ({links['year']}) · `{links['fire_id']}`",
             "",
-            f"IRWIN `{links['irwin_incident']}` · perimeters {str(links['first_perimeter_utc'])[:16]} → "
+            f"IRWIN `{links['irwin_incident']}` · {links.get('archive') or ''} perimeters "
+            f"{str(links['first_perimeter_utc'])[:16]} → "
             f"{str(links['last_perimeter_utc'])[:16]} UTC · files cover {t0[:16]} → {t1[:16]} UTC over region "
             f"W {w:.4f} S {s:.4f} E {e:.4f} N {n:.4f}"
             + (f" · ignition {ig['lat']:.4f}, {ig['lon']:.4f} at {ig['time_utc']} ({ig['method']})" if ig else ""),
             "",
-            f"[This fire's folder]({links['folder']}) · [Built dataset layers]({links['built_dataset']})",
+            f"[This fire's folder]({links['folder']})",
             "",
             "| channel | status | files | upstream sources |",
             "|---|---|---|---|",
@@ -121,7 +120,7 @@ class LinksBuilder:
         work = Path(s.work)
         if not s.dry_run:
             hub.check_write()
-        fires = FireCatalog(s.source_repo, work / "source").fires(s.fires, list(s.ids) if s.ids else None)
+        fires = FireCatalog(hub, work / "target", s.catalog_file).fires(s.archive, list(s.ids) if s.ids else None)
         fires = FireCatalog.with_extents(fires, FireCatalog.load_extents(hub, work / "target", s.extents_file))
         m = ManifestBook.read_local(Path(s.local_manifests)) if s.local_manifests else ManifestBook.read(hub)
         by_fire = {fid: g.to_dict("records") for fid, g in m.groupby("fire_id")} if len(m) else {}
@@ -132,7 +131,7 @@ class LinksBuilder:
         for k in range(0, len(fires), s.links_chunk):
             d = root / f"chunk{k // s.links_chunk:03d}"
             for f in fires[k : k + s.links_chunk]:
-                links = self.fire_links(f, by_fire.get(f.fire_id, []), s.hf_repo, s.source_repo, self.channels)
+                links = self.fire_links(f, by_fire.get(f.fire_id, []), s.hf_repo, self.channels)
                 fd = d / "fires" / f.fire_id
                 fd.mkdir(parents=True, exist_ok=True)
                 (fd / "links.json").write_text(json.dumps(links, indent=1))

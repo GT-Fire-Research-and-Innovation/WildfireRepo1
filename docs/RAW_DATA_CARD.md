@@ -5,18 +5,23 @@ tags: [wildfire, remote-sensing, geospatial, fire-spread, raw-data]
 ---
 # Wildfire spread 2014–2025: upstream raw sources per fire
 
-This repo holds the upstream data behind the built dataset
-[{SOURCE_REPO}](https://huggingface.co/datasets/{SOURCE_REPO}), fire by fire.
-Each fire gets the original records, values and grids of every source, cut to its region (the box around all
-its perimeters pushed out 32 km on every side) over its time window (below). Nothing is regridded or derived:
-this is a raw layer to cut training tiles from, never to train on as it stands.
-Made by the `fah` package (`python -m fah`) on the `data_grab_satfire` branch of
-https://github.com/GT-Fire-Research-and-Innovation/WildfireRepo1, one channel at a time
-(`notebooks/kaggle_data_grab.ipynb`).
+This repo holds the upstream raw data of every fire in its fire list, fire by fire. The fire list
+(`catalog/fires.csv`) is crawled from the NIFC perimeter and incident databases and kept as served; only gates
+decide which incidents are fires (see "The fire list"). Each fire gets the original records, values and grids of
+every source, cut to its region (the box of its perimeter records pushed out 32 km on every side) over its time
+window (below). Nothing is regridded or derived: this is a raw layer to cut training tiles from, never to train on
+as it stands. Made by the `fah` package (`python -m fah`) on the `data_grab_satfire` branch of
+https://github.com/GT-Fire-Research-and-Innovation/WildfireRepo1: the fire list first
+(`notebooks/kaggle_catalog.ipynb`), then each channel (`notebooks/kaggle_data_grab.ipynb`, one copy per channel,
+several at once).
 
 ## Layout
 ```
-catalog/fires.csv, qc_fires.csv      the fire list (fire_id, IRWIN incident, name, dates, box, QC rating)
+catalog/fires.csv                    the fire list: one row per fire (columns below)
+catalog/incidents.csv                every incident crawled, its gate values and why it is not a fire
+catalog/gates.json                   the gate settings and counts of the last build
+catalog/raw/perimeters/*.parquet     every perimeter record of every archive layer, all fields as served
+catalog/raw/incidents/*.parquet      the WFIGS incident record (97 fields) of every IRWIN id the perimeters name
 catalog/raw_index.csv                one row per fire and channel: status, number of files, bytes
 catalog/fire_extents.csv             each fire's time window, ignition point and region, and how each was found
 fires/<fire_id>/
@@ -32,15 +37,76 @@ To get one fire, download `fires/<fire_id>/`, for example with
 `huggingface_hub.snapshot_download(repo, repo_type="dataset", allow_patterns=["fires/<fire_id>/*"])`.
 FIRMS links contain `{MAP_KEY}` where your own free FIRMS key goes. NASA Earthdata links (viirs, vegetation,
 landcover) need a free Earthdata Login account or token (https://urs.earthdata.nasa.gov).
-`fire_id` = `"F"` followed by the first 10 hex characters of the SHA-1 of the incident key (its IRWIN ID).
-It matches the built dataset.
+`fire_id` = `"F"` followed by the first 10 hex characters of the SHA-1 of the incident key: the IRWIN ID as the
+archive stores it, braces and spaces stripped (a few keep trailing junk such as a newline; it stays, so ids never
+change), or `name:<lower-case name>|<unique fire id>` for an incident without one. The ids are those of the earlier
+catalog of the built dataset (Javyn123/wildfire-spread-2014-2025).
+
+## The fire list
+`python -m fah --catalog scan` crawls the databases into `catalog/raw/`; `--catalog build` applies the gates and
+writes `fires.csv`, `incidents.csv` and `gates.json` (`notebooks/kaggle_catalog.ipynb` runs both).
+
+**Sources.** Every record of every NIFC wildfire perimeter layer of the years, all fields, without geometry (the
+record's centroid is kept, and the service gives each fire's exact extent):
+
+| archive | layers | years | how its records are written |
+|---|---|---|---|
+| GeoMAC | `Historic_Geomac_Perimeters_<year>` | 2014–2019 | one outline per mapping; no category field; `perimeterdatetime` is a local clock time stored as if it were UTC |
+| NIFS / ODA | `National_Incident_Feature_Service_2018`, `2019_NIFS_OpenData`, Operational Data Archive 2020–2021 (geodatabase downloads), `Operational_Data_Archive_2022`–`2025` | 2018–2025 | every edit a new version (`GDB_FROM_DATE` / `GDB_TO_DATE`); `FeatureCategory` (wildfire daily / final perimeter, prescribed fire, …); `PolygonDateTime` in true UTC; `DeleteThis` flags |
+
+Then `WFIGS_Incident_Locations`, one record per incident with 97 fields (discovery time, cause, incident type WF / RX,
+final acres, containment / control / out times, fuel model, complex, point of origin), for every IRWIN id the
+perimeters name. Fires of 2018–2019 can be in both archives (`archive` = `both`).
+
+**Gates.** An incident is a fire of this repo when all of these hold (defaults; `--years`, `--min-acres`,
+`--min-days` change them):
+
+| gate | rule |
+|---|---|
+| wildfire | NIFS / ODA `FeatureCategory` is a wildfire perimeter; WFIGS `IncidentTypeCategory` is not RX (prescribed fire) |
+| region | a wildfire record's centroid lies in the continental US (-125, 24, -66, 50) |
+| years | the last perimeter of its main run falls in 2014–2025 |
+| size | its largest `GISAcres` is at least 1,000 acres |
+| days | it has perimeters on at least 3 burn days |
+| main run | records whose centroids do not chain within 25 km of one another form separate groups (an IRWIN id is sometimes typed on another fire's records, hundreds of km away), and perimeters more than 10 days apart split a group; the run with the most burn days must pass size and days too, and sets `first`, `last` and the box |
+
+A burn day is a perimeter's local solar date after taking off 6 hours, so a night infrared flight counts for the
+day that just burned. Hand sketches and modeled shapes do not count for size or days. Records flagged `DeleteThis`
+and records without a readable time are left out of every gate. GeoMAC times are read on the clock they were
+written in (Denver time for every 2019 record; the fire's own time zone before) and converted to UTC; NIFS / ODA
+times are UTC as stored. Every record stays in `catalog/raw/` as served: the interpreted times only decide the
+gates and the windows.
+
+**`catalog/fires.csv`**
+
+| column | what it is |
+|---|---|
+| `fire_id`, `incident`, `irwin_id`, `name` | the id; the incident key; its IRWIN uuid (junk removed); the latest name in its main run |
+| `archive` | `geomac`, `nifs` or `both` |
+| `year`, `first`, `last` | the main run: year of its last perimeter; first and last perimeter time (UTC) |
+| `first_record_utc`, `last_record_utc` | first and last wildfire record of the whole incident, before the main-run cut |
+| `days`, `all_days`, `records`, `all_records` | burn days and records of the main run, and of the whole incident |
+| `max_gis_acres`, `map_methods`, `layers` | largest mapped size, mapping methods and archive layers of the main run |
+| `west`, `south`, `east`, `north` | the exact extent of the main run's records |
+| `first_record_time`, `first_lat`, `first_lon` | the earliest perimeter of the main run and its centroid |
+| `discovery_utc`, `incident_lat`, `incident_lon`, `initial_lat`, `initial_lon` | WFIGS: discovery time; the incident's point; the reported initial point (often empty) |
+| `incident_type`, `incident_kind`, `fire_cause`, `fire_cause_general`, `fire_cause_specific` | WFIGS: type (WF / RX), kind, cause |
+| `final_acres`, `incident_size`, `containment_utc`, `control_utc`, `out_utc` | WFIGS: reported size and end times |
+| `predominant_fuel_group`, `predominant_fuel_model`, `primary_fuel_model` | WFIGS: fuel |
+| `complexity_level`, `complex_name`, `complex_id`, `is_complex_child` | WFIGS: incident complexity and complex |
+| `poo_state`, `poo_county`, `gacc`, `unique_fire_id`, `local_incident_id` | WFIGS: where it started, its coordination centre, its other ids |
+
+WFIGS columns are empty for an incident without an IRWIN id or a WFIGS record; every WFIGS field stays in
+`catalog/raw/incidents/`. `catalog/incidents.csv` lists every incident with `reason` (empty for fires), so a gate
+can be loosened without crawling again.
 
 ## Region, time window, ignition point
-**Region.** The box around all of a fire's perimeters, pushed out 32 km on every side (at least 32 km at every
+**Region.** The box of a fire's perimeter records (its main run: `west` / `south` / `east` / `north` in
+`catalog/fires.csv`), pushed out 32 km on every side (at least 32 km at every
 latitude of the box), so any 64 km × 64 km tile centred anywhere in the fire fits inside: on its ignition point,
 on its front on any day, or shifted at random. A fire too small to measure gets a 64 km square; larger fires get
-64 km plus their own width. `perimeters` and `ics209` stay on the build's tighter box (perimeter union + 9.6 km):
-they keep only the fire's own records, and a wider box would match neighbouring incidents. 27 fires burned wider
+64 km plus their own width. `perimeters` and `ics209` query the perimeters' own box instead: they keep only the
+fire's own records, and a wider box would match neighbouring incidents. 27 fires burned wider
 than 64 km; their region still holds all their data, but no single 64 km tile holds the whole fire.
 
 **Time window.** A fire often burns before its first mapped perimeter and keeps burning after its last. Each fire's window runs
@@ -51,15 +117,23 @@ day to 23:00 UTC of the last). An active day has at least 2 VIIRS detections ins
 quiet days, so a separate fire weeks earlier does not stretch the window. FIRMS itself covers a fixed 14 days
 before the first perimeter to 14 days after the last.
 
-**Ignition point.** The fire's earliest observation, which is known when it starts: the earlier of the first VIIRS
-overpass that saw it (the centre of its detections within 15 minutes of the first one; `ignition_method` =
-`firms`, or `firms_single` when no day had 2 detections) and its first mapped perimeter (`first_perimeter`, the
-centre of the cells the built dataset's labels give the earliest arrival). Without either, the centre of the
-perimeters' box (`perimeter_box_centre`, which uses the final extent: avoid it as a tile centre).
+**Ignition point.** The fire's earliest observation, which is known when it starts. It is the earliest of three:
+- the first VIIRS overpass that saw it: the centre of its detections within 15 minutes of the first one
+  (`ignition_method` = `firms`, or `firms_single` when no day had 2 detections);
+- its first mapped perimeter: the centroid and time of the earliest record of its main run (`first_perimeter`;
+  `first_*` in `catalog/fires.csv`);
+- the reported point of origin: WFIGS discovery time and incident point (`reported_origin`). It is used only from 14
+  days before the first perimeter day to a day after the last, so a misdated report cannot win.
+
+Without any of them, it is the centre of the perimeters' box (`perimeter_box_centre`, which uses the final extent:
+avoid it as a tile centre).
 
 `catalog/fire_extents.csv` lists, per fire: `start_day` / `end_day`, the perimeter days, how many days activity
 added on each side, `window_rule` (`perimeters+firms`, or `perimeters` without FIRMS data), `ignition_lat` /
-`ignition_lon` / `ignition_time_utc` / `ignition_method`, and `region_west` / `south` / `east` / `north`.
+`ignition_lon` / `ignition_time_utc` / `ignition_method`, `region_west` / `south` / `east` / `north`, and
+`firms_current` (whether the fire's firms files covered its current FIRMS days when the row was written). The
+time-dependent channels start only when every fire's row is current and matches its perimeter days, so a window
+never grows after they have fetched it.
 
 The region and window are fixed after the fact (from the final perimeters and all the detections), so they
 describe the whole fire. To train without seeing the future, cut your own inputs from these files using only what was
@@ -106,7 +180,7 @@ the fire's window.
 | Active fire | `goes` | Fire seen from a weather satellite parked over the Americas: coarse, but every hour | mid-2017–2025 | 2 km at best, about 3–4 km over the West | Time series: every hour |
 | Active fire | `viirs` | The raw satellite images behind `firms`: five bands of reflected light and heat at 375 m, one more at 750 m, day and night | 2014–2025; second satellite from 2018, third from 2023 | 375 m (one band 750 m) | Time series: every pass, about 2–6 a day |
 | Burned area | `perimeters` | The fire's outline each time an aircraft or crew mapped it | 2014–2025 | Exact outlines (no pixels) | Time series: each mapping, median 8 per fire, about a day apart |
-| Weather | `hrrr` | Wind, gusts and humidity as they were, from NOAA's high-resolution weather model | mid-2014–2025 | 3 km | Time series: every 3 hours |
+| Weather | `hrrr` | Wind, gusts, humidity, temperature, dew point, sunlight and rain as they were, from NOAA's high-resolution weather model, starting 3 days before the window | mid-2014–2025 | 3 km | Time series: every 3 hours |
 | Weather | `hrrr_next` | NOAA's forecast for the next 36 hours, made at noon UTC each day: wind, gusts, humidity, temperature, rain | mid-2014–2025; 36 h ahead from mid-2018 (15–18 h before) | 3 km | Time series: one forecast a day, a step every 3 hours |
 | Weather | `gfs` | NOAA's global forecast out to 10 days, coarse, with extra fields for smoke plumes and the air's mixing height | mid-2015–2025 | about 28 km | Time series: one forecast a day, a step every 3 hours |
 | Weather | `gridmet` | Daily weather and the fire-danger numbers crews use, including how dry dead wood and grass are | 2014–2025 (record from 1979) | about 4 km | Time series: daily |
@@ -187,7 +261,7 @@ What this one fire teaches:
 | `firms` | Series | 8,669 detections inside the fire's box from 70 satellite passes; FIRMS fetched 26 October to 9 December |
 | `goes` | Series | 480 hourly scans from GOES-16; 288 from GOES-17, whose data starts 15 November |
 | `viirs` | Series | 130 satellite passes: 65 from S-NPP and 65 from NOAA-20 |
-| `hrrr` | Series | 160 weather snapshots (every 3 hours) |
+| `hrrr` | Series | 184 weather snapshots every 3 hours, from 4 November (3 days before the window): each analysis, plus the 3-hour rain and sunlight of the run before |
 | `hrrr_next` | Series | 20 daily forecasts × 12 steps, out to 36 hours |
 | `gfs` | Series | 20 daily forecasts × 80 steps, out to 10 days |
 | `gridmet` | Series | 34 days, 25 October to 27 November, 13 variables |
@@ -244,6 +318,7 @@ next-day spread model is likely to lose without it:
 | 1 | Next-day forecast: wind, gusts, humidity, temperature, rain | `hrrr_next` | The weather the fire will meet, as known the day before | Before mid-2018 the forecast stops short of the next afternoon (use `gfs`) |
 | 2 | Today's wind, gusts and humidity | `hrrr` | The conditions that produced today's burning | — |
 | 2 | Fire-danger numbers and dead-fuel dryness (ERC, BI, 100- and 1000-hour fuel moisture, vapor pressure deficit) | `gridmet` | How ready the fuel is to burn, built up over weeks | Daily values; use the prediction day's, never the next day's |
+| 2 | Fine dead-fuel moisture (1- and 10-hour), hour by hour on the terrain | `hrrr` (`t2`, `dpt`, `dswrf`, and the 3-hour rain in `hrrr_f03.nc`; 3 days of spin-up included), `terrain`, `landfire` canopy cover | How dry the grass and needles that carry the fire are each afternoon, and how far they recover overnight | Has to be computed (for example with Nelson's model); gridmet's values are daily and 4 km |
 | 3 | Next-day forecast for early fires; plume and mixing-height fields | `gfs` | Fills about 750 fires before mid-2018; deep mixing goes with erratic growth | 28 km pixels: a few numbers per fire, not a map |
 | 3 | Days since rain, 30-day rain, drought index (PDSI) | `gridmet` | Long-term dryness | Changes slowly |
 | 3 | Critical fire-weather hours (low humidity with strong gusts) | `hrrr`, `hrrr_next` | How long conditions were extreme | Thresholds vary by region |
@@ -256,7 +331,7 @@ next-day spread model is likely to lose without it:
 |---|---|---|---|---|
 | 1 | Fuel type and its properties (how much fuel, how fine, how deep) | `landfire` | What burns and how fast | Missing for 2014–2016 fires; 2021–2022 fires get 2016 fuels, which miss recent burns |
 | 1 | Slope, aspect, elevation | `terrain` | Fire races uphill and follows canyons | — |
-| 2 | Physics-based spread estimate (Rothermel) | `landfire`, `terrain`, `hrrr`, `gridmet` | A textbook prediction of spread speed for the model to correct | Has to be computed |
+| 2 | Physics-based spread estimate (Rothermel) | `landfire`, `terrain`, `hrrr` (wind, fine-fuel moisture), `gridmet` | A textbook prediction of spread speed for the model to correct | Has to be computed |
 | 2 | Tree canopy height, cover, base height, density | `landfire` | Whether fire can climb into the treetops | Same version issues as fuel type |
 | 2 | Years since each spot last burned | `history` | Recently burned land has little left to burn | Fires earlier in the same year are missing |
 | 3 | Plant greenness and moisture | `vegetation` | Green plants slow fire; cured grass speeds it | Use only averages that ended before the prediction day |
@@ -285,8 +360,8 @@ next-day spread model is likely to lose without it:
 - **Composite:** an image averaged over several days so clouds can be filled in.
 - **ERC, BI:** energy release component and burning index, daily fire-danger numbers used by US fire agencies.
 - **Fire radiative power (FRP):** heat given off by a burning pixel, in megawatts.
-- **Fuel moisture (100-hour, 1000-hour):** how wet dead wood is; the hours describe how fast wood of that thickness
-  dries out.
+- **Fuel moisture (1-, 10-, 100-, 1000-hour):** how wet dead fuel is; the hours describe how fast fuel of that
+  thickness dries out, from grass and needles (1-hour, follows the weather within hours) to logs (1000-hour, weeks).
 - **Fuel model:** one of 40 standard fuel types (grass, shrub, timber litter, …) that fire behaviour models use.
 - **Infrared (IR) map:** a fire outline drawn from a heat camera flown over the fire, usually at night.
 - **Leak:** information from after the prediction moment slipping into the inputs.
@@ -306,12 +381,12 @@ next-day spread model is likely to lose without it:
 | suppression | NIFS / ODA EventLine and EventPolygon: every archived version (GDB_FROM_DATE / GDB_TO_DATE), with its CreateDate and DateCurrent; a model may use a version only from the burn day after the latest of the three | 2018+ | `event_lines.geojson.gz`, `event_polygons.geojson.gz` |
 | tessera | GeoTessera v1.1: reference only (year, region, how to fetch) | 2018+ | `tessera_ref.json` |
 | terrain | Copernicus GLO-30 DEM, native 1 arc-second | all | `dem_glo30.tif` |
-| landfire | LANDFIRE FBFM40, CC, CH, CBH, CBD from the newest version before the fire: the stored 30 m pixels in EPSG:5070 from LANDFIRE's image services (snapped to its grid, nearest neighbour), LZW GeoTIFF as the server returns it | 2017+ | `landfire_<version>_<layer>.tif` (5 files) |
+| landfire | LANDFIRE FBFM40, CC, CH, CBH, CBD from the newest version before the fire: the stored 30 m pixels in EPSG:5070 from LANDFIRE's image services (snapped to its grid, nearest neighbour), LZW GeoTIFF as the server returns it. LANDFIRE withdrew its LF2012, LF2014 and LF2020 fuels, so fires of 2017–2022 get LF2016 and later fires the version of the year before | 2017+ | `landfire_<version>_<layer>.tif` (5 files) |
 | lulc | Esri / Impact Observatory 10 m annual land use / land cover (io-lulc-annual-v02, Microsoft Planetary Computer), map of the year before the fire (2017 for 2017 fires, 2023 at most): the box's pixels of each source tile on its own UTM grid; class legend in the `classes` tag | 2017+ | `io_lulc_<year>_<tile>.tif` |
 | landcover | MODIS MCD12Q1 v061 annual land cover of the year before the fire, every layer (LC_Type1-5, LC_Prop1-3 and assessments, QC, LW), on the sinusoidal 463 m grid; tiles joined pixel for pixel | all | `mcd12q1_<year>.nc` |
 | vegetation | VIIRS VNP13A1 v002 16-day vegetation indices, every layer (NDVI, EVI, EVI2, reflectances, angles, composite day, VI quality, pixel reliability), each composite overlapping 16 days before the window to its end, sinusoidal 463 m grid | all | `vnp13a1.nc` (`time` = composite start) |
 | goes | GOES-16/17/18/19 ABI L2 fire product (FDCC): the scan nearest each hour of the window, cropped on the fixed grid; Mask/Power/Area/Temp/DQF stay packed as in the source | window ≥ 2017-06 | `goes_<sat>.nc` |
-| hrrr | NOAA HRRR GUST, UGRD/VGRD 10 m, RH 2 m, decoded from the files' own GRIB2 messages and cropped on the native 3 km grid: analyses every 3 h across the window (the 12z run's forecasts are in `hrrr_next`) | window ≥ 2014-08 | `hrrr_ana.nc` |
+| hrrr | NOAA HRRR every 3 h from 3 days before the window to its end (the spin-up an hourly fuel-moisture model needs), decoded from the files' own GRIB2 messages and cropped on the native 3 km grid. `hrrr_ana.nc`, the analysis (f00): GUST, UGRD/VGRD 10 m, RH / TMP / DPT 2 m, DSWRF (missing from the analyses of 2014 and a few days of 2016). `hrrr_f03.nc`, at the same valid times, the 3 h forecast (f03) of the run 3 h earlier: APCP 0–3 h (the rain of the 3 h before) and DSWRF (every version). The 12z run's longer forecasts are in `hrrr_next` | window ≥ 2014-08 | `hrrr_ana.nc`, `hrrr_f03.nc` |
 | hrrr_next | NOAA HRRR, the 12z run's forecasts every 3 h out to 36 h for each day (to 15 h before 2016-08-23, 18 h before 2018-07-12): GUST, UGRD/VGRD 10 m, RH 2 m, TMP 2 m, SPFH 2 m, APCP accumulated from the run start; `lead_h` and `run_time` per step | window ≥ 2014-08 | `hrrr_next.nc` |
 | gfs | NOAA GFS 0.25° (TS-SatFire's forecast source) from Google Earth Engine `NOAA/GFS0P25`: the 12z run's forecasts every 3 h out to 10 days for each day of the window (to 36 h before 2017-07-09, as the collection holds them), every band of each image (2 m temperature in °C, specific / relative humidity, 10 m wind, precipitation accumulated over the last 1–6 h, precipitable water, cloud cover, radiation; more bands from 2025-01-15) on the native 0.25° grid; `lead_h` and `run_time` per step | window ≥ 2015-07 | `gfs.nc` |
 | osm | OpenStreetMap, Geofabrik snapshot of 1 January of the fire's year: full extract of the region | all | `osm_<YYYY>-01-01.osm.pbf` |
