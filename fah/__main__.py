@@ -23,7 +23,10 @@ How a run works
      vegetation, viirs) read it.
   2. Resume: fires already in manifest/<channel>/*.csv of the target repo (ok / empty / n/a) are skipped;
      errors are retried. A row also has to match the fire's current window and region (columns window,
-     region), so widening either sends the fire back to the queue.
+     region), so widening either sends the fire back to the queue. With --max-hours, a pass over the fires
+     that ends early is followed by a check of the channel's whole manifest in the repo: fires still not done
+     (errors such as rate-limited calls, fires a pass never reached) get another pass 10 minutes later, until
+     every fire is done or the deadline nears.
   3. Each fire is fetched into a staging folder, then moved into the current batch. A batch is uploaded as one
      commit when it reaches --batch-gb or --batch-fires, when disk runs low, or before the deadline, together
      with its manifest file; the local copy is deleted right after. A failed upload keeps the batch on disk.
