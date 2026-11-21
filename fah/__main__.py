@@ -26,7 +26,10 @@ How a run works
      region), so widening either sends the fire back to the queue. With --max-hours, a pass over the fires
      that ends early is followed by a check of the channel's whole manifest in the repo: fires still not done
      (errors such as rate-limited calls, fires a pass never reached) get another pass 10 minutes later, until
-     every fire is done or the deadline nears.
+     every fire is done or the deadline nears. --max-errors-in-row fires failing in a row end a pass: after
+     other fires of the pass worked it is an outage (pause, then go back), with none working the channel stops.
+     The run ends with the list of fires the channel missed (not done, or empty): id, name, year, reason and
+     the fire's folder in the repo.
   3. Each fire is fetched into a staging folder, then moved into the current batch. A batch is uploaded as one
      commit when it reaches --batch-gb or --batch-fires, when disk runs low, or before the deadline, together
      with its manifest file; the local copy is deleted right after. A failed upload keeps the batch on disk.
@@ -157,7 +160,8 @@ def main(argv: list[str] | None = None) -> int:
         "--max-errors-in-row",
         type=int,
         default=10,
-        help="stop the channel (exit 4) after this many fires fail in a row; 0 = never",
+        help="this many fires failing in a row end a pass: the channel stops (exit 4) when no fire of the pass "
+        "worked, else (with --max-hours) it pauses 10 min and goes back; 0 = never",
     )
     ap.add_argument("--verbose", action="store_true")
     a = ap.parse_args(argv)
@@ -167,6 +171,8 @@ def main(argv: list[str] | None = None) -> int:
     err = logging.StreamHandler(sys.stderr)
     err.setLevel(logging.WARNING)
     logging.basicConfig(level=logging.INFO, format="%(message)s", handlers=[out, err], force=True)
+    for quiet in ("httpx", "httpcore"):  # huggingface_hub's HTTP library logs every request at INFO
+        logging.getLogger(quiet).setLevel(logging.WARNING)
 
     if a.status and not a.hf_repo:
         ap.error("--status needs --hf-repo")

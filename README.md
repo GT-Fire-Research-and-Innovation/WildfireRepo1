@@ -62,8 +62,11 @@ fires.
 A channel run resumes from the repo's manifests: fires recorded ok, empty or n/a are skipped, errors are fetched again.
 With `--max-hours`, a pass over the fires that ends early is followed by a check of the channel's whole manifest in the
 repo: fires still not done (errors such as rate-limited calls, or fires a pass never reached) get another pass 10
-minutes later, until every fire is done or the deadline nears. `--limit` keeps these passes to the run's own fires;
-without `--max-hours` a run makes one pass.
+minutes later, until every fire is done or the deadline nears. `--max-errors-in-row` fires failing in a row (default
+10) end a pass: when other fires of that pass worked, the source is taken to be down for a while and the run pauses and
+goes back; when none did, the channel stops (exit 4). `--limit` keeps these passes to the run's own fires;
+without `--max-hours` a run makes one pass. Every run ends by logging the fires its channel missed: each fire not done
+(error, outdated, not fetched) or empty, with its name, year, reason and its folder in the repo.
 
 Channels can run at the same time, one process per channel, against the same repo: each writes only
 `fires/<id>/<channel>/` and `manifest/<channel>/`, and every Hub write is retried when another commit or a rate limit

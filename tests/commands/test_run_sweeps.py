@@ -1,6 +1,6 @@
 """ChannelRun, offline: with --max-hours, a pass that ends before the deadline checks the channel's whole manifest in
 the repo and goes back to the fires not done (errors such as rate limits, fires a pass never reached) until all are
-done or the deadline nears."""
+done or the deadline nears; the run ends with the list of fires it missed."""
 
 from __future__ import annotations
 
@@ -11,6 +11,7 @@ import pandas as pd
 import pytest
 
 from fah.channels.base import Channel
+from fah.commands.progress import ChannelProgress
 from fah.commands.run import ChannelRun
 from fah.commands.settings import RunSettings
 from fah.core.errors import ExitCode
@@ -49,13 +50,19 @@ class FakeHub:
 
 class FlakyChannel(Channel):
     """fails: {fire_id: errors before it works}; unreached: fires the first pass never yields (as a shared download
-    can lose a fire); calls: every fire handed to fetch, in order."""
+    can lose a fire); empty: fires the source has nothing for; calls: every fire handed to fetch, in order."""
 
     name = "flaky"
     region_cut = False
 
-    def __init__(self, fails: dict[str, int] | None = None, unreached: set[str] | None = None) -> None:
+    def __init__(
+        self, fails: dict[str, int] | None = None, unreached: set[str] | None = None, empty: set[str] = frozenset()
+    ) -> None:
         self.fails, self.unreached, self.calls = dict(fails or {}), set(unreached or ()), []
+        self.empty = set(empty)
+
+    def skip_reason(self, fire):
+        return "not covered" if fire.fire_id == "NA" else None
 
     def fetch(self, fires, ctx):
         for f in fires:
@@ -67,6 +74,9 @@ class FlakyChannel(Channel):
             if self.fails.get(fid, 0):
                 self.fails[fid] -= 1
                 yield FetchResult(f, Status.ERROR, (), "boom")
+                continue
+            if fid in self.empty:
+                yield FetchResult(f, Status.EMPTY)
                 continue
             (ctx.stage(fid) / "x.txt").write_text("x")
             yield FetchResult(f, Status.OK, ("https://example.org/x",))
@@ -125,15 +135,30 @@ def test_a_limited_run_goes_back_only_to_its_own_fires(tmp_path, repo):
     assert ch.calls == ["A", "B", "A"] and done(repo) == {"A", "B"}
 
 
-def test_error_streak_stops_the_channel_in_the_first_pass_only(tmp_path, repo):
+def test_error_streak_stops_a_broken_channel_but_not_over_fires_failing_again(tmp_path, repo):
     broken = FlakyChannel(fails={k: 99 for k in "ABCDEF"})
-    assert run(tmp_path, broken, max_errors_in_row=2) == ExitCode.CHANNEL_BROKEN
+    assert run(tmp_path, broken, max_errors_in_row=2) == ExitCode.CHANNEL_BROKEN  # nothing ever worked
     assert broken.calls == ["A", "B"]
 
     shutil.rmtree(repo.root)
     ch = FlakyChannel(fails={"B": 3, "D": 3})  # no two in a row in pass 1; later passes are only B, D
     assert run(tmp_path, ch, max_errors_in_row=2) == ExitCode.OK
     assert ch.calls == [*"ABCDEF", *"BD", *"BD", *"BD"] and done(repo) == set("ABCDEF")
+
+
+def test_an_outage_after_fires_worked_pauses_the_run_then_it_goes_back(tmp_path, repo):
+    ch = FlakyChannel(fails={"C": 1, "D": 1})  # the source fails for a while after A, B worked
+    assert run(tmp_path, ch, max_errors_in_row=2) == ExitCode.OK
+    assert ch.calls == [*"ABCD", *"CDEF"] and done(repo) == set("ABCDEF")
+
+    shutil.rmtree(repo.root)
+    down = FlakyChannel(fails={k: 99 for k in "CDEF"})  # still down after the pause: E, F fail too
+    assert run(tmp_path, down, max_errors_in_row=2) == ExitCode.CHANNEL_BROKEN
+    assert down.calls == [*"ABCD", *"CDEF"] and done(repo) == {"A", "B"}
+
+    shutil.rmtree(repo.root)
+    once = FlakyChannel(fails={"C": 1, "D": 1})
+    assert run(tmp_path, once, max_errors_in_row=2, max_hours=None) == ExitCode.CHANNEL_BROKEN  # no later pass
 
 
 def test_redo_counts_only_this_runs_rows_when_it_checks_the_repo(tmp_path, repo):
@@ -151,3 +176,30 @@ def test_dry_run_makes_one_pass(tmp_path, repo):
     ch = FlakyChannel(fails={"A": 1})
     assert run(tmp_path, ch, dry_run=True) == ExitCode.OK
     assert ch.calls == list("ABCDEF")
+
+
+def test_the_run_ends_with_every_missed_fire_its_name_and_folder(tmp_path, repo, monkeypatch, camp, caplog):
+    fires = [camp.replace(fire_id=k, name=f"Fire {k}") for k in ("A", "B", "C", "NA")]
+    monkeypatch.setattr(FireCatalog, "fires", lambda self, archive="all", ids=None: fires)
+    ch = FlakyChannel(fails={"A": 99}, empty={"B"})
+    with caplog.at_level("INFO"):
+        assert run(tmp_path, ch, max_hours=0.2) == ExitCode.OK  # one pass: the deadline is already near
+    lines = caplog.messages
+    i = next(k for k, m in enumerate(lines) if m.startswith("missed in flaky"))
+    assert lines[i] == "missed in flaky: 1 not done, 1 empty (of 4 fires):"
+    folder = "https://huggingface.co/datasets/me/raw/tree/main/fires"
+    assert lines[i + 1] == f"  A  Fire A (2018)  error  {folder}/A  boom"
+    assert lines[i + 2] == f"  B  Fire B (2018)  empty  {folder}/B"
+    assert not any(" C " in m or "  NA " in m for m in lines[i + 3 :])  # ok and n/a fires are not missed
+
+
+def test_missed_fires_name_why_they_are_not_done(camp, channels):
+    a, b, c, d = (camp.replace(fire_id=k) for k in "ABCD")
+    hrrr = channels.get("hrrr")
+    m = pd.DataFrame([dict(fire_id="A", status="ok", window="old", region=hrrr.region_label(a), files="hrrr_ana.nc"),
+                      dict(fire_id="B", status="error", error="HTTP 400 Exceeding allowed transaction limit."),
+                      dict(fire_id="C", status="empty", window=hrrr.window_label(c), region=hrrr.region_label(c))],
+                     columns=ManifestBook.COLUMNS).fillna("").assign(fetched_utc="2026-11-21")  # fmt: skip
+    got = [(f.fire_id, st, note) for f, st, note in ChannelProgress.gaps(m, hrrr, [a, b, c, d])]
+    assert got == [("A", "outdated", ""), ("B", "error", "HTTP 400 Exceeding allowed transaction limit."),
+                   ("D", "not fetched", ""), ("C", "empty", "")]  # fmt: skip

@@ -47,9 +47,11 @@ class ChannelRun:
     rest, record every fire in a batch. With --max-hours, a pass that ends before the deadline is followed by a
     check of the channel's whole manifest in the repo, and the fires still not done (errors such as rate-limited
     calls, fires a pass never reached) get another pass after RETRY_PAUSE_S, until every fire is done or the
-    deadline nears. -> exit code 0, or CHANNEL_BROKEN when the error streak trips in the first pass."""
+    deadline nears. The error streak ends a pass: when fires worked earlier in that pass, the source is taken to be
+    down for a while (an outage, throttling) and the run pauses and goes back; when none did, it is broken.
+    -> exit code 0, or CHANNEL_BROKEN when the streak trips in a pass where no fire worked."""
 
-    RETRY_PAUSE_S = 600.0  # between passes: rate limits reset (FIRMS: per 10 min), and no commit every few seconds
+    RETRY_PAUSE_S = 600.0  # between passes: rate limits reset (FIRMS: per 10 min), outages pass, few commits
 
     def __init__(self, settings: RunSettings, registry: ChannelRegistry | None = None) -> None:
         self.s = settings
@@ -94,22 +96,26 @@ class ChannelRun:
             hub.shared_paths() if (s.hf_repo and not s.dry_run) else (),
         )
         t0 = time.time()
-        sweep, shared_sent, broken = 0, False, None
+        sweep, shared_sent, broken, tried = 0, False, None, set()
         try:
             while todo:
                 sweep += 1
-                # the streak guards the first pass only: later passes hold just the fires that failed already
-                streak = ErrorStreak(s.max_errors_in_row if sweep == 1 else 0)
+                streak = ErrorStreak(s.max_errors_in_row)
                 runnable = self._record_skipped(todo, batch)
                 if runnable and not shared_sent:
                     for src, repo_path in channel.shared_files(ctx):
                         batch.add_shared(src, repo_path)
                     shared_sent = True
-                self._fetch(runnable, ctx, batch, streak, sweep, t0)
+                worked = self._fetch(runnable, ctx, batch, streak, sweep, t0, tried)
                 batch.upload()
                 if streak.tripped:
-                    broken = streak
-                    break
+                    if not worked or s.dry_run or not s.hf_repo or ctx.deadline is None:
+                        broken = streak  # nothing worked this pass (or no later pass to go to): the source is down
+                        break
+                    log.warning(
+                        f"warning: pass {sweep}: {streak.n} fires failed in a row after {worked} worked "
+                        f"({streak.last[:200]}): the source is probably down for a while; pausing, then going back"
+                    )
                 if s.dry_run or not s.hf_repo or ctx.deadline is None or ctx.expired():
                     break  # without --max-hours nothing would end the passes: one pass, as before
                 todo = self._missed(hub, scope, since)
@@ -127,6 +133,7 @@ class ChannelRun:
         finally:
             if not s.keep_cache:
                 ctx.cleanup()
+        self._report_gaps(hub, scope, since)
         t = batch.totals
         if broken is not None:
             log.error(
@@ -142,15 +149,27 @@ class ChannelRun:
         return ExitCode.OK
 
     def _fetch(
-        self, runnable: list[Fire], ctx: RunContext, batch: BatchUploader, streak: ErrorStreak, sweep: int, t0: float
-    ) -> None:
+        self,
+        runnable: list[Fire],
+        ctx: RunContext,
+        batch: BatchUploader,
+        streak: ErrorStreak,
+        sweep: int,
+        t0: float,
+        tried: set[str],
+    ) -> int:
         """One pass: fetch the fires and add each result to the batch, until they are all done, the deadline nears
-        or the error streak trips."""
+        or the error streak trips. Errors of fires this run tried before (in `tried`) do not count toward the streak:
+        they failed already, so failing again says nothing new about the source. -> fires that did not fail."""
         tag = f"pass {sweep} " if sweep > 1 else ""
+        worked = 0
         with contextlib.closing(self.channel.fetch(runnable, ctx)) as results:
             for k, r in enumerate(results, 1):
                 err = Secrets.redact(r.error)
                 fid = r.fire.fire_id
+                retried = fid in tried
+                tried.add(fid)
+                worked += r.status != Status.ERROR
                 batch.add(r.fire.ref(), r.status, ctx.stage_path(fid), r.sources, err, self.channel.labels(r.fire))
                 ctx.drop_stage(fid)
                 if r.trace and self.s.verbose:
@@ -160,8 +179,9 @@ class ChannelRun:
                     + (f" {err[:120]}" if err else "")
                     + f"  ({(time.time() - t0) / 60:.0f} min)"
                 )
-                if streak.hit(r.status, err):
-                    return
+                if not (retried and r.status == Status.ERROR) and streak.hit(r.status, err):
+                    return worked
+        return worked
 
     def _missed(self, hub: HubRepo, scope: list[Fire], since: str | None) -> list[Fire]:
         """The fires of scope still not done, by the channel's whole manifest read again from the repo after a pass.
@@ -171,6 +191,31 @@ class ChannelRun:
             manifest = manifest[manifest["fetched_utc"].astype(str) >= since]
         done = ChannelProgress.done_ids(manifest, self.channel, scope)
         return [f for f in scope if f.fire_id not in done]
+
+    def _report_gaps(self, hub: HubRepo, scope: list[Fire], since: str | None) -> None:
+        """Log every fire of the run the channel missed (not done, or empty), with its name and its folder in the
+        repo (LINKS.md there links every channel's files and sources once --links has run)."""
+        s, name = self.s, self.channel.name
+        try:
+            if s.dry_run:
+                manifest = ManifestBook.read_local(Path(s.work) / "batch", name)
+            else:
+                manifest = ManifestBook.read(hub, name)
+        except Exception as ex:  # noqa: BLE001  (the report is a convenience: never fail the run over it)
+            log.warning(f"warning: could not read the {name} manifests for the missed-fire list: {ex}")
+            return
+        if since and len(manifest):
+            manifest = manifest[manifest["fetched_utc"].astype(str) >= since]
+        gaps = ChannelProgress.gaps(manifest, self.channel, scope)
+        n_empty = sum(st == Status.EMPTY for _, st, _ in gaps)
+        log.info(
+            f"missed in {name}: {len(gaps) - n_empty} not done, {n_empty} empty (of {len(scope)} fires)"
+            + (":" if gaps else "")
+        )
+        base = f"https://huggingface.co/datasets/{s.hf_repo}/tree/main/fires" if s.hf_repo else None
+        for f, status, note in gaps:
+            link = f"  {base}/{f.fire_id}" if base else ""
+            log.info(f"  {f.fire_id}  {f.name} ({f.year})  {status}{link}" + (f"  {note[:150]}" if note else ""))
 
     def _with_extents(self, hub: HubRepo, fires: list[Fire], work: Path) -> list[Fire]:
         """The fires with their windows from catalog/fire_extents.csv (needed by every time-dependent channel but

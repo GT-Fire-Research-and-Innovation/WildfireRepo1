@@ -35,6 +35,10 @@ class Ics209Archive:
     }
     NOT_TABLES = re.compile(r"(delet|complex|tract|county|cbg|block|link)")
     MATCH_PAD_DEG = 0.25
+    # long form -> the short form names use for it (mountain before mount, so 'mountain' becomes 'mtn')
+    SHORT_FORMS = (("mountain", "mtn"), ("mount", "mt"), ("road", "rd"), ("street", "st"), ("avenue", "ave"),
+                   ("highway", "hwy"), ("creek", "ck"), ("crk", "ck"), ("canyon", "cyn"), ("point", "pt"),
+                   ("junction", "jct"), ("saint", "st"), ("fort", "ft"))  # fmt: skip
 
     def __init__(self, http: HttpClient, cache_dir: Path) -> None:
         self.http = http
@@ -140,8 +144,14 @@ class Ics209Archive:
             raise KeyError(f"None of {candidates} in the incident table's columns: {sorted(cols)}")
         return None
 
-    @staticmethod
-    def _norm_name(s: object) -> str:
+    @classmethod
+    def _norm_name(cls, s: object) -> str:
+        """A name as matching compares it: lower case, punctuation and the words fire / complex / wildfire /
+        incident dropped, spaces removed, long forms shortened ('Carpenter Road' = 'CARPENTER RD.',
+        'StateCreek' = 'State Ck')."""
         s = re.sub(r"[^a-z0-9 ]", " ", str(s).lower())
         s = re.sub(r"\b(fire|complex|wildfire|incident)\b", " ", s)
-        return re.sub(r"\s+", " ", s).strip()
+        s = re.sub(r"\s+", "", s)
+        for long, short in cls.SHORT_FORMS:
+            s = s.replace(long, short)
+        return s

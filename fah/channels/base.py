@@ -62,6 +62,16 @@ class Channel(ABC):
         """One result per fire, each fire's files in ctx.stage_path(fire_id) when it is yielded."""
 
     @staticmethod
+    def describe(ex: BaseException) -> str:
+        """'Type: message' of an error, then of the errors it came from: rasterio's 'Read failed. See previous
+        exception for details.' says nothing without GDAL's own error behind it."""
+        parts: list[str] = []
+        while ex is not None and len(parts) < 4:
+            parts.append(f"{type(ex).__name__}: {ex}")
+            ex = ex.__cause__ or (None if ex.__suppress_context__ else ex.__context__)
+        return " <- ".join(parts)
+
+    @staticmethod
     def require_module(module: str, message: str) -> None:
         """ChannelUnavailable(message) when `module` cannot be imported."""
         try:
@@ -82,7 +92,7 @@ class PerFireChannel(Channel):
             try:
                 status, sources = self.fetch_one(fire, out, ctx)
             except Exception as ex:  # noqa: BLE001  (recorded for this fire; the run goes on)
-                yield FetchResult(fire, Status.ERROR, (), f"{type(ex).__name__}: {ex}", traceback.format_exc())
+                yield FetchResult(fire, Status.ERROR, (), self.describe(ex), traceback.format_exc())
             else:
                 yield FetchResult(fire, status, tuple(sources))
 

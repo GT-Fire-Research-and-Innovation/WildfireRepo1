@@ -1,5 +1,6 @@
 """Upstream clients, offline: retries and their limits, id paging that checks completeness, URLs exactly as each
-service wants them, HRRR byte ranges, Earthdata names and signed redirects, and GFS grid arithmetic."""
+service wants them, HRRR byte ranges, Earthdata names and signed redirects, GFS grid arithmetic, and ICS-209
+name matching."""
 
 from __future__ import annotations
 
@@ -19,6 +20,7 @@ from fah.sources.goes import GoesArchive
 from fah.sources.gridmet import GridmetService
 from fah.sources.hrrr import HrrrArchive
 from fah.sources.http import HttpClient, ParallelMap
+from fah.sources.ics209 import Ics209Archive
 from fah.sources.landfire import LandfireImageService
 from fah.sources.nifc import NifcArchive
 
@@ -284,3 +286,19 @@ def test_an_empty_nifc_listing_is_retried_then_an_error_never_empty(tmp_path, mo
         NifcArchive(Listing(empty=99), HttpClient(None), tmp_path).event_layers(2018)
     with pytest.raises(RuntimeError, match="listed no layers"):
         NifcArchive(Listing(empty=0, layers=[]), HttpClient(None), tmp_path).event_layers(2018)
+
+
+def test_ics209_names_match_without_spaces_case_or_long_forms(camp):
+    norm = Ics209Archive._norm_name
+    same = [("Carpenter Road", "CARPENTER RD."), ("StateCreek", "State Creek"), ("Onion Mountain", "Onion Mtn"),
+            ("MM 73 HWY 55", "MM73 HWY55"), ("Hurricane Creek", "HURRICANE CK"), ("SADDLE RIDGE", "Saddleridge Fire"),
+            ("Mount Hood", "Mt Hood"), ("Jay Point", "Jay Pt")]  # fmt: skip
+    assert all(norm(x) == norm(y) for x, y in same)
+    assert norm("Hurricane Creek") != norm("Hurricane Creek II") and norm("Bald Knob") != norm("Bald Knob Road")
+    lat, lon = (camp.box.south + camp.box.north) / 2, (camp.box.west + camp.box.east) / 2
+    incidents = pd.DataFrame({"incident_id": ["1", "2", "3"], "name": ["CARPENTER RD.", "Carpenter Road", "Carpenter"],
+                              "lat": [lat, lat + 5, lat], "lon": [lon] * 3, "year": [2018] * 3,
+                              "irwin": [""] * 3})  # fmt: skip
+    t0, t1 = pd.Timestamp("2018-11-09"), pd.Timestamp("2018-11-25")
+    archive = Ics209Archive.__new__(Ics209Archive)
+    assert archive.match(incidents, set(), {"carpenter road"}, camp.box, t0, t1) == ["1"]  # 2 is far away, 3 is not it

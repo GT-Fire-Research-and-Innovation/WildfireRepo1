@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+
 import pytest
 
 from fah.__main__ import main
@@ -31,6 +33,8 @@ def test_a_setup_error_exits_3_with_one_line(monkeypatch, capsys):
     monkeypatch.setattr(HubRepo, "connect", classmethod(lambda cls, repo: cls(NoToken(), repo)))
     assert main(["--check", "--hf-repo", "sam/raw"]) == 3
     assert "SETUP ERROR: HF_TOKEN is not set" in capsys.readouterr().err
+    # huggingface_hub's HTTP library logs every request at INFO: the command line keeps those lines out
+    assert all(logging.getLogger(n).getEffectiveLevel() == logging.WARNING for n in ("httpx", "httpcore"))
 
 
 def test_a_channel_that_cannot_run_exits_1(tmp_path, monkeypatch, capsys):

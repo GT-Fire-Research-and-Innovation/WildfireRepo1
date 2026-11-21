@@ -27,10 +27,13 @@ class NetcdfAttrs:
     @classmethod
     def clean(cls, attrs: Mapping) -> dict:
         """Text decoded, HDF5 dimension bookkeeping dropped, one-element arrays as scalars, booleans as int8
-        (_FillValue is passed to createVariable instead)."""
+        (_FillValue is passed to createVariable instead), names netCDF cannot hold made legal (attr_name)."""
         out = {}
         for k, v in dict(attrs).items():
             if k in cls.SKIP:
+                continue
+            k = cls.attr_name(k)
+            if k in out:  # two source names that differ only in characters netCDF refuses: the first stays
                 continue
             if isinstance(v, bytes):
                 v = v.decode(errors="replace")
@@ -51,6 +54,16 @@ class NetcdfAttrs:
                 continue
             out[k] = v
         return out
+
+    @staticmethod
+    def attr_name(name: object) -> str:
+        """A source attribute name as netCDF can store it, otherwise unchanged: '/' and control characters become
+        '_', trailing spaces go, and a name that does not start with a letter, digit or '_' gets a leading '_'
+        (MCD12Q1's 'Cropland/Natural Vegetation Mosaics' -> 'Cropland_Natural Vegetation Mosaics')."""
+        s = re.sub(r"[/\x00-\x1f\x7f]", "_", str(name)).rstrip()
+        if not s or (s[0].isascii() and not (s[0].isalnum() or s[0] == "_")):
+            s = "_" + s
+        return s
 
     @staticmethod
     def fill_value(attrs: Mapping, dtype) -> object | None:

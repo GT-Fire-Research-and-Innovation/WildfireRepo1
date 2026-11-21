@@ -95,3 +95,14 @@ def test_sinusoidal_netcdf_keeps_values_fill_and_grid(tmp_path):
         assert ds.variables["x"][0] == pytest.approx(SinusoidalGrid.X0 + 19500.5 * SinusoidalGrid.TILE_M / 2400)
     name = "HDFEOS/GRIDS/VIIRS_Grid_16Day_VI_500m/Data Fields/500 m 16 days pixel reliability"
     assert NetcdfAttrs.variable_name(name) == "pixel_reliability"
+
+
+def test_source_attribute_names_netcdf_refuses_are_made_legal(tmp_path):
+    netCDF4 = pytest.importorskip("netCDF4")
+    attrs = {"Cropland/Natural Vegetation Mosaics": np.uint8(14), "Water Bodies": np.uint8(17), "trailing ": "x",
+             "-dash": 1, "Cropland_Natural Vegetation Mosaics": np.uint8(99), "units": "class number"}  # fmt: skip
+    got = NetcdfAttrs.clean(attrs)
+    assert list(got) == ["Cropland_Natural Vegetation Mosaics", "Water Bodies", "trailing", "_-dash", "units"]
+    assert got["Cropland_Natural Vegetation Mosaics"] == 14  # the first of two names that become one stays
+    with netCDF4.Dataset(tmp_path / "a.nc", "w") as ds:
+        ds.setncatts(got)  # MCD12Q1's class names stopped every landcover fire here

@@ -97,3 +97,14 @@ def test_new_layout_names_are_required_for_a_fire_to_count_as_done(channels):
     assert channels.get("suppression").expected_files == {"event_lines.geojson.gz", "event_polygons.geojson.gz"}
     assert channels.get("terrain").expected_files is None
     assert len(channels.get("gridmet").expected_files) == 13
+
+
+def test_an_error_names_the_errors_behind_it():
+    try:
+        try:
+            raise OSError("HTTP response code: 503")
+        except OSError as cause:
+            raise RuntimeError("Read failed. See previous exception for details.") from cause
+    except RuntimeError as ex:
+        text = LulcChannel.describe(ex)
+    assert text == "RuntimeError: Read failed. See previous exception for details. <- OSError: HTTP response code: 503"
