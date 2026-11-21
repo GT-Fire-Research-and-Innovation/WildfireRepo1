@@ -14,3 +14,5 @@ __pycache__/
 *.egg-info/
 build/
 .ruff_cache/
+WildfireRepo1/suppression_day_after_rule.patch
+WildfireRepo1/WildfireRepo1_data_sources.md
