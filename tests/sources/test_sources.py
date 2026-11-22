@@ -23,6 +23,7 @@ from fah.sources.http import HttpClient, ParallelMap
 from fah.sources.ics209 import Ics209Archive
 from fah.sources.landfire import LandfireImageService
 from fah.sources.nifc import NifcArchive
+from fah.sources.planetary import PlanetaryComputer
 
 # a fixed box (the Camp Fire's old build box): the expected URLs and windows below are worked out for it
 BOX = BoundingBox(-121.88999101802999, 39.51118309776612, -121.23979602288742, 39.98463882716831)
@@ -302,3 +303,32 @@ def test_ics209_names_match_without_spaces_case_or_long_forms(camp):
     t0, t1 = pd.Timestamp("2018-11-09"), pd.Timestamp("2018-11-25")
     archive = Ics209Archive.__new__(Ics209Archive)
     assert archive.match(incidents, set(), {"carpenter road"}, camp.box, t0, t1) == ["1"]  # 2 is far away, 3 is not it
+
+
+class TokenSess:
+    """Hands out tokens t1, t2, ... each stating an expiry 15 minutes after the clock's current time."""
+
+    def __init__(self, clock: list[float]) -> None:
+        self.clock, self.calls = clock, 0
+
+    def get(self, url, timeout):
+        from datetime import datetime, timezone
+
+        self.calls += 1
+        expiry = datetime.fromtimestamp(self.clock[0] + 900, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        body = json.dumps({"token": f"t{self.calls}", "msft:expiry": expiry}).encode()
+        reply = Reply(200, body)
+        reply.raise_for_status = lambda: None
+        return reply
+
+
+def test_planetary_token_is_renewed_before_the_expiry_it_states(monkeypatch):
+    clock = [1_800_000_000.0]
+    monkeypatch.setattr("fah.sources.planetary.time.time", lambda: clock[0])
+    sess = TokenSess(clock)
+    pc = PlanetaryComputer(sess)
+    assert pc.token("io-lulc-annual-v02") == "t1"
+    clock[0] += 9 * 60  # 6 min left: still good
+    assert pc.token("io-lulc-annual-v02") == "t1"
+    clock[0] += 2 * 60  # 4 min left, inside the margin: a new one (the old 30 min rule kept it past its expiry)
+    assert pc.token("io-lulc-annual-v02") == "t2" and sess.calls == 2

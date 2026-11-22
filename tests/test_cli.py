@@ -34,7 +34,10 @@ def test_a_setup_error_exits_3_with_one_line(monkeypatch, capsys):
     assert main(["--check", "--hf-repo", "sam/raw"]) == 3
     assert "SETUP ERROR: HF_TOKEN is not set" in capsys.readouterr().err
     # huggingface_hub's HTTP library logs every request at INFO: the command line keeps those lines out
-    assert all(logging.getLogger(n).getEffectiveLevel() == logging.WARNING for n in ("httpx", "httpcore"))
+    quiet = ("httpx", "httpcore", "httpx2", "httpcore2")
+    assert all(logging.getLogger(n).getEffectiveLevel() == logging.WARNING for n in quiet)
+    # GDAL's per-request messages (rasterio._env) stay out too, unless --verbose
+    assert logging.getLogger("rasterio._env").getEffectiveLevel() == logging.CRITICAL
 
 
 def test_a_channel_that_cannot_run_exits_1(tmp_path, monkeypatch, capsys):

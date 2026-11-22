@@ -171,8 +171,11 @@ def main(argv: list[str] | None = None) -> int:
     err = logging.StreamHandler(sys.stderr)
     err.setLevel(logging.WARNING)
     logging.basicConfig(level=logging.INFO, format="%(message)s", handlers=[out, err], force=True)
-    for quiet in ("httpx", "httpcore"):  # huggingface_hub's HTTP library logs every request at INFO
+    # huggingface_hub's HTTP library logs every request at INFO (httpx, or its httpx2 fork from huggingface_hub 2)
+    for quiet in ("httpx", "httpcore", "httpx2", "httpcore2"):
         logging.getLogger(quiet).setLevel(logging.WARNING)
+    if not a.verbose:  # GDAL's own messages, one per failed byte range or strip: the fire's error line has the cause
+        logging.getLogger("rasterio").setLevel(logging.CRITICAL)
 
     if a.status and not a.hf_repo:
         ap.error("--status needs --hf-repo")
