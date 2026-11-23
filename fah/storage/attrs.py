@@ -11,10 +11,10 @@ import numpy as np
 class NetcdfAttrs:
     """Attributes copied from HDF4 / HDF5 / netCDF sources into the files written here."""
 
-    SKIP = frozenset(
+    # HDF5 dimension-scale bookkeeping whose values are h5py object references, which cannot be pickled.
+    REFERENCES = frozenset({"DIMENSION_LIST", "REFERENCE_LIST"})
+    SKIP = REFERENCES | frozenset(
         {
-            "DIMENSION_LIST",
-            "REFERENCE_LIST",
             "CLASS",
             "NAME",
             "_Netcdf4Dimid",
@@ -54,6 +54,12 @@ class NetcdfAttrs:
                 continue
             out[k] = v
         return out
+
+    @classmethod
+    def portable(cls, attrs: Mapping) -> dict:
+        """The attributes as values a worker process can send back (pickle): everything but the h5py object
+        references, which are not even read. Unlike clean(), _FillValue and the source names stay."""
+        return {k: attrs[k] for k in attrs.keys() if k not in cls.REFERENCES}
 
     @staticmethod
     def attr_name(name: object) -> str:

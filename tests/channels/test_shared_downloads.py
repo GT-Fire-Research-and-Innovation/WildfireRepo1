@@ -235,6 +235,14 @@ def granule(tmp: Path, prod: str, shape: tuple, lat: np.ndarray, lon: np.ndarray
                 g.create_dataset(f"{b}_quality_flags", data=np.zeros(shape, "u2"))
             if prod == "02IMG":
                 g["I04_brightness_temperature_lut"] = np.linspace(200, 400, 65536).astype("f4")
+        # The L1B files are netCDF4: every variable's dimensions are HDF5 dimension scales, which leave object
+        # references (DIMENSION_LIST) in its attributes.
+        scales = {n: f.create_dataset(f"number_of_{n}", data=np.arange(n)) for n in {*shape, 65536}}
+        for n, s in scales.items():
+            s.make_scale(f"number_of_{n}")
+        for d in g.values():
+            for axis, n in enumerate(d.shape):
+                d.dims[axis].attach_scale(scales[n])
     return p
 
 
@@ -307,6 +315,27 @@ def test_viirs_granule_is_cropped_on_the_swath_for_each_fire(tmp_path, monkeypat
             and g.source_DayNightFlag == "Day"
             and g.i_window_rows_cols == f"{ir0}:{ir1},{ic0}:{ic1}"
         )
+
+
+def test_viirs_granule_crops_cross_the_process_boundary(tmp_path, monkeypatch, camp):
+    """read_granule runs in a spawned worker, so what it returns is pickled back; h5py's object references are not
+    picklable, so the dimension-scale attributes must stay behind in the worker."""
+    import pickle
+
+    monkeypatch.setenv("EARTHDATA_TOKEN", "tok")
+    lat, lon = np.meshgrid(np.linspace(41, 39, 64), np.linspace(-122.5, -120.5, 80), indexing="ij")
+    files = {p: granule(tmp_path, p, (64, 80), lat, lon) for p in ("02IMG", "03IMG")}
+    entry = {"sat": "SNPP", "daynight": "Day", "start": "2018-11-10T20:48:00.000Z",
+             **{p: f"https://x/VNP{p}.A2018314.2048.002.nc" for p in files}}  # fmt: skip
+    monkeypatch.setattr(
+        EarthdataClient, "open_remote", lambda self, url, token=None: open(files[url.split("/VNP")[1][:5]], "rb")
+    )
+    key = ("SNPP", "A2018314", "2048")
+    res = pickle.loads(pickle.dumps(ViirsChannel.read_granule((key, entry, [(camp.fire_id, camp.region())]))))
+    assert res[0] == key and res[3] is None
+    i04, attrs = res[1][camp.fire_id]["i"]["I04"]
+    assert i04.size and attrs["_FillValue"] == 65535 and "DIMENSION_LIST" not in attrs
+    assert "DIMENSION_LIST" not in res[1][camp.fire_id]["i"]["I04_brightness_temperature_lut"][1]
 
 
 def test_viirs_granule_failures_are_notes_unless_all_fail(tmp_path, monkeypatch, camp):

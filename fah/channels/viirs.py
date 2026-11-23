@@ -229,9 +229,9 @@ class ViirsChannel(SharedDownloadChannel):
             if not isinstance(ds, h5py.Dataset) or not name.startswith(prefixes) or ds.dtype.kind not in "iuf":
                 continue
             if ds.shape == tuple(shape):
-                out[name] = (ds[rows, cols], dict(ds.attrs))
+                out[name] = (ds[rows, cols], NetcdfAttrs.portable(ds.attrs))
             elif ds.ndim == 1:
                 if name not in luts:
-                    luts[name] = (ds[:], dict(ds.attrs))
+                    luts[name] = (ds[:], NetcdfAttrs.portable(ds.attrs))
                 out[name] = luts[name]
         return out
