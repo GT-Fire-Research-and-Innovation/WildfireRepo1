@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import io
 import json
 import os
 import re
@@ -27,7 +28,11 @@ class EarthEngineGfs:
     # 3-hourly to 240 h (and on to 384 h, 12-hourly until 2021-06-11, 3-hourly after).
     MAX_LEAD = (("2015-07-01", 36), ("2017-07-09", 240))
     MAX_BANDS = 990  # bands per request (22 per image since 2025-01-15)
+    # The .npy header of a request lists each band as ('f<lead>__<band>', '<f4'), ~50 bytes: a full request's header
+    # is far past numpy's 10000-byte default (27158 bytes for 2017 runs, 48822 with the 22 bands of 2025 on).
+    MAX_NPY_HEADER = MAX_BANDS * 128
     MAX_CELLS = 2500  # 0.25 deg cells per request
+    THREADS = 10  # earthengine-api's requests session pools 10 connections per host: more threads only churn them
     UNITS = {
         "temperature_2m_above_ground": "degC",
         "dew_point_temperature_2m_above_ground": "degC",
@@ -127,7 +132,7 @@ class EarthEngineGfs:
 
         req = {
             "expression": coll.map(tag).toBands(),
-            "fileFormat": "NUMPY_NDARRAY",
+            "fileFormat": "NPY",  # the bytes, read by decode(): earthengine-api's NUMPY_NDARRAY keeps numpy's limit
             "grid": {
                 "dimensions": {"width": c1 - c0, "height": r1 - r0},
                 "crsCode": crs,
@@ -143,7 +148,7 @@ class EarthEngineGfs:
         }
         for attempt in range(6):
             try:
-                arr = ee.data.computePixels(req)
+                npy = ee.data.computePixels(req)
                 break
             except Exception as ex:  # noqa: BLE001  (Earth Engine raises its own exception types)
                 msg = str(ex).lower()
@@ -154,6 +159,13 @@ class EarthEngineGfs:
                 ):
                     raise
                 time.sleep(5 * 2**attempt)
+        return self.decode(npy)
+
+    @classmethod
+    def decode(cls, npy: bytes) -> dict[int, dict]:
+        """{lead: {band: 2-D array}} of computePixels' NPY bytes: one structured array, a field per band, its header
+        allowed up to MAX_NPY_HEADER bytes (never unpickled)."""
+        arr = np.load(io.BytesIO(npy), allow_pickle=False, max_header_size=cls.MAX_NPY_HEADER)
         out: dict[int, dict] = {}
         for name in arr.dtype.names or ():
             m = re.search(r"f(\d{3})__(\w+)$", name)

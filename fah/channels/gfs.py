@@ -87,8 +87,9 @@ class GfsChannel(SharedDownloadChannel):
                 return run, out
 
             stopped = False
-            with ThreadPoolExecutor(ctx.threads) as ex:
-                for run, out in ParallelMap.windowed(ex, fetch_run, sorted(need), 2 * ctx.threads):
+            threads = min(ctx.threads, EarthEngineGfs.THREADS)
+            with ThreadPoolExecutor(threads) as ex:
+                for run, out in ParallelMap.windowed(ex, fetch_run, sorted(need), 2 * threads):
                     src = f"ee:{EarthEngineGfs.COLLECTION} creation_time={run.strftime('%Y-%m-%dT%H:%MZ')}"
                     for cwin, ids, data, err in out:
                         for fid in ids:

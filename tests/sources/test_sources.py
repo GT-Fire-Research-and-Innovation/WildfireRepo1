@@ -257,6 +257,33 @@ def test_gfs_fires_of_one_run_share_requests_within_a_size_limit():
     assert [len(c) for c in EarthEngineGfs.lead_chunks(list(GfsChannel.LEADS))] == [45, 35]
 
 
+def test_gfs_reads_a_full_request_past_numpys_npy_header_limit():
+    """A request comes back as one structured .npy whose header lists every band (f<lead>__<band>). For a full request
+    that header is far past numpy's 10000-byte default, which earthengine-api's NUMPY_NDARRAY decoder keeps (it
+    refused 27158 bytes on 2017 runs), so the NPY bytes are read here with a limit sized to MAX_BANDS."""
+    import io
+    from unittest.mock import MagicMock
+
+    from fah.channels.gfs import GfsChannel
+
+    leads = EarthEngineGfs.lead_chunks(list(GfsChannel.LEADS))[0]
+    names = [f"f{h:03d}__{b}" for h in leads for b in EarthEngineGfs.UNITS]  # as many bands as one request holds
+    arr = np.zeros((2, 3), dtype=[(n, "<f4") for n in names])
+    arr[names[-1]] = 7.0
+    buf = io.BytesIO()
+    np.save(buf, arr)
+    raw = buf.getvalue()
+    with pytest.raises(ValueError, match="Header info length"):
+        np.load(io.BytesIO(raw))  # numpy's default limit: what failed on Kaggle
+
+    ee = MagicMock()
+    ee.data.computePixels.return_value = raw
+    out = EarthEngineGfs(ee).fetch(pd.Timestamp("2025-07-01 12:00", tz="UTC"), leads, PixelWindow(0, 2, 0, 3), GRID)
+    assert ee.data.computePixels.call_args.args[0]["fileFormat"] == "NPY"  # bytes back, not earthengine-api's np.load
+    assert sorted(out) == list(leads) and all(len(bands) == len(EarthEngineGfs.UNITS) for bands in out.values())
+    assert (out[leads[-1]][list(EarthEngineGfs.UNITS)[-1]] == 7.0).all() and out[leads[0]]["gust"].shape == (2, 3)
+
+
 class Listing:
     """The NIFC service listing: empty for the first `empty` calls (as ArcGIS Online now and then answers), then
     one 2018 archive service whose layer list is `layers`."""
